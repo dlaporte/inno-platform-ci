@@ -19,3 +19,6 @@ App repos consume this with:
 The workflow is intentionally safe to call from untrusted repos: all
 enforcement is server-side (the deploy broker verifies the signed OIDC
 `job_workflow_ref` claim and refuses tokens to anything else).
+
+Licensed MIT-0 (see LICENSE) — same as the app template; the contract is
+meant to be consumed, pinned, and adapted without attribution burden.
