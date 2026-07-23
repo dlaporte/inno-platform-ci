@@ -1,0 +1,23 @@
+{
+  "name": "inno-template",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "vitest run --config vitest.config.node.ts",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.2.0",
+    "hono": "^4",
+    "jose": "^5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4",
+    "@types/node": "^26.1.1",
+    "typescript": "^5",
+    "vitest": "~3.0",
+    "wrangler": "4.72.0"
+  }
+}

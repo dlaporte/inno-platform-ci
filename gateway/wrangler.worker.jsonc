@@ -1,0 +1,22 @@
+{
+  // Injected gateway config for WORKER-TYPE apps (migration 0022). Same gateway
+  // code as the container variant (src/gateway/index.ts) — it dispatches on the
+  // APP_WORKER binding (gateway/index.ts forwardToWorker). The difference from
+  // wrangler.jsonc: no container/Durable Object, and a service binding to the
+  // app's own Worker instead. Templated per app by ci/template-wrangler.mjs
+  // (templateWorkerGateway).
+  "workers_dev": false,                 // perimeter: the *.workers.dev URL is not behind Access
+  "name": "inno-app-replace",           // orchestrator/deploy sets to inno-app-{name}
+  "main": "src/gateway/index.ts",
+  "compatibility_date": "2026-03-10",
+  "observability": { "enabled": true },
+  // The app's own Worker. It has workers_dev:false and NO route, so it is
+  // reachable ONLY through this binding — the gateway (which verifies Access and
+  // injects identity FIRST) stays the sole entrypoint and identity boundary.
+  "services": [{ "binding": "APP_WORKER", "service": "inno-app-replace-app" }],
+  // ACCESS_TEAM_DOMAIN is a STATIC deployment constant (see wrangler.jsonc);
+  // ACCESS_AUD is templated per app. No D1/R2 here — storage belongs to the app
+  // Worker, which holds its own scoped bindings.
+  "vars": { "ACCESS_TEAM_DOMAIN": "davidlaporte.cloudflareaccess.com", "ACCESS_AUD": "REPLACE", "ENVIRONMENT": "production" },
+  "dev": { "vars": { "ENVIRONMENT": "dev" } }
+}

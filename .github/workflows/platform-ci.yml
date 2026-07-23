@@ -1,0 +1,786 @@
+name: Platform CI
+
+# Reusable workflow: the platform's safety gates + deploy job.
+#
+# ADAPTING TO YOUR OWN ACCOUNTS? This file hardcodes this deployment's
+# identifiers — re-point them (OPERATIONS §4.6 step 6): BROKER_URL, the four
+# cross-repo `repository:` checkout refs (<owner>/inno-template,
+# <owner>/inno-platform x3), and CLOUDFLARE_ACCOUNT_ID in the deploy job.
+#
+# This workflow is invoked (via `uses:`) by the thin caller workflow that
+# ships in every generated app repo (`inno-template`'s
+# `.github/workflows/deploy.yml`, copied into every `inno-{app}` repo). The
+# caller workflow is NOT trusted — its contents can be edited by the app
+# author. All enforcement lives here, in the uneditable reusable workflow:
+#
+#   - Every gate job below MUST exit non-zero on a finding, so that the
+#     `deploy` job's `needs:` blocks the deploy on any failure. A gate that
+#     only logs a warning is a broken gate.
+#   - Admin-configured gate policy (config store: safety.gate.*, ignore
+#     entries) arrives via the `policy` job's broker fetch. A DISABLED gate
+#     still RUNS as a job and early-exits with a loud warning — it is never
+#     `if:`-skipped, because a skipped needed job skips `deploy` unless
+#     deploy's `if:` drops its implicit success() check, and weakening that
+#     check would turn any future expression bug into a silent gate bypass.
+#     Policy-fetch failure falls back to the SECURE default (all gates on,
+#     no ignores) without failing the build.
+#   - The broker (`inno-platform`'s `/deploy-token`) independently verifies
+#     the GitHub OIDC token's signed `job_workflow_ref` claim equals
+#     `{owner}/inno-platform/.github/workflows/platform-ci.yml@refs/heads/main`
+#     — i.e. it refuses to mint a deploy token for any run that did not
+#     execute *this exact* reusable workflow from `main`. Combined with
+#     GitHub's guarantee that a caller cannot bypass a reusable workflow's
+#     internal `needs:` graph, that is the platform's whole provenance
+#     guarantee: a repo that strips or forks the gates gets no token.
+#
+# See docs/superpowers/plans/2026-07-17-plan3-ci-deploy-on-push.md (Task 5).
+
+on:
+  workflow_call:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  BROKER_URL: https://inno-platform.davidlaporte.org
+  # The `ci/` scripts + this workflow, and the app-template reference used by
+  # the config-integrity gate, are pinned to `main` — the same ref the
+  # broker's job_workflow_ref check requires this workflow to run from.
+  PLATFORM_REF: main
+  TEMPLATE_REF: main
+
+jobs:
+  # Fetch the app's effective gate policy (toggles + ignore IDs) from the
+  # broker. Granular string outputs, not one JSON blob: the sast job runs in
+  # the semgrep container (Alpine, no jq guaranteed), so gate jobs must consume
+  # policy with plain sh string tests — all jq stays here.
+  policy:
+    runs-on: ubuntu-latest
+    outputs:
+      gates_semgrep: ${{ steps.fetch.outputs.gates_semgrep }}
+      gates_trivy: ${{ steps.fetch.outputs.gates_trivy }}
+      gates_gitleaks: ${{ steps.fetch.outputs.gates_gitleaks }}
+      gates_deps: ${{ steps.fetch.outputs.gates_deps }}
+      ignores_semgrep: ${{ steps.fetch.outputs.ignores_semgrep }}   # space-separated IDs
+      ignores_trivy: ${{ steps.fetch.outputs.ignores_trivy }}
+      ignores_deps: ${{ steps.fetch.outputs.ignores_deps }}
+      gateway_ref: ${{ steps.fetch.outputs.gateway_ref }}
+      min_release_age_days: ${{ steps.fetch.outputs.min_release_age_days }}
+      app_type: ${{ steps.fetch.outputs.app_type }}
+    steps:
+      - name: Derive app name from repo name
+        id: app
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: echo "app=${REPO_NAME#inno-}" >> "$GITHUB_OUTPUT"
+
+      - name: Get OIDC token (audience=inno-platform-deploy)
+        id: oidc
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const token = await core.getIDToken('inno-platform-deploy');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Fetch gate policy (any failure => ALL gates on, NO ignores)
+        id: fetch
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          APP: ${{ steps.app.outputs.app }}
+        run: |
+          # This step must NEVER fail the job: a broker outage must not block
+          # deploys, and the fallback is the SECURE direction (everything on).
+          # Deliberate exception: gate jobs still fail OPEN to secure defaults
+          # (all gates on, no ignores) on a broker outage, but gateway_ref has
+          # no secure default — there is no safe fallback gateway to run — so
+          # emit_defaults leaves it empty, and the deploy job's "Require a
+          # promoted gateway" step hard-fails the tag deploy on that, by
+          # design (see OPERATIONS §7.9).
+          emit_defaults() {
+            echo "::warning title=Gate policy unavailable::running all gates with no ignores (secure default)"
+            for g in semgrep trivy gitleaks deps; do echo "gates_$g=true" >> "$GITHUB_OUTPUT"; done
+            for t in semgrep trivy deps; do echo "ignores_$t=" >> "$GITHUB_OUTPUT"; done
+            echo "gateway_ref=" >> "$GITHUB_OUTPUT"
+            # Type defaults to container on a broker outage — the safe, original
+            # build path (a worker app that can't be identified just runs the
+            # container gates, which its repo won't satisfy, and fails safely).
+            echo "app_type=container" >> "$GITHUB_OUTPUT"
+            # Cooldown has no "secure default" that could block a legit deploy on
+            # a broker outage — a length-of-time gate isn't a safety scanner — so
+            # it fails OPEN to 0 (off), consistent with never blocking on the
+            # broker being down.
+            echo "min_release_age_days=0" >> "$GITHUB_OUTPUT"
+          }
+          resp="$(curl -sS --max-time 15 --retry 2 -X POST "$BROKER_URL/ci/policy" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"app\":\"$APP\"}")" || { emit_defaults; exit 0; }
+          if ! printf '%s' "$resp" | jq -e '.gates | type == "object"' >/dev/null 2>&1; then
+            emit_defaults
+            exit 0
+          fi
+          # Partial policy resolves SECURE: a missing gate key reads true, a
+          # missing ignores list reads empty. IDs are grammar-filtered here (a
+          # third layer after write-time + serve-time validation) because they
+          # get word-split into tool flags in the gate jobs.
+          for g in semgrep trivy gitleaks deps; do
+            echo "gates_$g=$(printf '%s' "$resp" | jq -r --arg g "$g" '.gates[$g] != false')" >> "$GITHUB_OUTPUT"
+          done
+          for t in semgrep trivy deps; do
+            echo "ignores_$t=$(printf '%s' "$resp" | jq -r --arg t "$t" '(.ignores[$t] // []) | map(select(test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))) | join(" ")')" >> "$GITHUB_OUTPUT"
+          done
+          echo "gateway_ref=$(printf '%s' "$resp" | jq -r '(.gateway_ref // empty) | select(test("^[0-9a-fA-F]{7,40}$"))')" >> "$GITHUB_OUTPUT"
+          # Numeric cooldown threshold; a missing/garbage value reads 0 (off).
+          echo "min_release_age_days=$(printf '%s' "$resp" | jq -r '(.min_release_age_days // 0) | if type=="number" then . else 0 end')" >> "$GITHUB_OUTPUT"
+          # Deployment type: only "worker" opts into the worker path; anything
+          # else (incl. a missing field) reads "container" — the original path.
+          echo "app_type=$(printf '%s' "$resp" | jq -r 'if .type == "worker" then "worker" else "container" end')" >> "$GITHUB_OUTPUT"
+
+  config-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout app repo (the caller)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: app
+
+      - name: Checkout inno-platform (ci/ scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform
+          ref: ${{ env.PLATFORM_REF }}
+          path: inno-platform-ci
+          token: ${{ secrets.PLATFORM_READ_PAT }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Run config-integrity check
+        run: node inno-platform-ci/ci/check-config.mjs app
+
+  secrets:
+    runs-on: ubuntu-latest
+    needs: [policy]
+    steps:
+      - name: Gate switch
+        id: gate
+        env:
+          ENABLED: ${{ needs.policy.outputs.gates_gitleaks }}
+        run: |
+          if [ "$ENABLED" != "true" ]; then
+            echo "::warning title=SAFETY GATE DISABLED::gitleaks gate disabled by platform policy — no secret scan ran on this deploy"
+            echo "### :warning: gitleaks gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        if: steps.gate.outputs.enabled == 'true'
+        # Exact-pinned by commit SHA (= v2.3.9) like the Trivy image below: a
+        # floating major tag lets the gate's behavior drift with no repo diff.
+        # No central per-finding ignores for gitleaks (its fingerprints are
+        # commit-bound and rebase-fragile); the app's own .gitleaksignore is
+        # the supported suppression surface.
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gitleaks-action exits non-zero on any finding by default — that
+          # failure is the gate. Do not add continue-on-error here.
+
+  sast:
+    runs-on: ubuntu-latest
+    needs: [policy]
+    container:
+      # Exact-pinned like the Trivy image — an unpinned tag (implicit :latest)
+      # lets the SAST gate's ruleset/engine drift between runs with no repo diff.
+      image: semgrep/semgrep:1.170.0
+    steps:
+      - name: Gate switch
+        id: gate
+        env:
+          ENABLED: ${{ needs.policy.outputs.gates_semgrep }}
+        run: |
+          if [ "$ENABLED" != "true" ]; then
+            echo "::warning title=SAFETY GATE DISABLED::semgrep gate disabled by platform policy — no SAST ran on this deploy"
+            echo "### :warning: semgrep gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
+
+      - name: semgrep (OWASP Top Ten ruleset)
+        if: steps.gate.outputs.enabled == 'true'
+        # Scope to the app author's code (app/). The gateway (src/) is
+        # hash-pinned by config-integrity and the caller workflow is inert +
+        # platform-defined, so scanning them only yields findings on the
+        # platform's own intentional patterns (e.g. secrets: inherit).
+        # Admin-set rule ignores arrive as repeatable --exclude-rule flags;
+        # the set --/positional-args pattern is POSIX-sh safe in this
+        # container, and the IDs are grammar-pinned server-side.
+        env:
+          IGNORES: ${{ needs.policy.outputs.ignores_semgrep }}
+        run: |
+          set -- --config p/owasp-top-ten --error
+          for id in $IGNORES; do set -- "$@" --exclude-rule "$id"; done
+          semgrep "$@" app/
+
+  deps:
+    runs-on: ubuntu-latest
+    needs: [policy]
+    steps:
+      - name: Gate switch
+        id: gate
+        env:
+          ENABLED: ${{ needs.policy.outputs.gates_deps }}
+        run: |
+          if [ "$ENABLED" != "true" ]; then
+            echo "::warning title=SAFETY GATE DISABLED::dependency audit gate disabled by platform policy — no dependency scan ran on this deploy"
+            echo "### :warning: dependency audit gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          node-version: 22
+
+      - name: npm audit (repo package.json, if present — worker deps are audited in the platform repo's own CI, since they're injected at deploy time)
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          if [ -f package.json ]; then
+            # --omit=dev: the deployed worker bundles only runtime deps; dev
+            # tooling (wrangler/vitest/esbuild) isn't shipped, so its advisories
+            # don't affect the artifact. The worker's runtime deps + lockfile
+            # are template-owned and pinned by config-integrity. (npm audit has
+            # no per-advisory ignore flag — safety.ignore.deps.* applies to
+            # pip-audit only.)
+            npm audit --omit=dev --audit-level=high
+          else
+            echo "no package.json — skipping npm audit"
+          fi
+
+      - name: pip-audit (app/requirements.txt, if present)
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          IGNORES: ${{ needs.policy.outputs.ignores_deps }}
+        run: |
+          if [ -f app/requirements.txt ]; then
+            python3 -m pip install --quiet pip-audit
+            set --
+            for id in $IGNORES; do set -- "$@" --ignore-vuln "$id"; done
+            python3 -m pip_audit -r app/requirements.txt "$@"
+          else
+            echo "no app/requirements.txt — skipping pip-audit"
+          fi
+
+      # npm audit of the APP AUTHOR's own deps. Worker-type apps declare deps in
+      # app/package.json (there is no root package.json — config-integrity forbids
+      # it, and worker apps have no container image for Trivy to scan), so without
+      # this their dependencies would ship un-audited — the parity gap vs the
+      # container path (pip-audit + Trivy). Audits the lockfile without installing;
+      # generates a throwaway lock if the app didn't commit one so the gate still
+      # runs. (npm audit has no per-advisory ignore flag; safety.ignore.deps.*
+      # applies to pip-audit only.)
+      - name: npm audit (app/package.json, if present)
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          if [ -f app/package.json ]; then
+            cd app
+            [ -f package-lock.json ] || npm install --package-lock-only --ignore-scripts >/dev/null 2>&1 || true
+            npm audit --package-lock-only --omit=dev --audit-level=high
+          else
+            echo "no app/package.json — skipping app npm audit"
+          fi
+
+  container:
+    runs-on: ubuntu-latest
+    needs: [policy]
+    # This job builds the user-controlled Dockerfile. It deliberately has NO
+    # deploy token, no Cloudflare credential, and no platform secret in its
+    # env — an app author fully controls this build's inputs (the Dockerfile
+    # + app/ sources), so nothing of value to the platform is reachable from
+    # it. See the "token-ordering" note in this file's header / the plan.
+    # (The OIDC token minted below for the SBOM upload is NOT a credential —
+    # it only proves provenance to the broker's /deploy-sbom endpoint.)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No `cache: npm` here: this job never runs `npm ci`/`npm install` (the
+      # docker build below is a wholly separate build context, and the only
+      # runner-side use of node is running platform-ci/ci/sbom-upload.mjs
+      # directly). A cache key would have to hash a root lockfile that, once
+      # app repos stop vendoring worker build inputs, won't exist here — this
+      # job never checks out `gateway/` or injects anything.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      # Only the trivy SCAN is policy-toggleable. The build, the non-root/port
+      # asserts (container contract), and the SBOM generation are unconditional
+      # — the SBOM is inventory, and capturing it even for gate-disabled apps
+      # means flipping the gate back restores sweep coverage without a deploy.
+      # The ignore file is written AFTER checkout (checkout cleans the tree)
+      # and is the ONLY ignore file mounted into trivy: the app repo itself
+      # stays unmounted, so an app-committed .trivyignore remains inert.
+      - name: Gate switch + platform ignore file
+        id: gate
+        env:
+          ENABLED: ${{ needs.policy.outputs.gates_trivy }}
+          IGNORES: ${{ needs.policy.outputs.ignores_trivy }}
+        run: |
+          if [ "$ENABLED" != "true" ]; then
+            echo "::warning title=SAFETY GATE DISABLED::trivy image gate disabled by platform policy — no image CVE scan ran on this deploy (the app is also exempt from the safety sweep)"
+            echo "### :warning: trivy gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+          : > .trivyignore.platform
+          for id in $IGNORES; do echo "$id" >> .trivyignore.platform; done
+          if [ -s .trivyignore.platform ]; then
+            echo "platform-managed trivy ignores in effect:"
+            cat .trivyignore.platform
+          fi
+
+      # Worker-type apps have no Dockerfile — every image step below is guarded
+      # by app_type != 'worker'. The job still runs (and SUCCEEDS with the image
+      # steps skipped) so the deploy job's `needs: [container]` is satisfied; a
+      # skipped whole job would instead skip the deploy.
+      - name: docker build (isolated — no deploy token present)
+        if: needs.policy.outputs.app_type != 'worker'
+        run: docker build -t app-under-test .
+
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        if: needs.policy.outputs.app_type != 'worker' && steps.gate.outputs.enabled == 'true'
+        # Run trivy directly via its official image rather than the
+        # setup-trivy action — deterministic, and we authenticate the
+        # vuln-DB pull with github.token to avoid anonymous ghcr rate limits
+        # (the common cause of trivy-action CI flakes). --ignore-unfixed so
+        # only actionable (patch-available) HIGH/CRITICAL fail the gate.
+        env:
+          TRIVY_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            -v "$PWD/.trivyignore.platform:/.trivyignore.platform:ro" \
+            -e GITHUB_TOKEN="$TRIVY_TOKEN" \
+            aquasec/trivy:0.63.0 image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --ignorefile /.trivyignore.platform \
+              --exit-code 1 \
+              --no-progress \
+              app-under-test
+
+      # SBOM of the image that is about to deploy — the safety sweep's input.
+      # Uploaded DIRECTLY to the broker from this job (no workflow artifact:
+      # app-owned jobs in the caller share the run's artifact namespace) and
+      # staged server-side under this run's VERIFIED run_id claim;
+      # /deploy-complete promotes it to the live pointer. Best-effort: a failed
+      # upload warns and the build proceeds (the sweep keeps the previous SBOM).
+      - name: Generate SBOM (CycloneDX)
+        if: needs.policy.outputs.app_type != 'worker'
+        env:
+          TRIVY_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            -v "$PWD:/out" \
+            -e GITHUB_TOKEN="$TRIVY_TOKEN" \
+            aquasec/trivy:0.63.0 image \
+              --format cyclonedx \
+              --output /out/sbom.json \
+              --no-progress \
+              app-under-test
+
+      - name: Checkout inno-platform (ci/ scripts)
+        if: needs.policy.outputs.app_type != 'worker'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform
+          ref: ${{ env.PLATFORM_REF }}
+          path: platform-ci
+          token: ${{ secrets.PLATFORM_READ_PAT }}
+
+      - name: Get OIDC token (audience=inno-platform-deploy)
+        id: oidc_sbom
+        if: needs.policy.outputs.app_type != 'worker'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const token = await core.getIDToken('inno-platform-deploy');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Upload SBOM to broker (best-effort)
+        if: needs.policy.outputs.app_type != 'worker'
+        env:
+          OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          node platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "${REPO_NAME#inno-}" sbom.json "$OIDC_TOKEN" \
+            || echo "::warning::SBOM upload failed — the safety sweep will keep using the previous deployment's SBOM"
+
+      - name: Assert non-root user + EXPOSE 8080
+        if: needs.policy.outputs.app_type != 'worker'
+        run: |
+          set -e
+          user="$(docker inspect --format='{{.Config.User}}' app-under-test)"
+          if [ -z "$user" ] || [ "$user" = "root" ] || [ "$user" = "0" ]; then
+            echo "container-validate: image runs as root (User='$user') — refusing" >&2
+            exit 1
+          fi
+          echo "container-validate: runs as non-root user '$user'"
+
+          ports="$(docker inspect --format='{{json .Config.ExposedPorts}}' app-under-test)"
+          if ! echo "$ports" | grep -q '"8080/tcp"'; then
+            echo "container-validate: image does not EXPOSE 8080 (ExposedPorts=$ports) — refusing" >&2
+            exit 1
+          fi
+          echo "container-validate: exposes 8080"
+
+      # Contract R2 made real at build time: the container must come up and
+      # answer GET /healthz -> 200. Generous 90s window (slow app boots are
+      # legitimate; a healthz that needs storage is not — the endpoint must be
+      # storage-independent, per the application contract). The platform's
+      # runtime health probe binds to the same endpoint after deploy.
+      - name: Smoke test /healthz
+        if: needs.policy.outputs.app_type != 'worker'
+        run: |
+          set -e
+          docker run -d --name smoke -p 8080:8080 app-under-test
+          ok=""
+          for i in $(seq 1 18); do
+            if curl -sf -o /dev/null --max-time 4 http://localhost:8080/healthz; then ok=1; break; fi
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            echo "container-validate: /healthz did not answer 200 within 90s — refusing" >&2
+            echo "--- container logs ---" >&2
+            docker logs smoke >&2 || true
+            docker rm -f smoke || true
+            exit 1
+          fi
+          echo "container-validate: /healthz healthy"
+          docker rm -f smoke
+
+  # Supply-chain cooldown: fail if an exactly-pinned app dependency was
+  # published fewer than min_release_age_days days ago (config store:
+  # safety.min_release_age_days; 0 = off, the default). Complements the `deps`
+  # audit gate — that catches KNOWN-vulnerable versions, this catches too-new,
+  # unvetted ones. Always runs (never `if:`-skipped) and early-exits when the
+  # threshold is 0, matching the other gates' "disabled still runs" discipline.
+  dep-age:
+    runs-on: ubuntu-latest
+    needs: [policy]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: app-repo
+
+      - name: Checkout inno-platform (ci/ scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform
+          ref: ${{ env.PLATFORM_REF }}
+          path: inno-platform-ci
+          token: ${{ secrets.PLATFORM_READ_PAT }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Dependency release-age cooldown
+        env:
+          MIN_RELEASE_AGE_DAYS: ${{ needs.policy.outputs.min_release_age_days }}
+        run: node inno-platform-ci/ci/check-dep-age.mjs app-repo/app
+
+  # Skip deploying an app that is still the untouched template scaffold. A
+  # freshly generated repo ships app/.needs-build (the template marker); its
+  # generation commit fires CI, but with nothing built there is nothing to
+  # deploy — deploying it would serve the template and send a premature "live"
+  # email. The new-app / migrate-app skills delete the marker once real code is
+  # in place. The safety gate jobs still run on a scaffold push; only the
+  # deploy job is gated.
+  scaffold-check:
+    runs-on: ubuntu-latest
+    outputs:
+      built: ${{ steps.check.outputs.built }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: check
+        run: |
+          if [ -f app/.needs-build ]; then
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "app/.needs-build present — unbuilt scaffold, deploy will be skipped"
+          else
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: [policy, config-integrity, secrets, sast, deps, dep-age, container, scaffold-check]
+    # Release-driven: only a v* TAG deploys. A push to main runs the safety
+    # gates above and stops here — the push IS the safety preflight. github.ref
+    # in a reusable workflow is the CALLER run's ref, and the broker
+    # independently re-verifies it from the signed OIDC claims.
+    if: ${{ needs.scaffold-check.outputs.built == 'true' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout app repo (the caller)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout inno-platform (ci/ scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform
+          ref: ${{ env.PLATFORM_REF }}
+          path: platform-ci
+          token: ${{ secrets.PLATFORM_READ_PAT }}
+          # This checkout lands inside the app root that becomes the wrangler
+          # docker build context below. persist-credentials:false keeps
+          # PLATFORM_READ_PAT out of platform-ci/.git/config so the
+          # user-controlled Dockerfile rebuild cannot COPY+exfiltrate it. Only
+          # read from here (ci/ scripts) — no later git op needs the credential.
+          persist-credentials: false
+
+      - name: Require a promoted gateway (gateway.ref)
+        env:
+          GATEWAY_REF: ${{ needs.policy.outputs.gateway_ref }}
+        run: |
+          if [ -z "$GATEWAY_REF" ]; then
+            echo "::error title=Gateway not promoted::gateway.ref is unset or the policy fetch failed — there is no fallback. Promote with: set_config gateway.ref <inno-platform sha>"
+            exit 1
+          fi
+
+      - name: Checkout promoted gateway
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform
+          ref: ${{ needs.policy.outputs.gateway_ref }}
+          path: gateway-src
+          sparse-checkout: gateway
+          token: ${{ secrets.PLATFORM_READ_PAT }}
+          # Same reasoning as the platform-ci checkout above: this dir lands in
+          # the wrangler docker build context, so keep PLATFORM_READ_PAT out of
+          # gateway-src/.git/config. Only read from here (cp of gateway build
+          # inputs) — no later git op needs the credential.
+          persist-credentials: false
+
+      - name: Inject gateway + worker build inputs
+        env:
+          APP_TYPE: ${{ needs.policy.outputs.app_type }}
+        run: |
+          [ -f gateway-src/gateway/package.json ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the build-input move — promote a post-f866c96 platform SHA"; exit 1; }
+          [ -f gateway-src/gateway/wrangler.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the wrangler.jsonc move — promote a current platform SHA"; exit 1; }
+          rm -rf src/gateway
+          mkdir -p src/gateway
+          # The gateway SOURCE is identical for both types (src/gateway/index.ts
+          # dispatches on the APP_WORKER binding); only the wrangler config
+          # differs. package.json/lock/tsconfig are the gateway's build inputs.
+          cp gateway-src/gateway/*.ts src/gateway/
+          cp gateway-src/gateway/package.json gateway-src/gateway/package-lock.json gateway-src/gateway/tsconfig.json .
+          if [ "$APP_TYPE" = "worker" ]; then
+            # Worker-type: the gateway config is the service-binding variant, and
+            # the app's own Worker gets its own config. app/index.ts (the app
+            # author's fetch handler) and app/package.json (its deps, if any)
+            # come from the app repo — not injected.
+            [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
+            [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
+            cp gateway-src/gateway/wrangler.worker.jsonc wrangler.jsonc
+            cp gateway-src/gateway/app-worker.jsonc app-worker.jsonc
+          else
+            cp gateway-src/gateway/wrangler.jsonc .
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Derive app name from repo name
+        id: app
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          app="${REPO_NAME#inno-}"
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
+      # Requests a GitHub OIDC token scoped to audience "inno-platform-deploy"
+      # (id-token: write, granted above). This token is used ONLY for
+      # /deploy-token; the finalize step below mints a FRESH one, because
+      # GitHub OIDC tokens are short-lived and the container build/push inside
+      # `wrangler deploy` can outlast the TTL — an expired token there left
+      # the worker deployed but never finalized (no domain attach, not live).
+      # actions/github-script wraps the
+      # ACTIONS_ID_TOKEN_REQUEST_URL/ACTIONS_ID_TOKEN_REQUEST_TOKEN dance
+      # that `core.getIDToken(audience)` performs internally; the equivalent
+      # raw call is:
+      #   curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+      #     "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=inno-platform-deploy"
+      - name: Get OIDC token (audience=inno-platform-deploy)
+        id: oidc
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const token = await core.getIDToken('inno-platform-deploy');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Request deploy token from broker
+        id: deploy_token
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          APP: ${{ steps.app.outputs.app }}
+        run: |
+          set -e
+          # NOT `curl -f`: -f discards the response body on a non-2xx, which
+          # would swallow the broker's deliberately actionable messages (e.g.
+          # 409 app_stopped: "start it from the panel, then push"). Capture the
+          # status via -w and surface the body verbatim on failure instead. The
+          # token stays in a shell var (never written to disk).
+          resp="$(curl -sS -X POST "$BROKER_URL/deploy-token" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"app\":\"$APP\"}" \
+            -w '\n%{http_code}')"
+          http_code="$(printf '%s\n' "$resp" | tail -n1)"
+          resp="$(printf '%s\n' "$resp" | sed '$d')"
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "deploy-token request failed (HTTP $http_code):" >&2
+            printf '%s\n' "$resp" | jq -r '.message // .error // .' 2>/dev/null >&2 || printf '%s\n' "$resp" >&2
+            exit 1
+          fi
+
+          token="$(echo "$resp" | jq -r .token)"
+          database_id="$(echo "$resp" | jq -r .database_id)"
+          access_aud="$(echo "$resp" | jq -r .access_aud)"
+          deployment_id="$(echo "$resp" | jq -r .deployment_id)"
+          # Effective container.sleep_after from the platform config store;
+          # default defensively if an older broker doesn't return it.
+          sleep_after="$(echo "$resp" | jq -r '.sleep_after // "10m"')"
+
+          echo "::add-mask::$token"
+          {
+            echo "token=$token"
+            echo "database_id=$database_id"
+            echo "access_aud=$access_aud"
+            echo "deployment_id=$deployment_id"
+            echo "sleep_after=$sleep_after"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install app dependencies
+        # --ignore-scripts: deploy job holds the CF token; block dependency lifecycle code.
+        run: npm ci --ignore-scripts
+
+      - name: Template wrangler.jsonc (container)
+        if: needs.policy.outputs.app_type != 'worker'
+        env:
+          APP: ${{ steps.app.outputs.app }}
+          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
+          ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
+        run: node platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" wrangler.jsonc
+
+      - name: Template worker configs (gateway + app worker)
+        if: needs.policy.outputs.app_type == 'worker'
+        env:
+          APP: ${{ steps.app.outputs.app }}
+          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
+          ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
+        run: |
+          # The gateway config (wrangler.jsonc here = the worker-gateway variant)
+          # takes only the Access AUD + names; the app worker takes the D1 id.
+          node platform-ci/ci/template-wrangler.mjs --worker-gateway "$APP" "$ACCESS_AUD" wrangler.jsonc
+          node platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
+
+      # NOTE (token-ordering, spec §5.2): `wrangler deploy` re-builds the
+      # Dockerfile locally (containers[0].image is "./Dockerfile", enforced
+      # by the config-integrity gate) — this is a SECOND build of the same
+      # user-controlled Dockerfile, this time with CLOUDFLARE_API_TOKEN in
+      # env. See this file's header comment / the Task 5 report for the
+      # investigated alternative (a pre-built-image `image:` reference) and
+      # why it isn't used here.
+      # --config wrangler.jsonc: pin the exact file the config-integrity gate
+      # vetted. wrangler discovers config as wrangler.json ?? wrangler.jsonc ??
+      # wrangler.toml (wrangler.json OUTRANKS .jsonc, and multiple files don't
+      # error), so without --config an attacker could add an unvetted
+      # wrangler.json and have wrangler silently use it. The token is NOT
+      # forwarded into the Dockerfile rebuild here — no --build-arg / --secret
+      # passes CLOUDFLARE_API_TOKEN — do not add one without re-reviewing the
+      # token-exfil surface.
+      - name: wrangler deploy (container)
+        if: needs.policy.outputs.app_type != 'worker'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
+          # The minted deploy token is narrowly scoped and cannot call
+          # /memberships to auto-discover the account, so pin the account id
+          # explicitly (non-secret — it appears in dashboard URLs). Otherwise
+          # wrangler fails with code 9106 (auth) on the membership lookup.
+          CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24
+          # The platform-configured container sleep timeout (config store,
+          # app-overridable); the gateway's AppContainer reads it at
+          # construction. Validated server-side (duration grammar) before the
+          # broker returns it.
+          SLEEP_AFTER: ${{ steps.deploy_token.outputs.sleep_after }}
+        # CLOUDFLARE_API_BASE_URL pinned explicitly: wrangler adopts unset env
+        # keys from a cwd .env file — the gate rejects committed .env files
+        # (belt), and this pin makes the highest-value key unstealable even if
+        # one ever slipped through (suspenders).
+        run: CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4" npx wrangler deploy --config wrangler.jsonc --var "SLEEP_AFTER:$SLEEP_AFTER"
+
+      # Worker-type: deploy the app's own Worker FIRST (so the gateway's service
+      # binding resolves), then the gateway. The app Worker has workers_dev:false
+      # and no route, so only the gateway can reach it. No SLEEP_AFTER (that is a
+      # container knob). The same deploy token deploys both scripts.
+      - name: "wrangler deploy (worker: app Worker then gateway)"
+        if: needs.policy.outputs.app_type == 'worker'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24
+        run: |
+          set -e
+          # The app author's Worker may declare its own npm deps in app/package.json
+          # (config-integrity forbids a ROOT package.json, not this one). Install
+          # them the same hardened way as the gateway's — --ignore-scripts near the
+          # deploy token — so wrangler can bundle app/index.ts. No deps => skip.
+          if [ -f app/package.json ]; then (cd app && npm ci --ignore-scripts || npm install --ignore-scripts); fi
+          export CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4"
+          npx wrangler deploy --config app-worker.jsonc
+          npx wrangler deploy --config wrangler.jsonc
+
+      # Fresh token for finalize — see the note on the first OIDC step.
+      - name: Refresh OIDC token for finalize
+        id: oidc_finalize
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const token = await core.getIDToken('inno-platform-deploy');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Finalize deployment
+        env:
+          OIDC_TOKEN: ${{ steps.oidc_finalize.outputs.token }}
+          APP: ${{ steps.app.outputs.app }}
+          DEPLOYMENT_ID: ${{ steps.deploy_token.outputs.deployment_id }}
+          GATEWAY_REF: ${{ needs.policy.outputs.gateway_ref }}
+        run: |
+          set -e
+          result="$(node platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$GATEWAY_REF")"
+          echo "$result"
+          url="$(echo "$result" | jq -r .url)"
+          echo "Deployed: $url"
+          {
+            echo "### Deployed"
+            echo "$url"
+          } >> "$GITHUB_STEP_SUMMARY"
