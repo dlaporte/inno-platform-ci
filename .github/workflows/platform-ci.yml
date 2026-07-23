@@ -10,6 +10,7 @@ name: Platform CI
 # published byte-for-byte into inno-platform-ci by scripts/publish-mirror.sh
 # — the copy the checkouts below actually fetch.
 #
+# Published byte-for-byte to dlaporte/inno-platform-ci (see OPERATIONS §7.2.2).
 # This workflow is invoked (via `uses:`) by the thin caller workflow that
 # ships in every generated app repo (`inno-template`'s
 # `.github/workflows/deploy.yml`, copied into every `inno-{app}` repo). The
