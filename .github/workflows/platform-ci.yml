@@ -565,7 +565,7 @@ jobs:
           GATEWAY_REF: ${{ needs.policy.outputs.gateway_ref }}
         run: |
           if [ -z "$GATEWAY_REF" ]; then
-            echo "::error title=Gateway not promoted::gateway.ref is unset or the policy fetch failed — there is no fallback. Promote with: set_config gateway.ref <inno-platform sha>"
+            echo "::error title=Gateway not promoted::gateway.ref is unset or the policy fetch failed — there is no fallback. Promote with the sync_gateway_ref MCP tool (or set_config gateway.ref <inno-platform-ci mirror sha>)"
             exit 1
           fi
 
