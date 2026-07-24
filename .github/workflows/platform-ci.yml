@@ -32,17 +32,17 @@ name: Platform CI
 #     no ignores) without failing the build.
 #   - The broker (`inno-platform`'s `/deploy-token`) independently verifies
 #     the GitHub OIDC token's signed `job_workflow_ref` claim names *this
-#     exact* reusable workflow file running from `main`. During the contract
-#     split migration the broker dual-accepts either identity:
-#     `{owner}/inno-platform-ci/.github/workflows/platform-ci.yml@refs/heads/main`
-#     (canonical, the public mirror) or
-#     `{owner}/inno-platform/.github/workflows/platform-ci.yml@refs/heads/main`
-#     (legacy — still-unmigrated callers; each acceptance is audited as
-#     `legacy_workflow_ref` and the legacy branch is retired once that audit
-#     goes quiet). Combined with GitHub's guarantee that a caller cannot
-#     bypass a reusable workflow's internal `needs:` graph, that is the
-#     platform's whole provenance guarantee: a repo that strips or forks the
-#     gates gets no token.
+#     exact* reusable workflow file running from `main` — and the ONLY
+#     identity it accepts is the public mirror's:
+#     `{owner}/inno-platform-ci/.github/workflows/platform-ci.yml@refs/heads/main`.
+#     (The legacy in-repo identity, `{owner}/inno-platform/...`, was
+#     dual-accepted during the contract-split migration and retired
+#     2026-07-24 after its `legacy_workflow_ref` audit stayed at zero and
+#     the fleet re-tagged onto the mirror ref — so a caller `uses:` line
+#     pointing at inno-platform itself is now refused.) Combined with
+#     GitHub's guarantee that a caller cannot bypass a reusable workflow's
+#     internal `needs:` graph, that is the platform's whole provenance
+#     guarantee: a repo that strips or forks the gates gets no token.
 #
 # See docs/superpowers/plans/2026-07-17-plan3-ci-deploy-on-push.md (Task 5).
 
