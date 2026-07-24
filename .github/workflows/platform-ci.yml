@@ -13,9 +13,11 @@ name: Platform CI
 # Published byte-for-byte to dlaporte/inno-platform-ci (see OPERATIONS §7.2.2).
 # This workflow is invoked (via `uses:`) by the thin caller workflow that
 # ships in every generated app repo (`inno-template`'s
-# `.github/workflows/deploy.yml`, copied into every `inno-{app}` repo). The
-# caller workflow is NOT trusted — its contents can be edited by the app
-# author. All enforcement lives here, in the uneditable reusable workflow:
+# `.github/workflows/deploy.yml`, copied into every `inno-{app}` repo), and
+# by registered third-party repos (register_app), whose hand-added deploy.yml
+# passes `with: app:`. No caller workflow is trusted — its contents can be
+# edited by the app author. All enforcement lives here, in the uneditable
+# reusable workflow:
 #
 #   - Every gate job below MUST exit non-zero on a finding, so that the
 #     `deploy` job's `needs:` blocks the deploy on any failure. A gate that
@@ -46,6 +48,14 @@ name: Platform CI
 
 on:
   workflow_call:
+    inputs:
+      app:
+        description: >-
+          Platform app name. Required for registered (github-app) repos; defaults
+          to the repository name with any inno- prefix removed.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   id-token: write
@@ -77,12 +87,20 @@ jobs:
       gateway_ref: ${{ steps.fetch.outputs.gateway_ref }}
       min_release_age_days: ${{ steps.fetch.outputs.min_release_age_days }}
       app_type: ${{ steps.fetch.outputs.app_type }}
+      app: ${{ steps.app.outputs.app }}
     steps:
-      - name: Derive app name from repo name
+      # `app` is caller-asserted; safe only because the broker binds the signed
+      # repository_id claim to the app record and refuses mismatches
+      # (app_mismatch / deploy_denied:repo_id).
+      - name: Derive app name (input, or repo name minus inno- prefix)
         id: app
         env:
           REPO_NAME: ${{ github.event.repository.name }}
-        run: echo "app=${REPO_NAME#inno-}" >> "$GITHUB_OUTPUT"
+          INPUT_APP: ${{ inputs.app }}
+        run: |
+          APP="$INPUT_APP"
+          if [ -z "$APP" ]; then APP="${REPO_NAME#inno-}"; fi
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
 
       - name: Get OIDC token (audience=inno-platform-deploy)
         id: oidc
@@ -434,9 +452,9 @@ jobs:
         if: needs.policy.outputs.app_type != 'worker'
         env:
           OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
-          REPO_NAME: ${{ github.event.repository.name }}
+          APP: ${{ needs.policy.outputs.app }}
         run: |
-          node platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "${REPO_NAME#inno-}" sbom.json "$OIDC_TOKEN" \
+          node platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$OIDC_TOKEN" \
             || echo "::warning::SBOM upload failed — the safety sweep will keep using the previous deployment's SBOM"
 
       - name: Assert non-root user + EXPOSE 8080
@@ -615,14 +633,6 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Derive app name from repo name
-        id: app
-        env:
-          REPO_NAME: ${{ github.event.repository.name }}
-        run: |
-          app="${REPO_NAME#inno-}"
-          echo "app=$app" >> "$GITHUB_OUTPUT"
-
       # Requests a GitHub OIDC token scoped to audience "inno-platform-deploy"
       # (id-token: write, granted above). This token is used ONLY for
       # /deploy-token; the finalize step below mints a FRESH one, because
@@ -648,7 +658,7 @@ jobs:
         id: deploy_token
         env:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
-          APP: ${{ steps.app.outputs.app }}
+          APP: ${{ needs.policy.outputs.app }}
         run: |
           set -e
           # NOT `curl -f`: -f discards the response body on a non-2xx, which
@@ -693,7 +703,7 @@ jobs:
       - name: Template wrangler.jsonc (container)
         if: needs.policy.outputs.app_type != 'worker'
         env:
-          APP: ${{ steps.app.outputs.app }}
+          APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
           ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
         run: node platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" wrangler.jsonc
@@ -701,7 +711,7 @@ jobs:
       - name: Template worker configs (gateway + app worker)
         if: needs.policy.outputs.app_type == 'worker'
         env:
-          APP: ${{ steps.app.outputs.app }}
+          APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
           ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
         run: |
@@ -778,7 +788,7 @@ jobs:
       - name: Finalize deployment
         env:
           OIDC_TOKEN: ${{ steps.oidc_finalize.outputs.token }}
-          APP: ${{ steps.app.outputs.app }}
+          APP: ${{ needs.policy.outputs.app }}
           DEPLOYMENT_ID: ${{ steps.deploy_token.outputs.deployment_id }}
           GATEWAY_REF: ${{ needs.policy.outputs.gateway_ref }}
         run: |
