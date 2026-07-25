@@ -124,6 +124,10 @@ const COMPETING_WRANGLER_RE = /^wrangler\.(json|toml|.+\.(json|jsonc|toml))$/;
  * copies, plus the repo-local rules (CLAUDE.md headers, no package-manager
  * config, no wrangler cache dirs).
  *
+ * (Check numbering has gaps — 1, 1b, 7, 7b, 8: checks 2–6 were retired when
+ * wrangler.jsonc stopped being app-owned. The survivors keep their original
+ * numbers so existing references don't shift.)
+ *
  * @param {string} appDir
  * @returns {{ok: boolean, violations: string[]}}
  */

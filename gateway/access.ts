@@ -2,6 +2,10 @@ import { jwtVerify } from "jose";
 
 export const ACCESS_JWT_HEADER = "cf-access-jwt-assertion";
 export const ACCESS_COOKIE = "CF_Authorization";
+// The platform group prefix. Only `inno-` groups are carried into the
+// container (prod filter here + the dev X-Mock-Groups filter in index.ts) —
+// one constant so the two paths can't drift.
+export const GROUP_PREFIX = "inno-";
 
 export interface AccessIdentity { email: string; groups: string[] }
 
@@ -27,7 +31,7 @@ export async function verifyAccessJwt(
       throw new Error("no email claim");
     }
     const rawGroups = Array.isArray(payload.groups) ? payload.groups : [];
-    const groups = rawGroups.filter((g): g is string => typeof g === "string" && g.startsWith("inno-"));
+    const groups = rawGroups.filter((g): g is string => typeof g === "string" && g.startsWith(GROUP_PREFIX));
     return { email, groups };
   } catch (e) {
     throw new Error(`access_invalid:${String(e).slice(0, 120)}`);

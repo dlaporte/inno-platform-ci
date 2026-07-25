@@ -3,9 +3,10 @@
 // deploy` succeeds, so the broker can attach the app's DNS/domain and mark
 // the deployment (and app) as live.
 //
-// Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> [token]
+// Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> [token] [gatewayRef]
 // `token` (the GitHub Actions OIDC token, verified server-side) falls back to
-// $ACTIONS_ID_TOKEN if not passed as an argument.
+// $ACTIONS_ID_TOKEN if not passed as an argument. `gatewayRef` records which
+// promoted gateway build was injected into this deploy.
 
 import { brokerPost } from "./broker-post.mjs";
 import { isMainModule } from "./cli.mjs";

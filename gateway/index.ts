@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { Container, getContainer } from "@cloudflare/containers";
 import { createRemoteJWKSet } from "jose";
 import type { Env } from "./env";
-import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, type AccessIdentity } from "./access";
+import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, GROUP_PREFIX, type AccessIdentity } from "./access";
 import { sanitizeAndInject } from "./identity";
 import { handleStorage } from "./storage";
 
@@ -77,23 +77,24 @@ export function makeApp(deps: Deps = realDeps) {
         email: c.req.header("X-Mock-User") ?? "dev@davidlaporte.org",
         // Same inno- filter production applies (access.ts), so dev can't inject
         // a non-inno group the real path would strip.
-        groups: (c.req.header("X-Mock-Groups") ?? "").split(",").map((s) => s.trim()).filter((g) => g.startsWith("inno-")),
+        groups: (c.req.header("X-Mock-Groups") ?? "").split(",").map((s) => s.trim()).filter((g) => g.startsWith(GROUP_PREFIX)),
       };
     } else {
+      const path = c.req.path;
       const token = c.req.header(ACCESS_JWT_HEADER) ?? readCookie(c.req.raw, ACCESS_COOKIE);
-      if (!token) { console.warn(`gateway: 401 no Access token (${c.req.method} ${new URL(c.req.url).pathname})`); return c.text("unauthorized", 401); }
+      if (!token) { console.warn(`gateway: 401 no Access token (${c.req.method} ${path})`); return c.text("unauthorized", 401); }
       // The platform's health probe authenticates with an Access SERVICE
       // token — a valid JWT with no user identity. It is accepted for
       // exactly one request shape: GET /healthz. Any other path keeps the
       // hard identity requirement (a service token can never browse the app
       // or reach data as a person).
-      const isHealthProbe = c.req.method === "GET" && new URL(c.req.url).pathname === "/healthz";
+      const isHealthProbe = c.req.method === "GET" && path === "/healthz";
       try {
         identity = await verifyAccessJwt(token,
           { jwks: deps.jwks(env), aud: env.ACCESS_AUD, teamDomain: env.ACCESS_TEAM_DOMAIN },
           { allowService: isHealthProbe });
       } catch (e) {
-        console.warn(`gateway: 401 ${String(e).slice(0, 120)} (${c.req.method} ${new URL(c.req.url).pathname})`);
+        console.warn(`gateway: 401 ${String(e).slice(0, 120)} (${c.req.method} ${path})`);
         return c.text("unauthorized", 401);
       }
     }

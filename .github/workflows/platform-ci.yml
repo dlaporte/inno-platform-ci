@@ -11,13 +11,13 @@ name: Platform CI
 # — the copy the checkouts below actually fetch.
 #
 # Published byte-for-byte to dlaporte/inno-platform-ci (see OPERATIONS §7.2.2).
-# This workflow is invoked (via `uses:`) by the thin caller workflow that
-# ships in every generated app repo (`inno-template`'s
-# `.github/workflows/deploy.yml`, copied into every `inno-{app}` repo), and
-# by registered third-party repos (register_app), whose hand-added deploy.yml
-# passes `with: app:`. No caller workflow is trusted — its contents can be
-# edited by the app author. All enforcement lives here, in the uneditable
-# reusable workflow:
+# This workflow is invoked (via `uses:`) by the thin caller workflow in each
+# app's USER-OWNED repo — registered via register_app (OPERATIONS §7.2.4), whose
+# `.github/workflows/deploy.yml` passes `with: app:`. (The template ships a
+# starter deploy.yml, but the repo and its name belong to the user; the platform
+# no longer generates `inno-{app}` repos.) No caller workflow is trusted — its
+# contents can be edited by the app author. All enforcement lives here, in the
+# uneditable reusable workflow:
 #
 #   - Every gate job below MUST exit non-zero on a finding, so that the
 #     `deploy` job's `needs:` blocks the deploy on any failure. A gate that
