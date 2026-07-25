@@ -114,36 +114,12 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud } = 
     throw new Error(`template markers remain after substitution: ${stillPresent.map((m) => m.pattern).join(", ")}`);
   }
 
-  // Enforce workers_dev: false (perimeter hardening). The *.workers.dev URL is
-  // NOT behind Cloudflare Access — closing it makes the Access-protected custom
-  // hostname the sole ingress. Enforced here so it applies to EVERY app at
-  // deploy, including apps whose committed wrangler.jsonc predates this policy.
-  //
-  // Decide from the comment-stripped PARSE — exactly what `wrangler deploy`
-  // reads — never from raw text. A raw-text regex/replace can be fooled by a
-  // comment that hosts a stray `{` (the injected key lands inside the comment)
-  // or that merely mentions the key (injection is skipped): wrangler then
-  // strips comments and deploys with the ingress silently left open.
-  let config;
-  try {
-    config = JSON.parse(stripJsonComments(out));
-  } catch (e) {
-    throw new Error(`templated wrangler.jsonc is not valid JSON: ${e.message}`);
-  }
-  if (config.workers_dev !== false) {
-    // Absent or truthy: normalize to a comment-free JSON document with the flag
-    // forced false. Only this corrective branch rewrites; a compliant config
-    // (workers_dev already false) passes through untouched, comments intact.
-    config.workers_dev = false;
-    out = JSON.stringify(config, null, 2) + "\n";
-  }
-  // Post-condition on the PARSE, not raw text: fail loud rather than ever
-  // deploy with the workers.dev ingress left open.
-  if (JSON.parse(stripJsonComments(out)).workers_dev !== false) {
-    throw new Error("workers_dev must be exactly `false` after templating");
-  }
-
-  return out;
+  // Enforce workers_dev: false (perimeter hardening) via the shared helper, so
+  // the container and worker paths apply the identical rule. The *.workers.dev
+  // URL is NOT behind Cloudflare Access — closing it makes the Access-protected
+  // custom hostname the sole ingress; applied to EVERY app at deploy, including
+  // apps whose committed wrangler.jsonc predates this policy.
+  return forceWorkersDevFalse(out, "wrangler.jsonc");
 }
 
 // --- Worker-type templating (migration 0022) --------------------------------
@@ -188,6 +164,17 @@ function applyMarkers(text, markers) {
 
 // workers_dev:false enforced from the comment-stripped PARSE (what wrangler
 // reads), never raw text — identical reasoning to templateWrangler's block.
+// Force `workers_dev: false` on a templated wrangler config. Shared by the
+// container path (templateWrangler) and the worker templaters so all deploy
+// types close the *.workers.dev ingress identically.
+//
+// Decide from the comment-stripped PARSE — exactly what `wrangler deploy` reads
+// — never from raw text. A raw-text regex/replace can be fooled by a comment
+// that hosts a stray `{` (the injected key lands inside the comment) or that
+// merely mentions the key (injection skipped): wrangler then strips comments
+// and deploys with the ingress silently left open. A compliant config
+// (workers_dev already false) passes through untouched, comments intact; only
+// the corrective branch rewrites to comment-free JSON.
 function forceWorkersDevFalse(out, label) {
   let config;
   try { config = JSON.parse(stripJsonComments(out)); }
