@@ -63,26 +63,12 @@ function countMatches(text, re) {
  * @returns {string} the substituted JSONC text
  */
 export function templateWrangler(wranglerText, { app, databaseId, accessAud } = {}) {
-  if (typeof app !== "string" || !APP_NAME_RE.test(app)) {
-    throw new Error(`invalid app name: ${JSON.stringify(app)} (must match ${APP_NAME_RE})`);
-  }
-  if (RESERVED_APP_NAMES.includes(app)) {
-    throw new Error(`reserved app name: ${app}`);
-  }
-  // "null"/"undefined" as literal strings are what `jq -r .missing_field`
-  // yields when the broker response lacks a field — a non-empty string that
-  // would otherwise pass these checks and surface later as a baffling
-  // Cloudflare error instead of a clear "broker returned a malformed response".
-  const JQ_MISSING_LITERALS = new Set(["null", "undefined"]);
-  if (typeof databaseId !== "string" || databaseId.length === 0 || JQ_MISSING_LITERALS.has(databaseId)) {
-    throw new Error(`invalid databaseId: ${JSON.stringify(databaseId)}`);
-  }
-  if (typeof accessAud !== "string" || accessAud.length === 0 || JQ_MISSING_LITERALS.has(accessAud)) {
-    throw new Error(`invalid accessAud: ${JSON.stringify(accessAud)}`);
-  }
-  if (UNSAFE_VALUE_RE.test(databaseId) || UNSAFE_VALUE_RE.test(accessAud)) {
-    throw new Error("invalid character in deploy parameter");
-  }
+  // Shared validation so the container path and the worker templaters enforce
+  // identical app-name and deploy-value rules (jq missing-field literals,
+  // unsafe characters). See assertAppName/assertDeployValue below.
+  assertAppName(app);
+  assertDeployValue("databaseId", databaseId);
+  assertDeployValue("accessAud", accessAud);
 
   // Safety net: the template must have exactly two bare `"REPLACE"` literal
   // occurrences (database_id and ACCESS_AUD both start out as "REPLACE").

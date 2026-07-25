@@ -344,7 +344,7 @@ jobs:
 
       # No `cache: npm` here: this job never runs `npm ci`/`npm install` (the
       # docker build below is a wholly separate build context, and the only
-      # runner-side use of node is running platform-ci/ci/sbom-upload.mjs
+      # runner-side use of node is running inno-platform-ci/ci/sbom-upload.mjs
       # directly). A cache key would have to hash a root lockfile that, once
       # app repos stop vendoring worker build inputs, won't exist here — this
       # job never checks out `gateway/` or injects anything.
@@ -436,7 +436,7 @@ jobs:
         with:
           repository: dlaporte/inno-platform-ci
           ref: ${{ env.PLATFORM_REF }}
-          path: platform-ci
+          path: inno-platform-ci
 
       - name: Get OIDC token (audience=inno-platform-deploy)
         id: oidc_sbom
@@ -454,7 +454,7 @@ jobs:
           OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
           APP: ${{ needs.policy.outputs.app }}
         run: |
-          node platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$OIDC_TOKEN" \
+          node inno-platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$OIDC_TOKEN" \
             || echo "::warning::SBOM upload failed — the safety sweep will keep using the previous deployment's SBOM"
 
       - name: Assert non-root user + EXPOSE 8080
@@ -569,7 +569,7 @@ jobs:
         with:
           repository: dlaporte/inno-platform-ci
           ref: ${{ env.PLATFORM_REF }}
-          path: platform-ci
+          path: inno-platform-ci
           # This checkout lands inside the app root that becomes the wrangler
           # docker build context below. It's an anonymous public checkout, so
           # there is no credential to leak — persist-credentials:false stays
@@ -706,7 +706,7 @@ jobs:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
           ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
-        run: node platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" wrangler.jsonc
+        run: node inno-platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" wrangler.jsonc
 
       - name: Template worker configs (gateway + app worker)
         if: needs.policy.outputs.app_type == 'worker'
@@ -717,8 +717,8 @@ jobs:
         run: |
           # The gateway config (wrangler.jsonc here = the worker-gateway variant)
           # takes only the Access AUD + names; the app worker takes the D1 id.
-          node platform-ci/ci/template-wrangler.mjs --worker-gateway "$APP" "$ACCESS_AUD" wrangler.jsonc
-          node platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
+          node inno-platform-ci/ci/template-wrangler.mjs --worker-gateway "$APP" "$ACCESS_AUD" wrangler.jsonc
+          node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
 
       # NOTE (token-ordering, spec §5.2): `wrangler deploy` re-builds the
       # Dockerfile locally (containers[0].image is "./Dockerfile", enforced
@@ -793,7 +793,7 @@ jobs:
           GATEWAY_REF: ${{ needs.policy.outputs.gateway_ref }}
         run: |
           set -e
-          result="$(node platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$GATEWAY_REF")"
+          result="$(node inno-platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$GATEWAY_REF")"
           echo "$result"
           url="$(echo "$result" | jq -r .url)"
           echo "Deployed: $url"

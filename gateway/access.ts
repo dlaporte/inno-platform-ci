@@ -3,7 +3,7 @@ import { jwtVerify } from "jose";
 export const ACCESS_JWT_HEADER = "cf-access-jwt-assertion";
 export const ACCESS_COOKIE = "CF_Authorization";
 
-export interface AccessIdentity { email: string; groups: string[]; service?: boolean }
+export interface AccessIdentity { email: string; groups: string[] }
 
 export async function verifyAccessJwt(
   token: string,
@@ -22,7 +22,7 @@ export async function verifyAccessJwt(
       // does so for GET /healthz alone) accept them; everywhere else an
       // identity-less token stays a hard 401.
       if (allowService && typeof payload.common_name === "string" && payload.common_name) {
-        return { email: "", groups: [], service: true };
+        return { email: "", groups: [] };
       }
       throw new Error("no email claim");
     }

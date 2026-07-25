@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Config-integrity gate: verifies a generated app repo has not weakened the
+// Config-integrity gate: verifies an app repo has not weakened the
 // security posture the platform requires (CLAUDE.md guidance present,
 // production auth mode, container image/limits unchanged, gateway not
 // vendored into the app repo — the platform injects it at build time).
@@ -117,7 +117,7 @@ const PINNED_BUILD_INPUT_FILES = ["package.json", "package-lock.json", "tsconfig
 const COMPETING_WRANGLER_RE = /^wrangler\.(json|toml|.+\.(json|jsonc|toml))$/;
 
 /**
- * Check that `appDir` (a generated app repo) complies with the platform's
+ * Check that `appDir` (a registered app repo) complies with the platform's
  * config-integrity requirements. Everything platform-owned (gateway source,
  * worker build inputs, wrangler.jsonc) is INJECTED at build time from the
  * promoted gateway.ref — this gate verifies the repo does not carry shadow
@@ -219,24 +219,25 @@ export function checkConfig(appDir) {
     );
   }
 
-  // --- Check 7b: scaffold/ must NOT exist — provisioning prunes the ---
-  // deployment-type scaffolds out of every generated repo; a surviving
+  // --- Check 7b: scaffold/ must NOT exist — registration prunes the ---
+  // deployment-type scaffolds out of every app repo; a surviving
   // scaffold/ means the prune failed (or the template was copied by hand)
   // and the repo is carrying BOTH variants' files.
   //
-  // EXCEPT while app/.needs-build exists: the GENERATE commit fires its own
-  // CI run before provisioning's prune commit lands, and that run checks out
+  // EXCEPT while app/.needs-build exists: the template-generation commit (the
+  // user's "Use this template") fires its own
+  // CI run before registration's prune commit lands, and that run checks out
   // the pristine, unpruned template — failing it would redline every new
-  // app's very first run for a state the platform itself created seconds
-  // earlier. The marker is the platform's existing "not an app yet" signal
-  // (scaffold-check skips deploys on it), and deleting it to start building
-  // re-arms this check; a genuinely failed prune can't deploy anyway
-  // (provisioning halts before the deploy prerequisites exist).
+  // app's very first run for a transient state that only exists until
+  // registration's prune commit lands. The marker is the platform's existing
+  // "not an app yet" signal (scaffold-check skips deploys on it), and deleting
+  // it to start building re-arms this check; a genuinely failed prune can't
+  // deploy anyway (registration halts before the deploy prerequisites exist).
   let scaffoldPresent = false;
   try { lstatSync(join(appDir, "scaffold")); scaffoldPresent = true; } catch {}
   if (scaffoldPresent && !existsSync(join(appDir, "app", ".needs-build"))) {
     violations.push(
-      "delete scaffold/ — the deployment-type scaffold directory is template-only; provisioning prunes it out of generated repos",
+      "delete scaffold/ — the deployment-type scaffold directory is template-only; registration prunes it out of app repos",
     );
   }
 

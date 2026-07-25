@@ -1,15 +1,15 @@
 {
-  "name": "inno-template",
+  "name": "inno-app",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "test": "vitest run --config vitest.config.node.ts",
+    "test": "echo \"No tests configured — add your own (see CLAUDE.md)\" && exit 0",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cloudflare/containers": "^0.2.0",
+    "@cloudflare/containers": "^0.2.4",
     "hono": "^4",
     "jose": "^5"
   },

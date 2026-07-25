@@ -2,6 +2,11 @@ import type { Env } from "./env";
 
 type S = Pick<Env, "DB" | "FILES">;
 
+// Per-object upload cap (25 MiB). Enforced only when the client sends a
+// content-length header — a chunked PUT with no length streams to R2, where
+// R2's own object-size limits apply as the backstop.
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
 export async function handleStorage(request: Request, env: S): Promise<Response> {
   try {
     const url = new URL(request.url);
@@ -29,7 +34,7 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       const key = decodeURIComponent(fileMatch[1]);
       if (m === "PUT") {
         const len = request.headers.get("content-length");
-        if (len && Number(len) > 26214400) return json({ error: "too_large" }, 413);
+        if (len && Number(len) > MAX_UPLOAD_BYTES) return json({ error: "too_large" }, 413);
         await env.FILES.put(key, request.body);
         return json({ key });
       }

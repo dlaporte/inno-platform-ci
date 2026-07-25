@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { Container, getContainer } from "@cloudflare/containers";
 import { createRemoteJWKSet } from "jose";
 import type { Env } from "./env";
-import { verifyAccessJwt, ACCESS_JWT_HEADER, type AccessIdentity } from "./access";
+import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, type AccessIdentity } from "./access";
 import { sanitizeAndInject } from "./identity";
 import { handleStorage } from "./storage";
 
@@ -12,6 +12,11 @@ import { handleStorage } from "./storage";
 // this, container startup fails with "ctx.exports.ContainerProxy is undefined".
 export { ContainerProxy } from "@cloudflare/containers";
 
+// NOTE: the lowercased class name is load-bearing OUTSIDE this worker —
+// src/naming.ts `containerAppName` derives the billed Cloudflare Container
+// application name as `<worker>-appcontainer` from `class AppContainer`.
+// Renaming this class silently orphans the billed container on teardown; keep
+// the two in sync (see the reciprocal note in src/naming.ts).
 export class AppContainer extends Container<Env> {
   defaultPort = 8080;
   // Scale-to-zero timeout. The platform injects SLEEP_AFTER at deploy time
@@ -70,11 +75,13 @@ export function makeApp(deps: Deps = realDeps) {
     if (env.ENVIRONMENT === "dev") {
       identity = {
         email: c.req.header("X-Mock-User") ?? "dev@davidlaporte.org",
-        groups: (c.req.header("X-Mock-Groups") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+        // Same inno- filter production applies (access.ts), so dev can't inject
+        // a non-inno group the real path would strip.
+        groups: (c.req.header("X-Mock-Groups") ?? "").split(",").map((s) => s.trim()).filter((g) => g.startsWith("inno-")),
       };
     } else {
-      const token = c.req.header(ACCESS_JWT_HEADER) ?? readCookie(c.req.raw, "CF_Authorization");
-      if (!token) return c.text("unauthorized", 401);
+      const token = c.req.header(ACCESS_JWT_HEADER) ?? readCookie(c.req.raw, ACCESS_COOKIE);
+      if (!token) { console.warn(`gateway: 401 no Access token (${c.req.method} ${new URL(c.req.url).pathname})`); return c.text("unauthorized", 401); }
       // The platform's health probe authenticates with an Access SERVICE
       // token — a valid JWT with no user identity. It is accepted for
       // exactly one request shape: GET /healthz. Any other path keeps the
@@ -85,7 +92,8 @@ export function makeApp(deps: Deps = realDeps) {
         identity = await verifyAccessJwt(token,
           { jwks: deps.jwks(env), aud: env.ACCESS_AUD, teamDomain: env.ACCESS_TEAM_DOMAIN },
           { allowService: isHealthProbe });
-      } catch {
+      } catch (e) {
+        console.warn(`gateway: 401 ${String(e).slice(0, 120)} (${c.req.method} ${new URL(c.req.url).pathname})`);
         return c.text("unauthorized", 401);
       }
     }
