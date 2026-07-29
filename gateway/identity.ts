@@ -7,9 +7,20 @@ import type { AccessIdentity } from "./access";
 const STRIP_EXACT = ["x-forwarded-user", "x-forwarded-groups", "x-forwarded-email"];
 const STRIP_PREFIXES = ["cf-access-"];
 
-export function sanitizeAndInject(req: Request, identity: AccessIdentity): Request {
+// In MCP mode the caller's credential is a platform-issued OAuth bearer token in
+// `Authorization`. The gateway has already consumed it, and the app must never
+// see it: a leaked app-scoped token would let the app impersonate its own user
+// against the platform, and R3 says the app performs no authentication anyway.
+// Stripped only in MCP mode — on the Access path `Authorization` is not a
+// platform credential, and removing it there would be a silent behavior change
+// for existing apps.
+const STRIP_EXACT_MCP = [...STRIP_EXACT, "authorization"];
+
+export function sanitizeAndInject(
+  req: Request, identity: AccessIdentity, opts: { mcpMode?: boolean } = {},
+): Request {
   const headers = new Headers(req.headers);
-  for (const h of STRIP_EXACT) headers.delete(h);
+  for (const h of opts.mcpMode ? STRIP_EXACT_MCP : STRIP_EXACT) headers.delete(h);
   // Headers.keys() are already lowercased by the Fetch API, so no toLowerCase.
   for (const name of [...headers.keys()]) {
     if (STRIP_PREFIXES.some((p) => name.startsWith(p))) headers.delete(name);

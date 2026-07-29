@@ -87,6 +87,11 @@ jobs:
       gateway_ref: ${{ steps.fetch.outputs.gateway_ref }}
       min_release_age_days: ${{ steps.fetch.outputs.min_release_age_days }}
       app_type: ${{ steps.fetch.outputs.app_type }}
+      # 'true' for the types whose code is an app-owned Worker behind the gateway
+      # ('worker' and 'mcp'), i.e. NOT a container image. Derived once here so the
+      # container-only gates and the worker-shaped deploy each test a single flag
+      # instead of enumerating types (mirrors isWorkerShaped in src/registry.ts).
+      worker_shaped: ${{ steps.fetch.outputs.worker_shaped }}
       app: ${{ steps.app.outputs.app }}
     steps:
       # `app` is caller-asserted; safe only because the broker binds the signed
@@ -134,6 +139,7 @@ jobs:
             # build path (a worker app that can't be identified just runs the
             # container gates, which its repo won't satisfy, and fails safely).
             echo "app_type=container" >> "$GITHUB_OUTPUT"
+            echo "worker_shaped=false" >> "$GITHUB_OUTPUT"
             # Cooldown has no "secure default" that could block a legit deploy on
             # a broker outage — a length-of-time gate isn't a safety scanner — so
             # it fails OPEN to 0 (off), consistent with never blocking on the
@@ -161,9 +167,20 @@ jobs:
           echo "gateway_ref=$(printf '%s' "$resp" | jq -r '(.gateway_ref // empty) | select(test("^[0-9a-fA-F]{7,40}$"))')" >> "$GITHUB_OUTPUT"
           # Numeric cooldown threshold; a missing/garbage value reads 0 (off).
           echo "min_release_age_days=$(printf '%s' "$resp" | jq -r '(.min_release_age_days // 0) | if type=="number" then . else 0 end')" >> "$GITHUB_OUTPUT"
-          # Deployment type: only "worker" opts into the worker path; anything
-          # else (incl. a missing field) reads "container" — the original path.
-          echo "app_type=$(printf '%s' "$resp" | jq -r 'if .type == "worker" then "worker" else "container" end')" >> "$GITHUB_OUTPUT"
+          # Deployment type: "worker" and "mcp" opt into the app-owned-Worker
+          # path; anything else (incl. a missing field) reads "container" — the
+          # original path. Normalized to exactly one of the three known values,
+          # so the `== 'container'` / worker_shaped conditions below are exhaustive.
+          app_type="$(printf '%s' "$resp" | jq -r 'if .type == "worker" then "worker" elif .type == "mcp" then "mcp" else "container" end')"
+          echo "app_type=$app_type" >> "$GITHUB_OUTPUT"
+          # Both worker-shaped types skip the container gates and share the
+          # app-Worker-then-gateway deploy; only the injected gateway config and
+          # its templating differ.
+          if [ "$app_type" = "worker" ] || [ "$app_type" = "mcp" ]; then
+            echo "worker_shaped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "worker_shaped=false" >> "$GITHUB_OUTPUT"
+          fi
 
   config-integrity:
     runs-on: ubuntu-latest
@@ -377,16 +394,17 @@ jobs:
             cat .trivyignore.platform
           fi
 
-      # Worker-type apps have no Dockerfile — every image step below is guarded
-      # by app_type != 'worker'. The job still runs (and SUCCEEDS with the image
-      # steps skipped) so the deploy job's `needs: [container]` is satisfied; a
-      # skipped whole job would instead skip the deploy.
+      # Worker-shaped apps ('worker' and 'mcp') have no Dockerfile — every image
+      # step below is guarded by worker_shaped != 'true'. The job still runs (and
+      # SUCCEEDS with the image steps skipped) so the deploy job's
+      # `needs: [container]` is satisfied; a skipped whole job would instead skip
+      # the deploy.
       - name: docker build (isolated — no deploy token present)
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         run: docker build -t app-under-test .
 
       - name: Trivy image scan (fail on HIGH/CRITICAL)
-        if: needs.policy.outputs.app_type != 'worker' && steps.gate.outputs.enabled == 'true'
+        if: needs.policy.outputs.worker_shaped != 'true' && steps.gate.outputs.enabled == 'true'
         # Run trivy directly via its official image rather than the
         # setup-trivy action — deterministic, and we authenticate the
         # vuln-DB pull with github.token to avoid anonymous ghcr rate limits
@@ -415,7 +433,7 @@ jobs:
       # /deploy-complete promotes it to the live pointer. Best-effort: a failed
       # upload warns and the build proceeds (the sweep keeps the previous SBOM).
       - name: Generate SBOM (CycloneDX)
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         env:
           TRIVY_TOKEN: ${{ github.token }}
         run: |
@@ -431,7 +449,7 @@ jobs:
               app-under-test
 
       - name: Checkout inno-platform (ci/ scripts)
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: dlaporte/inno-platform-ci
@@ -440,7 +458,7 @@ jobs:
 
       - name: Get OIDC token (audience=inno-platform-deploy)
         id: oidc_sbom
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
@@ -449,7 +467,7 @@ jobs:
             core.setOutput('token', token);
 
       - name: Upload SBOM to broker (best-effort)
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         env:
           OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
           APP: ${{ needs.policy.outputs.app }}
@@ -458,7 +476,7 @@ jobs:
             || echo "::warning::SBOM upload failed — the safety sweep will keep using the previous deployment's SBOM"
 
       - name: Assert non-root user + EXPOSE 8080
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         run: |
           set -e
           user="$(docker inspect --format='{{.Config.User}}' app-under-test)"
@@ -481,7 +499,7 @@ jobs:
       # storage-independent, per the application contract). The platform's
       # runtime health probe binds to the same endpoint after deploy.
       - name: Smoke test /healthz
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         run: |
           set -e
           docker run -d --name smoke -p 8080:8080 app-under-test
@@ -610,20 +628,26 @@ jobs:
           [ -f gateway-src/gateway/wrangler.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the wrangler.jsonc move — promote a current platform SHA"; exit 1; }
           rm -rf src/gateway
           mkdir -p src/gateway
-          # The gateway SOURCE is identical for both types (src/gateway/index.ts
-          # dispatches on the APP_WORKER binding); only the wrangler config
-          # differs. package.json/lock/tsconfig are the gateway's build inputs.
+          # The gateway SOURCE is identical for ALL types (src/gateway/index.ts
+          # dispatches on MCP_MODE and the APP_WORKER binding); only the wrangler
+          # config differs. package.json/lock/tsconfig are the gateway's build inputs.
           cp gateway-src/gateway/*.ts src/gateway/
           cp gateway-src/gateway/package.json gateway-src/gateway/package-lock.json gateway-src/gateway/tsconfig.json .
-          if [ "$APP_TYPE" = "worker" ]; then
-            # Worker-type: the gateway config is the service-binding variant, and
-            # the app's own Worker gets its own config. app/index.ts (the app
-            # author's fetch handler) and app/package.json (its deps, if any)
-            # come from the app repo — not injected.
-            [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
+          if [ "$APP_TYPE" = "worker" ] || [ "$APP_TYPE" = "mcp" ]; then
+            # Worker-shaped: the app's own Worker gets its own config, and the
+            # gateway gets the variant matching its identity boundary — the
+            # Access-terminating one for 'worker', the OAuth-terminating one for
+            # 'mcp'. app/index.ts (the app author's fetch handler) and
+            # app/package.json (its deps, if any) come from the app repo.
             [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
-            cp gateway-src/gateway/wrangler.worker.jsonc wrangler.jsonc
             cp gateway-src/gateway/app-worker.jsonc app-worker.jsonc
+            if [ "$APP_TYPE" = "mcp" ]; then
+              [ -f gateway-src/gateway/wrangler.mcp.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp deployment type — promote a current platform SHA"; exit 1; }
+              cp gateway-src/gateway/wrangler.mcp.jsonc wrangler.jsonc
+            else
+              [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
+              cp gateway-src/gateway/wrangler.worker.jsonc wrangler.jsonc
+            fi
           else
             cp gateway-src/gateway/wrangler.jsonc .
           fi
@@ -686,6 +710,11 @@ jobs:
           # Effective container.sleep_after from the platform config store;
           # default defensively if an older broker doesn't return it.
           sleep_after="$(echo "$resp" | jq -r '.sleep_after // "10m"')"
+          # mcp-type only: this app's RFC 8707/9728 resource identifier. Emitted as
+          # the empty string for the other types (the templater rejects an empty
+          # value, so an mcp deploy against an older broker fails loudly rather
+          # than pinning a bogus audience).
+          mcp_resource="$(echo "$resp" | jq -r '.mcp_resource // empty')"
 
           echo "::add-mask::$token"
           {
@@ -694,6 +723,7 @@ jobs:
             echo "access_aud=$access_aud"
             echo "deployment_id=$deployment_id"
             echo "sleep_after=$sleep_after"
+            echo "mcp_resource=$mcp_resource"
           } >> "$GITHUB_OUTPUT"
 
       - name: Install app dependencies
@@ -701,7 +731,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Template wrangler.jsonc (container)
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -720,6 +750,21 @@ jobs:
           node inno-platform-ci/ci/template-wrangler.mjs --worker-gateway "$APP" "$ACCESS_AUD" wrangler.jsonc
           node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
 
+      # mcp-type: the app worker config is identical to the worker type's, but the
+      # gateway is keyed by this app's RFC 8707/9728 resource identifier instead of
+      # an Access AUD (these apps have no Access application). MCP_RESOURCE comes
+      # from the broker so the value the gateway pins a token's audience against is
+      # never rebuilt in CI.
+      - name: Template mcp configs (gateway + app worker)
+        if: needs.policy.outputs.app_type == 'mcp'
+        env:
+          APP: ${{ needs.policy.outputs.app }}
+          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
+          MCP_RESOURCE: ${{ steps.deploy_token.outputs.mcp_resource }}
+        run: |
+          node inno-platform-ci/ci/template-wrangler.mjs --mcp-gateway "$APP" "$MCP_RESOURCE" wrangler.jsonc
+          node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
+
       # NOTE (token-ordering, spec §5.2): `wrangler deploy` re-builds the
       # Dockerfile locally (containers[0].image is "./Dockerfile", enforced
       # by the config-integrity gate) — this is a SECOND build of the same
@@ -736,7 +781,7 @@ jobs:
       # passes CLOUDFLARE_API_TOKEN — do not add one without re-reviewing the
       # token-exfil surface.
       - name: wrangler deploy (container)
-        if: needs.policy.outputs.app_type != 'worker'
+        if: needs.policy.outputs.worker_shaped != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
           # The minted deploy token is narrowly scoped and cannot call
@@ -755,12 +800,14 @@ jobs:
         # one ever slipped through (suspenders).
         run: CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4" npx wrangler deploy --config wrangler.jsonc --var "SLEEP_AFTER:$SLEEP_AFTER"
 
-      # Worker-type: deploy the app's own Worker FIRST (so the gateway's service
-      # binding resolves), then the gateway. The app Worker has workers_dev:false
-      # and no route, so only the gateway can reach it. No SLEEP_AFTER (that is a
-      # container knob). The same deploy token deploys both scripts.
-      - name: "wrangler deploy (worker: app Worker then gateway)"
-        if: needs.policy.outputs.app_type == 'worker'
+      # Worker-shaped ('worker' and 'mcp'): deploy the app's own Worker FIRST (so
+      # the gateway's service binding resolves), then the gateway. The app Worker
+      # has workers_dev:false and no route, so only the gateway can reach it. No
+      # SLEEP_AFTER (that is a container knob). The same deploy token deploys both
+      # scripts. Identical for both types — only the gateway CONFIG differed, and
+      # that was already chosen at injection/templating time.
+      - name: "wrangler deploy (worker-shaped: app Worker then gateway)"
+        if: needs.policy.outputs.worker_shaped == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
           CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24

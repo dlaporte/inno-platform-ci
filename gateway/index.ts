@@ -5,6 +5,9 @@ import type { Env } from "./env";
 import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, GROUP_PREFIX, type AccessIdentity } from "./access";
 import { sanitizeAndInject } from "./identity";
 import { handleStorage } from "./storage";
+import {
+  authenticateMcp, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
+} from "./mcp-auth";
 
 // The @cloudflare/containers runtime routes container calls through an internal
 // `ContainerProxy` Durable Object that it looks up via `ctx.exports.ContainerProxy`.
@@ -62,6 +65,19 @@ export const realDeps: Deps = {
   forwardToWorker: (env, req) => env.APP_WORKER!.fetch(req),
 };
 
+// Hono's `c.executionCtx` GETTER throws ("This context has no ExecutionContext")
+// when the app was invoked without one — as `app.fetch(req, env)` does in tests.
+// So it cannot be probed with optional chaining; it has to be caught. Returning
+// undefined lets callers fall back to awaiting their background work inline.
+function safeWaitUntil(c: { executionCtx: { waitUntil(p: Promise<unknown>): void } }): ((p: Promise<unknown>) => void) | undefined {
+  try {
+    const ctx = c.executionCtx;
+    return (p) => ctx.waitUntil(p);
+  } catch {
+    return undefined;
+  }
+}
+
 function readCookie(req: Request, name: string): string | undefined {
   const raw = req.headers.get("cookie") ?? "";
   return raw.split(";").map((s) => s.trim()).find((c) => c.startsWith(`${name}=`))?.slice(name.length + 1);
@@ -72,7 +88,30 @@ export function makeApp(deps: Deps = realDeps) {
   app.all("*", async (c) => {
     const env = c.env;
     let identity: AccessIdentity;
-    if (env.ENVIRONMENT === "dev") {
+    // MCP mode (mcp-type apps): this gateway is an OAuth Resource Server, not an
+    // Access-terminating proxy. Handled before the dev branch so the discovery
+    // document and the 401 challenge behave identically in dev and production —
+    // an MCP client's very first request depends on both.
+    if (env.MCP_MODE === "true") {
+      const path = c.req.path;
+      // Public, unauthenticated by design: this is how a client with no token
+      // discovers which Authorization Server to use. Contains only URLs.
+      if (c.req.method === "GET" && isProtectedResourceRequest(env, path)) {
+        return protectedResourceMetadata(env);
+      }
+      const auth = await authenticateMcp(env, c.req.raw, env.MCP_RESOURCE ?? "", safeWaitUntil(c));
+      if (!auth) {
+        console.warn(`gateway: 401 no/invalid bearer (${c.req.method} ${path})`);
+        return unauthorizedChallenge(env);
+      }
+      // Same rule the Access path applies to its service token: a credential
+      // with no user identity is good for GET /healthz and nothing else.
+      if (auth.service && !(c.req.method === "GET" && path === "/healthz")) {
+        console.warn(`gateway: 403 service credential outside /healthz (${c.req.method} ${path})`);
+        return c.text("forbidden", 403);
+      }
+      identity = auth.identity;
+    } else if (env.ENVIRONMENT === "dev") {
       identity = {
         email: c.req.header("X-Mock-User") ?? "dev@davidlaporte.org",
         // Same inno- filter production applies (access.ts), so dev can't inject
@@ -81,6 +120,13 @@ export function makeApp(deps: Deps = realDeps) {
       };
     } else {
       const path = c.req.path;
+      // Fail CLOSED on a mis-templated deploy: without an AUD and team domain
+      // there is nothing to verify a JWT against, and proceeding would check the
+      // token against `undefined` rather than this app's Access application.
+      if (!env.ACCESS_AUD || !env.ACCESS_TEAM_DOMAIN) {
+        console.error("gateway: Access mode without ACCESS_AUD/ACCESS_TEAM_DOMAIN — refusing all requests");
+        return c.text("unauthorized", 401);
+      }
       const token = c.req.header(ACCESS_JWT_HEADER) ?? readCookie(c.req.raw, ACCESS_COOKIE);
       if (!token) { console.warn(`gateway: 401 no Access token (${c.req.method} ${path})`); return c.text("unauthorized", 401); }
       // The platform's health probe authenticates with an Access SERVICE
@@ -104,7 +150,7 @@ export function makeApp(deps: Deps = realDeps) {
     // handler above, reachable solely by the app's own container in-runtime.
     // Do not add a /_storage route here: that would let the public internet
     // reach handleStorage's arbitrary SQL/R2 access directly.
-    const proxied = sanitizeAndInject(c.req.raw, identity);
+    const proxied = sanitizeAndInject(c.req.raw, identity, { mcpMode: env.MCP_MODE === "true" });
     // Deployment-type dispatch: worker-type apps carry an APP_WORKER service
     // binding and forward to the app's own Worker; container-type apps (no such
     // binding) forward to the container. Either way the gateway did the Access

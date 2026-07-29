@@ -211,6 +211,30 @@ export function templateWorkerGateway(text, { app, accessAud } = {}) {
 }
 
 /**
+ * Template the mcp-type GATEWAY config (gateway/wrangler.mcp.jsonc).
+ * Same marker discipline as templateWorkerGateway, but the single "REPLACE" is
+ * MCP_RESOURCE (this app's RFC 8707/9728 resource identifier) rather than
+ * ACCESS_AUD — mcp apps have no Cloudflare Access application. The resource is
+ * compared by EXACT match against a token's audience, so it is validated as a
+ * deploy value and must arrive from the broker's `mcp_resource`, never be
+ * rebuilt here.
+ */
+export function templateMcpGateway(text, { app, mcpResource } = {}) {
+  assertAppName(app);
+  assertDeployValue("mcpResource", mcpResource);
+  const replaceCount = countMatches(text, /"REPLACE"/g);
+  if (replaceCount !== 1) {
+    throw new Error(`expected exactly 1 "REPLACE" marker (MCP_RESOURCE) in the mcp gateway config, found ${replaceCount}`);
+  }
+  const out = applyMarkers(text, [
+    { pattern: /"inno-app-replace-app"/, replacement: `"inno-app-${app}-app"` },
+    { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
+    { pattern: /("MCP_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${mcpResource}"` },
+  ]);
+  return forceWorkersDevFalse(out, "mcp gateway config");
+}
+
+/**
  * Template the worker-type APP WORKER config (gateway/app-worker.jsonc).
  * Markers: the worker name ("inno-app-replace-app"), D1 name/id, R2 bucket.
  * Exactly one "REPLACE" (database_id) — no ACCESS_AUD (the gateway owns Access).
@@ -238,6 +262,11 @@ if (isMainModule(import.meta.url)) {
     if (!app || !accessAud) { console.error("Usage: node ci/template-wrangler.mjs --worker-gateway <app> <accessAud> [path]"); process.exit(1); }
     writeFileSync(path, templateWorkerGateway(readFileSync(path, "utf8"), { app, accessAud }));
     console.log(`templated worker gateway ${path} for app "${app}"`);
+  } else if (mode === "--mcp-gateway") {
+    const [app, mcpResource, path = "wrangler.jsonc"] = rest;
+    if (!app || !mcpResource) { console.error("Usage: node ci/template-wrangler.mjs --mcp-gateway <app> <mcpResource> [path]"); process.exit(1); }
+    writeFileSync(path, templateMcpGateway(readFileSync(path, "utf8"), { app, mcpResource }));
+    console.log(`templated mcp gateway ${path} for app "${app}"`);
   } else if (mode === "--worker-app") {
     const [app, databaseId, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId) { console.error("Usage: node ci/template-wrangler.mjs --worker-app <app> <databaseId> [path]"); process.exit(1); }

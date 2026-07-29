@@ -1,0 +1,41 @@
+{
+  // Injected gateway config for MCP-TYPE apps. Same gateway code as the other
+  // two variants (src/gateway/index.ts); the difference is the IDENTITY
+  // BOUNDARY. An MCP client cannot complete an interactive Cloudflare Access
+  // login, so these apps have NO Access application: the gateway runs in MCP
+  // mode as an OAuth 2.1 Resource Server, verifying a platform-issued bearer
+  // token and injecting the same spoof-proof X-Forwarded-* headers the Access
+  // path injects. Templated per app by ci/template-wrangler.mjs
+  // (templateMcpGateway). See APP-CONTRACT §1.2.
+  "workers_dev": false,                 // perimeter: the *.workers.dev URL bypasses the platform's DNS/routing
+  "name": "inno-app-replace",           // orchestrator/deploy sets to inno-app-{name}
+  "main": "src/gateway/index.ts",
+  "compatibility_date": "2026-03-10",
+  "observability": { "enabled": true },
+  "services": [
+    // The app's own Worker — workers_dev:false and no route, so it is reachable
+    // ONLY through this binding. The gateway (which authenticates FIRST) stays
+    // the sole entrypoint and identity boundary, exactly as for worker-type apps.
+    { "binding": "APP_WORKER", "service": "inno-app-replace-app" },
+    // The control plane, for token introspection (POST /app-introspect). The
+    // platform's access tokens are opaque, so they cannot be verified locally.
+    // This binding IS the authentication for that endpoint — it is a capability
+    // the app author cannot obtain, because this file is platform-injected and
+    // the config-integrity gate rejects app-owned wrangler configs.
+    { "binding": "PLATFORM", "service": "inno-platform" }
+  ],
+  // MCP_MODE switches the gateway onto the bearer-token path. MCP_RESOURCE is
+  // this app's RFC 8707/9728 resource identifier, templated from the deploy
+  // broker's `mcp_resource`; it is compared by EXACT match against a token's
+  // audience, which is what stops a token minted for one app being replayed
+  // against another. MCP_AUTH_SERVER is a static deployment constant (the
+  // platform's own origin) advertised in the protected-resource metadata.
+  // Deliberately NO ACCESS_AUD / ACCESS_TEAM_DOMAIN: these apps have no Access
+  // application, and the gateway's Access branch fails closed without them.
+  "vars": {
+    "MCP_MODE": "true",
+    "MCP_RESOURCE": "REPLACE",
+    "MCP_AUTH_SERVER": "https://inno-platform.davidlaporte.org",
+    "ENVIRONMENT": "production"
+  }
+}
