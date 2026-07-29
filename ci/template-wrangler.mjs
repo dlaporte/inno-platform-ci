@@ -47,6 +47,69 @@ function countMatches(text, re) {
   return m ? m.length : 0;
 }
 
+// A linked binding name is derived by the platform (src/links.ts linkBindingFor)
+// from an app name, so it is always LINKED_ + upper-snake. Re-assert the shape
+// here rather than trusting the payload: this value is interpolated into the
+// deployed config, and the two reserved names below are the app's OWN storage.
+const LINK_BINDING_RE = /^LINKED_[A-Z][A-Z0-9_]*$/;
+const RESERVED_BINDINGS = new Set(["DATA", "FILES", "DB", "APP", "APP_WORKER", "PLATFORM"]);
+
+/**
+ * Parse and validate the linked-database payload the broker emitted
+ * (`linked_databases` on the deploy-token response), passed through CI as JSON
+ * in INNO_LINKED_DATABASES. Absent/empty is the common case and yields [].
+ *
+ * Every field is validated with the same rules as any other deploy value —
+ * these end up verbatim inside the deployed wrangler config.
+ */
+export function parseLinkedDatabases(raw) {
+  if (raw === undefined || raw === null || raw === "" || raw === "[]") return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("INNO_LINKED_DATABASES is not valid JSON");
+  }
+  if (!Array.isArray(parsed)) throw new Error("INNO_LINKED_DATABASES must be a JSON array");
+  const seen = new Set();
+  return parsed.map((entry) => {
+    if (!entry || typeof entry !== "object") throw new Error("each linked database must be an object");
+    const { binding, database_name: databaseName, database_id: databaseId } = entry;
+    if (typeof binding !== "string" || !LINK_BINDING_RE.test(binding)) {
+      throw new Error(`invalid linked binding name: ${JSON.stringify(binding)}`);
+    }
+    if (RESERVED_BINDINGS.has(binding)) throw new Error(`linked binding may not shadow ${binding}`);
+    if (seen.has(binding)) throw new Error(`duplicate linked binding: ${binding}`);
+    seen.add(binding);
+    assertDeployValue(`linked ${binding} database_name`, databaseName);
+    assertDeployValue(`linked ${binding} database_id`, databaseId);
+    return { binding, databaseName, databaseId };
+  });
+}
+
+/**
+ * Append linked D1 bindings to an existing `d1_databases` array, textually, so
+ * the template's comments survive (the rest of this script is deliberately
+ * textual for the same reason). The array in every platform template is a
+ * single-line literal containing no `]`, which is what makes this safe; the
+ * exactly-one assertion below fails loud if that ever stops being true.
+ */
+export function appendLinkedDatabases(text, links, label) {
+  if (links.length === 0) return text;
+  const arrayRe = /("d1_databases"\s*:\s*\[)([^\]]*)(\])/g;
+  const count = countMatches(text, arrayRe);
+  if (count !== 1) {
+    throw new Error(`expected exactly 1 "d1_databases" array in the ${label}, found ${count}`);
+  }
+  const entries = links
+    .map((l) => `{ "binding": "${l.binding}", "database_name": "${l.databaseName}", "database_id": "${l.databaseId}" }`)
+    .join(", ");
+  return text.replace(/("d1_databases"\s*:\s*\[)([^\]]*)(\])/, (_m, open, body, close) => {
+    const trimmed = body.trim();
+    return `${open}${trimmed ? `${body.replace(/\s*$/, "")}, ` : ""}${entries}${close}`;
+  });
+}
+
 /**
  * Substitute the wrangler.jsonc template markers with real deploy-time values.
  *
@@ -58,11 +121,15 @@ function countMatches(text, re) {
  *   - `"database_id": "REPLACE"`               -> `"database_id": "{databaseId}"`
  *   - `"ACCESS_AUD": "REPLACE"`                 -> `"ACCESS_AUD": "{accessAud}"`
  *
+ * Linked cross-app databases (migration 0028), if any, are appended to
+ * `d1_databases` after substitution — for a container app the gateway holds
+ * those bindings and serves them over /_storage/linked/{app}/sql/*.
+ *
  * @param {string} wranglerText
- * @param {{app: string, databaseId: string, accessAud: string}} params
+ * @param {{app: string, databaseId: string, accessAud: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string}[]}} params
  * @returns {string} the substituted JSONC text
  */
-export function templateWrangler(wranglerText, { app, databaseId, accessAud } = {}) {
+export function templateWrangler(wranglerText, { app, databaseId, accessAud, linkedDatabases = [] } = {}) {
   // Shared validation so the container path and the worker templaters enforce
   // identical app-name and deploy-value rules (jq missing-field literals,
   // unsafe characters). See assertAppName/assertDeployValue below.
@@ -114,12 +181,19 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud } = 
     throw new Error(`template markers remain after substitution: ${stillPresent.map((m) => m.pattern).join(", ")}`);
   }
 
+  // Cross-app data links (migration 0028). For a CONTAINER app the gateway holds
+  // the D1 bindings (the container itself reaches storage over
+  // http://storage.internal and holds no credential), so a link becomes an extra
+  // gateway binding which gateway/storage.ts exposes under
+  // /_storage/linked/{app}/sql/*.
+  const withLinks = appendLinkedDatabases(out, linkedDatabases, "wrangler.jsonc");
+
   // Enforce workers_dev: false (perimeter hardening) via the shared helper, so
   // the container and worker paths apply the identical rule. The *.workers.dev
   // URL is NOT behind Cloudflare Access — closing it makes the Access-protected
   // custom hostname the sole ingress; applied to EVERY app at deploy, including
   // apps whose committed wrangler.jsonc predates this policy.
-  return forceWorkersDevFalse(out, "wrangler.jsonc");
+  return forceWorkersDevFalse(withLinks, "wrangler.jsonc");
 }
 
 // --- Worker-type templating (migration 0022) --------------------------------
@@ -238,8 +312,12 @@ export function templateMcpGateway(text, { app, mcpResource } = {}) {
  * Template the worker-type APP WORKER config (gateway/app-worker.jsonc).
  * Markers: the worker name ("inno-app-replace-app"), D1 name/id, R2 bucket.
  * Exactly one "REPLACE" (database_id) — no ACCESS_AUD (the gateway owns Access).
+ *
+ * @param {string} text
+ * @param {{app: string, databaseId: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string}[]}} params
+ * @returns {string} the substituted JSONC text
  */
-export function templateWorkerApp(text, { app, databaseId } = {}) {
+export function templateWorkerApp(text, { app, databaseId, linkedDatabases = [] } = {}) {
   assertAppName(app);
   assertDeployValue("databaseId", databaseId);
   const replaceCount = countMatches(text, /"REPLACE"/g);
@@ -252,11 +330,22 @@ export function templateWorkerApp(text, { app, databaseId } = {}) {
     { pattern: /"inno-replace-data"/, replacement: `"inno-${app}-data"` },
     { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${databaseId}"` },
   ]);
-  return forceWorkersDevFalse(out, "app worker config");
+  // Cross-app data links (migration 0028): each becomes an EXTRA D1 binding
+  // alongside the app's own DATA. Appended after marker substitution so the
+  // marker post-conditions above see only the template's own values.
+  const withLinks = appendLinkedDatabases(out, linkedDatabases, "app worker config");
+  return forceWorkersDevFalse(withLinks, "app worker config");
 }
 
 if (isMainModule(import.meta.url)) {
   const [mode, ...rest] = process.argv.slice(2);
+  // Linked databases arrive as JSON in the environment rather than argv: the
+  // payload is a nested structure and every shell-quoting mistake here would be
+  // a config-corruption bug. Empty/absent is the common case.
+  const linkedDatabases = parseLinkedDatabases(process.env.INNO_LINKED_DATABASES);
+  if (linkedDatabases.length > 0) {
+    console.log(`linking ${linkedDatabases.length} cross-app database(s): ${linkedDatabases.map((l) => l.binding).join(", ")}`);
+  }
   if (mode === "--worker-gateway") {
     const [app, accessAud, path = "wrangler.jsonc"] = rest;
     if (!app || !accessAud) { console.error("Usage: node ci/template-wrangler.mjs --worker-gateway <app> <accessAud> [path]"); process.exit(1); }
@@ -270,7 +359,7 @@ if (isMainModule(import.meta.url)) {
   } else if (mode === "--worker-app") {
     const [app, databaseId, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId) { console.error("Usage: node ci/template-wrangler.mjs --worker-app <app> <databaseId> [path]"); process.exit(1); }
-    writeFileSync(path, templateWorkerApp(readFileSync(path, "utf8"), { app, databaseId }));
+    writeFileSync(path, templateWorkerApp(readFileSync(path, "utf8"), { app, databaseId, linkedDatabases }));
     console.log(`templated app worker ${path} for app "${app}"`);
   } else {
     const [app, databaseId, accessAud, wranglerPath = "wrangler.jsonc"] = [mode, ...rest];
@@ -278,7 +367,7 @@ if (isMainModule(import.meta.url)) {
       console.error("Usage: node ci/template-wrangler.mjs <app> <databaseId> <accessAud> [wranglerPath=wrangler.jsonc]");
       process.exit(1);
     }
-    const templated = templateWrangler(readFileSync(wranglerPath, "utf8"), { app, databaseId, accessAud });
+    const templated = templateWrangler(readFileSync(wranglerPath, "utf8"), { app, databaseId, accessAud, linkedDatabases });
     writeFileSync(wranglerPath, templated);
     console.log(`templated ${wranglerPath} for app "${app}"`);
   }

@@ -720,6 +720,11 @@ jobs:
           # rejects an empty value, so an oauth-rs deploy against an older
           # broker fails loudly rather than pinning a bogus audience).
           mcp_resource="$(echo "$resp" | jq -r '.mcp_resource // empty')"
+          # Cross-app data links (migration 0027). Compact JSON array, empty for
+          # almost every app. -c keeps it on ONE line so it survives $GITHUB_OUTPUT
+          # (which is line-oriented); an older broker that omits the field yields
+          # [], which the templater treats as "no links".
+          linked_databases="$(echo "$resp" | jq -c '.linked_databases // []')"
 
           echo "::add-mask::$token"
           {
@@ -729,6 +734,7 @@ jobs:
             echo "deployment_id=$deployment_id"
             echo "sleep_after=$sleep_after"
             echo "mcp_resource=$mcp_resource"
+            echo "linked_databases=$linked_databases"
           } >> "$GITHUB_OUTPUT"
 
       - name: Install app dependencies
@@ -741,6 +747,7 @@ jobs:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
           ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
+          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
         run: node inno-platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" wrangler.jsonc
 
       - name: Template worker configs (gateway + app worker)
@@ -749,6 +756,7 @@ jobs:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
           ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
+          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
         run: |
           # The gateway config (wrangler.jsonc here = the worker-gateway variant)
           # takes only the Access AUD + names; the app worker takes the D1 id.
@@ -766,6 +774,7 @@ jobs:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
           MCP_RESOURCE: ${{ steps.deploy_token.outputs.mcp_resource }}
+          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
         run: |
           node inno-platform-ci/ci/template-wrangler.mjs --mcp-gateway "$APP" "$MCP_RESOURCE" wrangler.jsonc
           node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc

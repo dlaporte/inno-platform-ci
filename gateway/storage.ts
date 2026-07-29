@@ -7,6 +7,35 @@ type S = Pick<Env, "DB" | "FILES">;
 // R2's own object-size limits apply as the backstop.
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
+// Must match src/links.ts linkBindingFor — the gateway builds separately from
+// the platform Worker, so the derivation is restated rather than imported. A
+// test asserts the two agree.
+const APP_NAME_RE = /^[a-z][a-z0-9-]{2,28}$/;
+export function linkBindingFor(sourceApp: string): string {
+  return `LINKED_${sourceApp.toUpperCase().replace(/-/g, "_")}`;
+}
+
+/**
+ * Resolve `/_storage/linked/{app}/...` to the D1 binding the platform injected
+ * for that link, or null when no such link is deployed.
+ *
+ * The presence of the binding IS the authorization: it exists only because the
+ * platform templated it into this gateway's config at deploy time, having
+ * checked same-owner and membership containment. The container cannot conjure a
+ * binding, so a request naming an unlinked app finds nothing.
+ */
+function resolveLinkedDb(env: S, sourceApp: string): D1Database | null {
+  if (!APP_NAME_RE.test(sourceApp)) return null;
+  // Linked bindings are named after the SOURCE app, so they cannot appear in the
+  // static Env type — look them up dynamically rather than widening Env with an
+  // index signature (which would weaken every other binding's typing).
+  const candidate = (env as unknown as Record<string, unknown>)[linkBindingFor(sourceApp)];
+  // Duck-type rather than instanceof: D1Database is not a constructible global.
+  return candidate && typeof (candidate as D1Database).prepare === "function"
+    ? (candidate as D1Database)
+    : null;
+}
+
 export async function handleStorage(request: Request, env: S): Promise<Response> {
   try {
     const url = new URL(request.url);
@@ -23,6 +52,33 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       const body = await readJson<{ sql: string; params?: unknown[] }>(request);
       if (!body?.sql) return json({ error: "bad_request" }, 400);
       const r = await env.DB.prepare(body.sql).bind(...(body.params ?? [])).run();
+      return json({ changes: r.meta.changes ?? 0, lastRowId: r.meta.last_row_id ?? null });
+    }
+    // Cross-app data links (migration 0028). Same query/execute surface as the
+    // app's own database, scoped to a source app it has a deployed link to.
+    // Deliberately mirrors the shape above rather than inventing a second API,
+    // so an app author who can read from their own D1 can read from a linked one
+    // without learning anything new.
+    const linkMatch = path.match(/^\/_storage\/linked\/([^/]+)\/sql\/(query|execute)$/);
+    if (linkMatch && m === "POST") {
+      const [, sourceApp, op] = linkMatch;
+      const linkedDb = resolveLinkedDb(env, sourceApp);
+      if (!linkedDb) {
+        return json({
+          error: "not_linked",
+          detail:
+            `No deployed data link to "${sourceApp}". Create one with the link_app_data MCP tool ` +
+            "(same owner only), then redeploy this app — links are bound at deploy time.",
+        }, 404);
+      }
+      const body = await readJson<{ sql: string; params?: unknown[] }>(request);
+      if (!body?.sql) return json({ error: "bad_request" }, 400);
+      const stmt = linkedDb.prepare(body.sql).bind(...(body.params ?? []));
+      if (op === "query") {
+        const { results } = await stmt.all();
+        return json({ results });
+      }
+      const r = await stmt.run();
       return json({ changes: r.meta.changes ?? 0, lastRowId: r.meta.last_row_id ?? null });
     }
     if (path === "/_storage/files" && m === "GET") {
