@@ -86,11 +86,12 @@ jobs:
       ignores_deps: ${{ steps.fetch.outputs.ignores_deps }}
       gateway_ref: ${{ steps.fetch.outputs.gateway_ref }}
       min_release_age_days: ${{ steps.fetch.outputs.min_release_age_days }}
-      app_type: ${{ steps.fetch.outputs.app_type }}
-      # 'true' for the types whose code is an app-owned Worker behind the gateway
-      # ('worker' and 'mcp'), i.e. NOT a container image. Derived once here so the
-      # container-only gates and the worker-shaped deploy each test a single flag
-      # instead of enumerating types.
+      shape: ${{ steps.fetch.outputs.shape }}
+      perimeter: ${{ steps.fetch.outputs.perimeter }}
+      # The shape axis, collapsed to a boolean: 'true' when the app's code is
+      # an app-owned Worker behind the gateway (shape == 'worker'), i.e. NOT a
+      # container image. Derived once here so the container-only gates and the
+      # worker-shaped deploy each test a single flag instead of enumerating types.
       worker_shaped: ${{ steps.fetch.outputs.worker_shaped }}
       app: ${{ steps.app.outputs.app }}
     steps:
@@ -135,10 +136,12 @@ jobs:
             for g in semgrep trivy gitleaks deps; do echo "gates_$g=true" >> "$GITHUB_OUTPUT"; done
             for t in semgrep trivy deps; do echo "ignores_$t=" >> "$GITHUB_OUTPUT"; done
             echo "gateway_ref=" >> "$GITHUB_OUTPUT"
-            # Type defaults to container on a broker outage — the safe, original
-            # build path (a worker app that can't be identified just runs the
-            # container gates, which its repo won't satisfy, and fails safely).
-            echo "app_type=container" >> "$GITHUB_OUTPUT"
+            # Falls back to shape=container, perimeter=sso on a broker outage —
+            # the safe, original build path (a worker app that can't be
+            # identified just runs the container gates, which its repo won't
+            # satisfy, and fails safely).
+            echo "shape=container" >> "$GITHUB_OUTPUT"
+            echo "perimeter=sso" >> "$GITHUB_OUTPUT"
             echo "worker_shaped=false" >> "$GITHUB_OUTPUT"
             # Cooldown has no "secure default" that could block a legit deploy on
             # a broker outage — a length-of-time gate isn't a safety scanner — so
@@ -167,16 +170,16 @@ jobs:
           echo "gateway_ref=$(printf '%s' "$resp" | jq -r '(.gateway_ref // empty) | select(test("^[0-9a-fA-F]{7,40}$"))')" >> "$GITHUB_OUTPUT"
           # Numeric cooldown threshold; a missing/garbage value reads 0 (off).
           echo "min_release_age_days=$(printf '%s' "$resp" | jq -r '(.min_release_age_days // 0) | if type=="number" then . else 0 end')" >> "$GITHUB_OUTPUT"
-          # Deployment type: "worker" and "mcp" opt into the app-owned-Worker
-          # path; anything else (incl. a missing field) reads "container" — the
-          # original path. Normalized to exactly one of the three known values,
-          # so the `== 'container'` / worker_shaped conditions below are exhaustive.
-          app_type="$(printf '%s' "$resp" | jq -r 'if .type == "worker" then "worker" elif .type == "mcp" then "mcp" else "container" end')"
-          echo "app_type=$app_type" >> "$GITHUB_OUTPUT"
-          # Both worker-shaped types skip the container gates and share the
-          # app-Worker-then-gateway deploy; only the injected gateway config and
-          # its templating differ.
-          if [ "$app_type" = "worker" ] || [ "$app_type" = "mcp" ]; then
+          # Axes-first (new broker), falling back to the legacy `type` field
+          # (old broker) — both normalize to known values, failing safe to the
+          # container x sso path exactly as before.
+          shape="$(printf '%s' "$resp" | jq -r 'if .shape == "worker" then "worker" elif .shape == "container" then "container" elif .type == "worker" or .type == "mcp" then "worker" else "container" end')"
+          perimeter="$(printf '%s' "$resp" | jq -r 'if .perimeter == "oauth-rs" then "oauth-rs" elif .perimeter == "sso" then "sso" elif .type == "mcp" then "oauth-rs" else "sso" end')"
+          echo "shape=$shape" >> "$GITHUB_OUTPUT"
+          echo "perimeter=$perimeter" >> "$GITHUB_OUTPUT"
+          # worker_shaped survives as the gate-condition flag; it is now simply
+          # the shape axis.
+          if [ "$shape" = "worker" ]; then
             echo "worker_shaped=true" >> "$GITHUB_OUTPUT"
           else
             echo "worker_shaped=false" >> "$GITHUB_OUTPUT"
@@ -622,7 +625,8 @@ jobs:
 
       - name: Inject gateway + worker build inputs
         env:
-          APP_TYPE: ${{ needs.policy.outputs.app_type }}
+          SHAPE: ${{ needs.policy.outputs.shape }}
+          PERIMETER: ${{ needs.policy.outputs.perimeter }}
         run: |
           [ -f gateway-src/gateway/package.json ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the build-input move — promote a post-f866c96 platform SHA"; exit 1; }
           [ -f gateway-src/gateway/wrangler.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the wrangler.jsonc move — promote a current platform SHA"; exit 1; }
@@ -633,15 +637,16 @@ jobs:
           # config differs. package.json/lock/tsconfig are the gateway's build inputs.
           cp gateway-src/gateway/*.ts src/gateway/
           cp gateway-src/gateway/package.json gateway-src/gateway/package-lock.json gateway-src/gateway/tsconfig.json .
-          if [ "$APP_TYPE" = "worker" ] || [ "$APP_TYPE" = "mcp" ]; then
+          if [ "$SHAPE" = "worker" ]; then
             # Worker-shaped: the app's own Worker gets its own config, and the
             # gateway gets the variant matching its identity boundary — the
-            # Access-terminating one for 'worker', the OAuth-terminating one for
-            # 'mcp'. app/index.ts (the app author's fetch handler) and
-            # app/package.json (its deps, if any) come from the app repo.
+            # Access-terminating one for the sso perimeter, the
+            # OAuth-terminating one for the oauth-rs perimeter. app/index.ts
+            # (the app author's fetch handler) and app/package.json (its deps,
+            # if any) come from the app repo.
             [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
             cp gateway-src/gateway/app-worker.jsonc app-worker.jsonc
-            if [ "$APP_TYPE" = "mcp" ]; then
+            if [ "$PERIMETER" = "oauth-rs" ]; then
               [ -f gateway-src/gateway/wrangler.mcp.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp deployment type — promote a current platform SHA"; exit 1; }
               cp gateway-src/gateway/wrangler.mcp.jsonc wrangler.jsonc
             else
@@ -710,10 +715,10 @@ jobs:
           # Effective container.sleep_after from the platform config store;
           # default defensively if an older broker doesn't return it.
           sleep_after="$(echo "$resp" | jq -r '.sleep_after // "10m"')"
-          # mcp-type only: this app's RFC 8707/9728 resource identifier. Emitted as
-          # the empty string for the other types (the templater rejects an empty
-          # value, so an mcp deploy against an older broker fails loudly rather
-          # than pinning a bogus audience).
+          # oauth-rs perimeter only: this app's RFC 8707/9728 resource identifier.
+          # Emitted as the empty string for the sso perimeter (the templater
+          # rejects an empty value, so an oauth-rs deploy against an older
+          # broker fails loudly rather than pinning a bogus audience).
           mcp_resource="$(echo "$resp" | jq -r '.mcp_resource // empty')"
 
           echo "::add-mask::$token"
@@ -739,7 +744,7 @@ jobs:
         run: node inno-platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" wrangler.jsonc
 
       - name: Template worker configs (gateway + app worker)
-        if: needs.policy.outputs.app_type == 'worker'
+        if: needs.policy.outputs.shape == 'worker' && needs.policy.outputs.perimeter == 'sso'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -750,13 +755,13 @@ jobs:
           node inno-platform-ci/ci/template-wrangler.mjs --worker-gateway "$APP" "$ACCESS_AUD" wrangler.jsonc
           node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
 
-      # mcp-type: the app worker config is identical to the worker type's, but the
-      # gateway is keyed by this app's RFC 8707/9728 resource identifier instead of
-      # an Access AUD (these apps have no Access application). MCP_RESOURCE comes
-      # from the broker so the value the gateway pins a token's audience against is
-      # never rebuilt in CI.
+      # oauth-rs perimeter: the app worker config is identical to the sso
+      # perimeter's, but the gateway is keyed by this app's RFC 8707/9728
+      # resource identifier instead of an Access AUD (these apps have no
+      # Access application). MCP_RESOURCE comes from the broker so the value
+      # the gateway pins a token's audience against is never rebuilt in CI.
       - name: Template mcp configs (gateway + app worker)
-        if: needs.policy.outputs.app_type == 'mcp'
+        if: needs.policy.outputs.shape == 'worker' && needs.policy.outputs.perimeter == 'oauth-rs'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
