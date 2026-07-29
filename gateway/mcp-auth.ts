@@ -9,24 +9,65 @@
 //
 // The platform's access tokens are OPAQUE (workers-oauth-provider encrypts the
 // grant into them), so they cannot be verified locally. The gateway asks the
-// platform over the PLATFORM service binding — a capability the app author
-// cannot forge or reach, since the wrangler config carrying it is
-// platform-owned and the config-integrity gate rejects app-owned wrangler files.
+// platform over the PLATFORM service binding.
 //
-// One introspection per token per colo: results are cached in the Workers Cache
-// API keyed by a SHA-256 of the token, with a TTL bounded by both the token's
-// own remaining lifetime and MAX_CACHE_SECONDS. After the first request the hot
-// path costs no subrequest, which is what makes opaque tokens as cheap here as
-// a locally-verified JWT would have been.
+// One introspection per token per isolate: positive results are cached in a
+// module-scope Map, with a TTL bounded by both the token's own remaining
+// lifetime and MAX_CACHE_SECONDS. After the first request the hot path costs no
+// subrequest, which is what makes opaque tokens as cheap here as a
+// locally-verified JWT would have been.
+//
+// The cache is a Map, deliberately NOT the Workers Cache API: `caches.default`
+// is shared across every Worker on the zone (the reason Workers-for-Platforms
+// offers isolated caches for its "untrusted" mode), and this platform runs app
+// code as ordinary Workers on the same zone. A co-resident app author could
+// pre-plant an entry under a key they compute from the (public) resource + any
+// token and forge an identity for another app's gateway. A module-scope Map is
+// private to this isolate — unreachable from any other Worker — so a poisoned
+// entry is impossible.
 
 import type { Env } from "./env";
 import type { AccessIdentity } from "./access";
+import { GROUP_PREFIX } from "./access";
 
 // Upper bound on how long a positive introspection is reused. This is the
 // revocation lag: a grant revoked at the platform keeps working in an already-
-// warm colo for at most this long. 60s is short next to the 24h Access session
-// the other app types run with, so this is a tightening, not a loosening.
+// warm isolate for at most this long. 60s is short next to the 24h Access
+// session the other app types run with, so this is a tightening, not a loosening.
 const MAX_CACHE_SECONDS = 60;
+
+// Bound the isolate's memory. Map preserves insertion order, so eviction past
+// this drops the oldest entry — a coarse LRU that is fine for a per-isolate,
+// short-TTL cache. Far above any single app's realistic concurrent-token count.
+const MAX_CACHE_ENTRIES = 1000;
+
+interface IntrospectionResponse {
+  active: boolean;
+  email?: string;
+  groups?: string[];
+  service?: boolean;
+  expires_in?: number;
+}
+
+// The introspection cache, private to this isolate. Keyed by the hex digest
+// (see cacheKeyFor); value carries an absolute expiry so a stale entry is never
+// honored past its own TTL even if the isolate outlives it.
+const introspectionCache = new Map<string, { body: IntrospectionResponse; expiresAt: number }>();
+
+function cacheGet(key: string, now: number): IntrospectionResponse | null {
+  const entry = introspectionCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= now) { introspectionCache.delete(key); return null; }
+  return entry.body;
+}
+
+function cacheSet(key: string, body: IntrospectionResponse, ttlSeconds: number, now: number): void {
+  if (introspectionCache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = introspectionCache.keys().next().value;
+    if (oldest !== undefined) introspectionCache.delete(oldest);
+  }
+  introspectionCache.set(key, { body, expiresAt: now + ttlSeconds * 1000 });
+}
 
 // RFC 9728 §3.1: the metadata document lives under this prefix on the RESOURCE's
 // own origin, with the resource's path component INSERTED after it. Our resource
@@ -62,14 +103,6 @@ export interface McpAuthResult {
   service: boolean;
 }
 
-interface IntrospectionResponse {
-  active: boolean;
-  email?: string;
-  groups?: string[];
-  service?: boolean;
-  expires_in?: number;
-}
-
 // RFC 6750 §2.1: credentials go in `Authorization: Bearer <token>`. Deliberately
 // header-only — no query-parameter fallback, which RFC 6750 §5.3 warns against
 // (tokens leak into logs and Referer headers) and which the protected-resource
@@ -85,52 +118,55 @@ export function bearerToken(req: Request): string | null {
   return m ? m[1] : null;
 }
 
-// Cache key: a hash, never the token itself. Cache keys can surface in
-// diagnostics, and the Cache API is per-colo shared state — storing raw bearer
-// tokens as URLs would be a credential leak.
-//
-// The hash input is a JSON array rather than a delimiter-joined string, so no
-// separator has to be chosen or defended: two different (resource, token) pairs
-// can never serialize identically, whatever characters they contain. Including
-// the RESOURCE is load-bearing — the Cache API is shared per zone, and every app
-// gateway lives on a hostname of the same zone, so a token-only key could let one
-// app's cached introspection satisfy another app's gateway.
-async function cacheKeyFor(token: string, resource: string): Promise<Request> {
+// Cache key: a hash, never the token itself. The hash input is a JSON array
+// rather than a delimiter-joined string, so no separator has to be chosen or
+// defended: two different (resource, token) pairs can never serialize
+// identically, whatever characters they contain. Including the RESOURCE keeps
+// two apps' entries distinct even though the cache is now per-isolate.
+async function cacheKeyFor(token: string, resource: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([resource, token])));
-  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  // A synthetic https URL on a reserved host — never fetched, only used as a key.
-  return new Request(`https://mcp-introspection.invalid/${hex}`);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Ask the platform whether this token is live and who it belongs to.
+// Ask the platform whether this token is live and who it belongs to. Fails
+// CLOSED on every failure mode — a non-200, a thrown binding call, or a
+// non-JSON body all resolve to {active:false}, so the caller answers the
+// recoverable 401 challenge (never a 500, which an MCP client treats as fatal
+// and does not retry).
 async function introspectViaPlatform(
   env: Env, token: string, resource: string,
 ): Promise<IntrospectionResponse> {
-  const res = await env.PLATFORM!.fetch("https://platform.internal/app-introspect", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token, resource }),
-  });
-  if (!res.ok) {
-    // A platform-side failure must NOT be read as "token valid". Fail closed and
-    // let the caller answer 401; the client will retry.
-    console.warn(`gateway: introspection failed (${res.status})`);
+  try {
+    const res = await env.PLATFORM!.fetch("https://platform.internal/app-introspect", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token, resource }),
+    });
+    if (!res.ok) {
+      console.warn(`gateway: introspection failed (${res.status})`);
+      return { active: false };
+    }
+    return (await res.json()) as IntrospectionResponse;
+  } catch (e) {
+    console.warn(`gateway: introspection threw: ${String(e).slice(0, 120)}`);
     return { active: false };
   }
-  return (await res.json()) as IntrospectionResponse;
 }
 
-// Resolve a bearer token to an identity, using (and populating) the per-colo
+// Resolve a bearer token to an identity, using (and populating) the per-isolate
 // cache. Returns null for any invalid/expired/foreign token.
-// `waitUntil` (when the caller has an ExecutionContext) keeps the cache write off
-// the response path — the entry is only an optimization, so the request should
-// never wait on it.
 export async function authenticateMcp(
   env: Env, req: Request, resource: string,
-  waitUntil?: (p: Promise<unknown>) => void,
 ): Promise<McpAuthResult | null> {
   const token = bearerToken(req);
   if (!token) return null;
+  // A mis-templated gateway with no resource must refuse locally, not lean on
+  // the platform rejecting an empty resource across a gateway/platform version
+  // skew. Also keeps every such gateway out of a shared `resource=""` key space.
+  if (!resource) {
+    console.error("gateway: MCP mode without MCP_RESOURCE — refusing all requests");
+    return null;
+  }
   if (!env.PLATFORM) {
     // Misconfiguration (an mcp gateway deployed without its service binding).
     // Fail closed rather than serve an app with no identity boundary at all.
@@ -138,36 +174,43 @@ export async function authenticateMcp(
     return null;
   }
 
+  const now = Date.now();
   const key = await cacheKeyFor(token, resource);
-  const cache = caches.default;
-  let body: IntrospectionResponse | null = null;
-
-  const hit = await cache.match(key);
-  if (hit) {
-    try { body = (await hit.json()) as IntrospectionResponse; } catch { body = null; }
-  }
+  let body = cacheGet(key, now);
 
   if (!body) {
     body = await introspectViaPlatform(env, token, resource);
-    // Only positive results are cached. Caching negatives would let a token that
-    // has just been granted keep failing for the rest of the window, and there
-    // is no cost pressure to justify it — an invalid token is not a hot path.
+    // Only positive results are cached, and only when they have real remaining
+    // life — caching an already-expired token (expires_in <= 0) would honor it
+    // for up to the 1s TTL floor. Negatives are never cached: a just-granted
+    // token must not keep failing, and an invalid token is not a hot path.
     if (body.active) {
-      // TTL is the LESSER of the ceiling and the token's own remaining life, so a
-      // nearly-expired token is never honored past its expiry.
-      const ttl = Math.max(1, Math.min(MAX_CACHE_SECONDS, body.expires_in ?? MAX_CACHE_SECONDS));
-      const write = cache.put(key, new Response(JSON.stringify(body), {
-        headers: { "content-type": "application/json", "cache-control": `max-age=${ttl}` },
-      }));
-      if (waitUntil) waitUntil(write); else await write;
+      const remaining = body.expires_in ?? MAX_CACHE_SECONDS;
+      if (remaining > 0) {
+        const ttl = Math.max(1, Math.min(MAX_CACHE_SECONDS, remaining));
+        cacheSet(key, body, ttl, now);
+      }
     }
   }
 
   if (!body.active) return null;
-  return {
-    identity: { email: body.email ?? "", groups: body.groups ?? [] },
-    service: body.service === true,
-  };
+  // A positive result with no user identity is only meaningful as the health
+  // probe's service credential. Never inject an empty/anonymous identity as a
+  // person — the perimeter must not depend on the platform always sending an
+  // email for a real user.
+  const email = typeof body.email === "string" ? body.email : "";
+  if (!email && body.service !== true) {
+    console.warn("gateway: rejecting active introspection with no email and no service flag");
+    return null;
+  }
+  // Re-filter groups to the inno- prefix, matching verifyAccessJwt (access.ts)
+  // and the dev path — one invariant, now three producers. The gateway is
+  // version-pinned per app (gateway_ref) while the platform ships from main, so
+  // "the platform already filters" is a cross-version assumption, not a local
+  // guarantee; enforce it here too.
+  const groups = (Array.isArray(body.groups) ? body.groups : [])
+    .filter((g): g is string => typeof g === "string" && g.startsWith(GROUP_PREFIX));
+  return { identity: { email, groups }, service: body.service === true };
 }
 
 // RFC 9728 §3: the metadata document that tells an MCP client which
@@ -190,7 +233,12 @@ export function protectedResourceMetadata(env: Env): Response {
 // RFC 9728 §5.1 / MCP auth: a 401 whose WWW-Authenticate names the metadata
 // document. Without `resource_metadata` a client has no way to find the AS and
 // simply fails, so this header is what makes the whole flow discoverable.
-export function unauthorizedChallenge(env: Env): Response {
+//
+// `invalidToken` distinguishes "presented a bad/expired token" from "presented
+// none": RFC 6750 §3.1 says only the former carries `error="invalid_token"`,
+// and MCP clients use exactly that to choose "silently refresh" over "restart
+// authorization" — without it a client can re-present an expired token in a loop.
+export function unauthorizedChallenge(env: Env, invalidToken = false): Response {
   // The metadata document lives on the RESOURCE's origin, derived from
   // MCP_RESOURCE so the two can never disagree. Advertises the spec-correct
   // path-inserted form (RFC 9728 §3.1).
@@ -199,13 +247,19 @@ export function unauthorizedChallenge(env: Env): Response {
     const resource = new URL(env.MCP_RESOURCE ?? "");
     url = `${resource.origin}${protectedResourcePathFor(resource.pathname)}`;
   } catch { url = ""; }
+  const params: string[] = [];
+  if (invalidToken) {
+    params.push('error="invalid_token"');
+    params.push('error_description="the access token is invalid or expired"');
+  }
+  // Without resource_metadata a client cannot discover the AS at all, so a bare
+  // `Bearer` is only the mis-templated-deploy fallback.
+  if (url) params.push(`resource_metadata="${url}"`);
   return new Response("unauthorized", {
     status: 401,
     headers: {
       "content-type": "text/plain",
-      // Without resource_metadata a client cannot discover the AS at all, so a
-      // bare `Bearer` is only the mis-templated-deploy fallback.
-      "www-authenticate": url ? `Bearer resource_metadata="${url}"` : "Bearer",
+      "www-authenticate": params.length ? `Bearer ${params.join(", ")}` : "Bearer",
     },
   });
 }

@@ -6,7 +6,7 @@ import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, GROUP_PREFIX, type A
 import { sanitizeAndInject } from "./identity";
 import { handleStorage } from "./storage";
 import {
-  authenticateMcp, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
+  authenticateMcp, bearerToken, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
 } from "./mcp-auth";
 
 // The @cloudflare/containers runtime routes container calls through an internal
@@ -65,19 +65,6 @@ export const realDeps: Deps = {
   forwardToWorker: (env, req) => env.APP_WORKER!.fetch(req),
 };
 
-// Hono's `c.executionCtx` GETTER throws ("This context has no ExecutionContext")
-// when the app was invoked without one — as `app.fetch(req, env)` does in tests.
-// So it cannot be probed with optional chaining; it has to be caught. Returning
-// undefined lets callers fall back to awaiting their background work inline.
-function safeWaitUntil(c: { executionCtx: { waitUntil(p: Promise<unknown>): void } }): ((p: Promise<unknown>) => void) | undefined {
-  try {
-    const ctx = c.executionCtx;
-    return (p) => ctx.waitUntil(p);
-  } catch {
-    return undefined;
-  }
-}
-
 function readCookie(req: Request, name: string): string | undefined {
   const raw = req.headers.get("cookie") ?? "";
   return raw.split(";").map((s) => s.trim()).find((c) => c.startsWith(`${name}=`))?.slice(name.length + 1);
@@ -99,10 +86,13 @@ export function makeApp(deps: Deps = realDeps) {
       if (c.req.method === "GET" && isProtectedResourceRequest(env, path)) {
         return protectedResourceMetadata(env);
       }
-      const auth = await authenticateMcp(env, c.req.raw, env.MCP_RESOURCE ?? "", safeWaitUntil(c));
+      const auth = await authenticateMcp(env, c.req.raw, env.MCP_RESOURCE ?? "");
       if (!auth) {
-        console.warn(`gateway: 401 no/invalid bearer (${c.req.method} ${path})`);
-        return unauthorizedChallenge(env);
+        // Distinguish "presented a bad/expired token" (→ error=invalid_token, so
+        // the client refreshes) from "presented none" (→ start authorization).
+        const hadToken = bearerToken(c.req.raw) !== null;
+        console.warn(`gateway: 401 ${hadToken ? "invalid" : "no"} bearer (${c.req.method} ${path})`);
+        return unauthorizedChallenge(env, hadToken);
       }
       // Same rule the Access path applies to its service token: a credential
       // with no user identity is good for GET /healthz and nothing else.

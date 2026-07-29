@@ -19,9 +19,9 @@
     { "binding": "APP_WORKER", "service": "inno-app-replace-app" },
     // The control plane, for token introspection (POST /app-introspect). The
     // platform's access tokens are opaque, so they cannot be verified locally.
-    // This binding IS the authentication for that endpoint — it is a capability
-    // the app author cannot obtain, because this file is platform-injected and
-    // the config-integrity gate rejects app-owned wrangler configs.
+    // The binding is ROUTING convenience, NOT authentication: /app-introspect is
+    // publicly reachable and safe by construction (no authority, returns only
+    // what the presented token already contains) — see src/routes/mcp-introspect.ts.
     { "binding": "PLATFORM", "service": "inno-platform" }
   ],
   // MCP_MODE switches the gateway onto the bearer-token path. MCP_RESOURCE is

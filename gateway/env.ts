@@ -28,7 +28,9 @@ export type Env = {
   // The Authorization Server issuer the protected-resource metadata advertises
   // (the platform's own origin).
   MCP_AUTH_SERVER?: string;
-  // Service binding to the platform Worker, used for token introspection. This
-  // binding IS the authentication for /app-introspect — see gateway/mcp-auth.ts.
+  // Service binding to the platform Worker, used for token introspection. The
+  // binding is ROUTING, not authentication — /app-introspect is publicly
+  // reachable and safe by construction (it has no authority and returns only
+  // what is already inside the presented token); see src/routes/mcp-introspect.ts.
   PLATFORM?: Fetcher;
 };
