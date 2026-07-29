@@ -90,7 +90,7 @@ jobs:
       # 'true' for the types whose code is an app-owned Worker behind the gateway
       # ('worker' and 'mcp'), i.e. NOT a container image. Derived once here so the
       # container-only gates and the worker-shaped deploy each test a single flag
-      # instead of enumerating types (mirrors isWorkerShaped in src/registry.ts).
+      # instead of enumerating types.
       worker_shaped: ${{ steps.fetch.outputs.worker_shaped }}
       app: ${{ steps.app.outputs.app }}
     steps:
