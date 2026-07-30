@@ -21,14 +21,17 @@ export const REQUIRED_CLAUDE_MD_HEADERS = [
   "## What CI enforces",
 ];
 
-// Type-variant header pairs: each pair carries the same safety guidance for
-// its runtime, and EITHER member satisfies the gate. The gate stays
+// Type-variant header groups: each group carries the same safety guidance for
+// its runtime, and ANY member satisfies the gate. The gate stays
 // deliberately type-blind — it must not depend on the broker's policy fetch
 // (which can fall back to 'container' on an outage) to know which variant to
-// demand, and pre-scaffold apps all carry the container member.
+// demand, and pre-scaffold apps all carry the container member. "## Worker
+// contract" is the legacy heading of "## Function contract" (the 'worker'
+// preset was renamed 'function' 2026-07-30): scaffolds emit the new heading,
+// but existing app repos keep their CLAUDE.md forever, so both satisfy.
 export const CLAUDE_MD_HEADER_VARIANTS = [
   ["## Persistence (use the storage client)", "## Persistence (use your bindings)"],
-  ["## Container contract", "## Worker contract"],
+  ["## Container contract", "## Function contract", "## Worker contract"],
 ];
 
 /**
@@ -147,7 +150,7 @@ export function checkConfig(appDir) {
     }
     for (const pair of CLAUDE_MD_HEADER_VARIANTS) {
       if (!pair.some((h) => claudeMd.includes(h))) {
-        violations.push(`CLAUDE.md is missing a required header (either variant): "${pair[0]}" or "${pair[1]}"`);
+        violations.push(`CLAUDE.md is missing a required header (any variant): ${pair.map((h) => `"${h}"`).join(" or ")}`);
       }
     }
   }

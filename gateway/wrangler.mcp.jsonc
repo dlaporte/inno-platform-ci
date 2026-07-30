@@ -15,7 +15,7 @@
   "services": [
     // The app's own Worker — workers_dev:false and no route, so it is reachable
     // ONLY through this binding. The gateway (which authenticates FIRST) stays
-    // the sole entrypoint and identity boundary, exactly as for worker-type apps.
+    // the sole entrypoint and identity boundary, exactly as for function-type apps.
     { "binding": "APP_WORKER", "service": "inno-app-replace-app" },
     // The control plane, for token introspection (POST /app-introspect). The
     // platform's access tokens are opaque, so they cannot be verified locally.

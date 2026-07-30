@@ -1,5 +1,5 @@
 {
-  // Injected config for the APP WORKER of a worker-type app (migration 0022) —
+  // Injected config for the APP WORKER of a function-shaped app (migration 0022) —
   // the user's own Cloudflare Worker, deployed alongside (and behind) the
   // gateway. `main` is the app author's entry: a standard Worker module at
   // app/index.ts exporting `export default { fetch(request, env, ctx) }`. The
@@ -12,7 +12,7 @@
   "compatibility_date": "2026-03-10",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // The app's OWN storage bindings (its provisioned D1 + R2). Worker-type apps
+  // The app's OWN storage bindings (its provisioned D1 + R2). Function-shaped apps
   // use these directly (env.DATA / env.FILES) rather than the container's
   // http://storage.internal — a deliberate posture difference: a binding is a
   // capability handle to the app's own resources, not an exfiltratable token,

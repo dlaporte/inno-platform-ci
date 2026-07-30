@@ -46,7 +46,7 @@ AppContainer.outboundByHost = { "storage.internal": (req: Request, env: Env) => 
 type Deps = {
   jwks: (env: Env) => ReturnType<typeof createRemoteJWKSet>;
   forwardToContainer: (env: Env, req: Request) => Promise<Response>;
-  // Worker-type apps (env.APP_WORKER bound) forward here instead — a service
+  // Function-shaped apps (env.APP_WORKER bound) forward here instead — a service
   // binding to the app's own Worker. See makeApp's dispatch below.
   forwardToWorker: (env: Env, req: Request) => Promise<Response>;
 };
@@ -60,7 +60,7 @@ export const realDeps: Deps = {
     return j;
   },
   forwardToContainer: (env, req) => getContainer(env.APP).fetch(req),
-  // env.APP_WORKER exists only on worker-type deploys, where makeApp dispatches
+  // env.APP_WORKER exists only on function-shaped deploys, where makeApp dispatches
   // here; the `!` is safe because the container branch is chosen whenever it's absent.
   forwardToWorker: (env, req) => env.APP_WORKER!.fetch(req),
 };
@@ -141,7 +141,7 @@ export function makeApp(deps: Deps = realDeps) {
     // Do not add a /_storage route here: that would let the public internet
     // reach handleStorage's arbitrary SQL/R2 access directly.
     const proxied = sanitizeAndInject(c.req.raw, identity, { mcpMode: env.OAUTH_RS_MODE === "true" });
-    // Deployment-type dispatch: worker-type apps carry an APP_WORKER service
+    // Deployment-type dispatch: function-shaped apps carry an APP_WORKER service
     // binding and forward to the app's own Worker; container-type apps (no such
     // binding) forward to the container. Either way the gateway did the Access
     // verification and identity injection FIRST, so the target only ever sees a

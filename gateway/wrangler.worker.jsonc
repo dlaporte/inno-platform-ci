@@ -1,5 +1,5 @@
 {
-  // Injected gateway config for WORKER-TYPE apps (migration 0022). Same gateway
+  // Injected gateway config for FUNCTION-SHAPED apps (migration 0022). Same gateway
   // code as the container variant (src/gateway/index.ts) — it dispatches on the
   // APP_WORKER binding (gateway/index.ts forwardToWorker). The difference from
   // wrangler.jsonc: no container/Durable Object, and a service binding to the
