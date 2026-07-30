@@ -175,7 +175,7 @@ export function checkConfig(appDir) {
       if (name === "wrangler.jsonc") {
         violations.push(
           "delete wrangler.jsonc — the platform injects wrangler.jsonc at build time from the promoted gateway.ref " +
-            "(see docs/superpowers/specs/2026-07-22-wrangler-injection-design.md)",
+            "(see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)",
         );
         continue;
       }
@@ -219,7 +219,7 @@ export function checkConfig(appDir) {
   try { lstatSync(join(appDir, "src", "gateway")); gatewayPresent = true; } catch {}
   if (gatewayPresent) {
     violations.push(
-      "delete src/gateway/ — the platform injects the gateway at build time (see docs/superpowers/specs/2026-07-22-gateway-build-resolution-design.md)",
+      "delete src/gateway/ — the platform injects the gateway at build time (see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)",
     );
   }
 
@@ -265,7 +265,7 @@ export function checkConfig(appDir) {
     }
     if (present) {
       violations.push(
-        `delete ${relPath} — the platform injects worker build inputs at build time (see docs/superpowers/specs/2026-07-22-pinned-build-injection-design.md)`,
+        `delete ${relPath} — the platform injects worker build inputs at build time (see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)`,
       );
     }
   }

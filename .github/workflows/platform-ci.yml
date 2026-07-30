@@ -57,17 +57,16 @@ on:
         type: string
         default: ""
 
+# Least privilege by default: only the three jobs that actually mint an OIDC
+# token (policy, container, deploy) re-grant `id-token: write` at job level.
 permissions:
-  id-token: write
   contents: read
 
 env:
   BROKER_URL: https://inno-platform.davidlaporte.org
-  # The `ci/` scripts + this workflow, and the app-template reference used by
-  # the config-integrity gate, are pinned to `main` — the same ref the
+  # The `ci/` scripts and this workflow are pinned to `main` — the same ref the
   # broker's job_workflow_ref check requires this workflow to run from.
   PLATFORM_REF: main
-  TEMPLATE_REF: main
 
 jobs:
   # Fetch the app's effective gate policy (toggles + ignore IDs) from the
@@ -76,6 +75,10 @@ jobs:
   # policy with plain sh string tests — all jq stays here.
   policy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write   # mints a broker OIDC token
+      contents: read
     outputs:
       gates_semgrep: ${{ steps.fetch.outputs.gates_semgrep }}
       gates_trivy: ${{ steps.fetch.outputs.gates_trivy }}
@@ -186,6 +189,7 @@ jobs:
 
   config-integrity:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout app repo (the caller)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -208,6 +212,7 @@ jobs:
 
   secrets:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [policy]
     steps:
       - name: Gate switch
@@ -241,11 +246,12 @@ jobs:
 
   sast:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [policy]
     container:
       # Exact-pinned like the Trivy image — an unpinned tag (implicit :latest)
       # lets the SAST gate's ruleset/engine drift between runs with no repo diff.
-      image: semgrep/semgrep:1.170.0
+      image: semgrep/semgrep@sha256:c98f8829eea377274ee4b10656458b078b88232469b2ff913f091c2317347c9d # v1.170.0
     steps:
       - name: Gate switch
         id: gate
@@ -279,6 +285,7 @@ jobs:
 
   deps:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [policy]
     steps:
       - name: Gate switch
@@ -300,20 +307,17 @@ jobs:
         with:
           node-version: 22
 
-      - name: npm audit (repo package.json, if present — worker deps are audited in the platform repo's own CI, since they're injected at deploy time)
+      - name: Worker dependency audit (not run here — by construction)
         if: steps.gate.outputs.enabled == 'true'
         run: |
-          if [ -f package.json ]; then
-            # --omit=dev: the deployed worker bundles only runtime deps; dev
-            # tooling (wrangler/vitest/esbuild) isn't shipped, so its advisories
-            # don't affect the artifact. The worker's runtime deps + lockfile
-            # are template-owned and pinned by config-integrity. (npm audit has
-            # no per-advisory ignore flag — safety.ignore.deps.* applies to
-            # pip-audit only.)
-            npm audit --omit=dev --audit-level=high
-          else
-            echo "no package.json — skipping npm audit"
-          fi
+          # There is deliberately no root `npm audit` here: config-integrity
+          # check 8 REJECTS a repo carrying a root package.json/package-lock.json
+          # /tsconfig.json, because the platform injects the worker build inputs
+          # at deploy time from the promoted gateway.ref. So any repo that
+          # reaches this job has no root manifest to audit, and those pinned
+          # worker deps are audited in the platform repo's own CI instead.
+          # The app's OWN dependencies are audited by the two steps below.
+          echo "root manifest is forbidden by config-integrity; worker deps audited in platform CI"
 
       - name: pip-audit (app/requirements.txt, if present)
         if: steps.gate.outputs.enabled == 'true'
@@ -342,7 +346,15 @@ jobs:
         run: |
           if [ -f app/package.json ]; then
             cd app
-            [ -f package-lock.json ] || npm install --package-lock-only --ignore-scripts >/dev/null 2>&1 || true
+            # Do NOT swallow this: an unresolvable app/package.json means the
+            # gate has nothing to audit, which must fail loudly rather than
+            # silently pass. (A gate that only logs a warning is a broken gate.)
+            if [ ! -f package-lock.json ]; then
+              npm install --package-lock-only --ignore-scripts || {
+                echo "::error title=Dependency gate::could not resolve app/package.json into a lockfile — fix the dependency ranges or commit a package-lock.json"
+                exit 1
+              }
+            fi
             npm audit --package-lock-only --omit=dev --audit-level=high
           else
             echo "no app/package.json — skipping app npm audit"
@@ -350,6 +362,10 @@ jobs:
 
   container:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      id-token: write   # mints a broker OIDC token
+      contents: read
     needs: [policy]
     # This job builds the user-controlled Dockerfile. It deliberately has NO
     # deploy token, no Cloudflare credential, and no platform secret in its
@@ -420,7 +436,9 @@ jobs:
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
             -v "$PWD/.trivyignore.platform:/.trivyignore.platform:ro" \
             -e GITHUB_TOKEN="$TRIVY_TOKEN" \
-            aquasec/trivy:0.63.0 image \
+            # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot
+            # change gate/sweep behavior with no repo diff. Bump both files together.
+            aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
               --severity HIGH,CRITICAL \
               --ignore-unfixed \
               --ignorefile /.trivyignore.platform \
@@ -444,7 +462,9 @@ jobs:
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
             -v "$PWD:/out" \
             -e GITHUB_TOKEN="$TRIVY_TOKEN" \
-            aquasec/trivy:0.63.0 image \
+            # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot
+            # change gate/sweep behavior with no repo diff. Bump both files together.
+            aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
               --format cyclonedx \
               --output /out/sbom.json \
               --no-progress \
@@ -528,6 +548,7 @@ jobs:
   # threshold is 0, matching the other gates' "disabled still runs" discipline.
   dep-age:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [policy]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -559,6 +580,7 @@ jobs:
   # deploy job is gated.
   scaffold-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       built: ${{ steps.check.outputs.built }}
     steps:
@@ -580,6 +602,10 @@ jobs:
     # independently re-verifies it from the signed OIDC claims.
     if: ${{ needs.scaffold-check.outputs.built == 'true' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write   # mints a broker OIDC token
+      contents: read
     steps:
       - name: Checkout app repo (the caller)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
