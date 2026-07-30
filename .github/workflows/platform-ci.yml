@@ -431,13 +431,17 @@ jobs:
         env:
           TRIVY_TOKEN: ${{ github.token }}
         run: |
+          # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot change
+          # gate/sweep behavior with no repo diff. Bump platform-ci.yml and
+          # safety-sweep.yml together — the gate and the sweep must never disagree.
+          # NOTE: keep comments ABOVE `docker run`, never between its
+          # backslash-continued lines — a `#` there silently truncates the command
+          # (the image argument is dropped) and bash -n cannot see it.
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
             -v "$PWD/.trivyignore.platform:/.trivyignore.platform:ro" \
             -e GITHUB_TOKEN="$TRIVY_TOKEN" \
-            # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot
-            # change gate/sweep behavior with no repo diff. Bump both files together.
             aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
               --severity HIGH,CRITICAL \
               --ignore-unfixed \
@@ -457,13 +461,17 @@ jobs:
         env:
           TRIVY_TOKEN: ${{ github.token }}
         run: |
+          # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot change
+          # gate/sweep behavior with no repo diff. Bump platform-ci.yml and
+          # safety-sweep.yml together — the gate and the sweep must never disagree.
+          # NOTE: keep comments ABOVE `docker run`, never between its
+          # backslash-continued lines — a `#` there silently truncates the command
+          # (the image argument is dropped) and bash -n cannot see it.
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
             -v "$PWD:/out" \
             -e GITHUB_TOKEN="$TRIVY_TOKEN" \
-            # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot
-            # change gate/sweep behavior with no repo diff. Bump both files together.
             aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
               --format cyclonedx \
               --output /out/sbom.json \
