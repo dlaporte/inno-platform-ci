@@ -196,8 +196,8 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud, lin
   return forceWorkersDevFalse(withLinks, "wrangler.jsonc");
 }
 
-// --- Worker-type templating (migration 0022) --------------------------------
-// Worker-type apps deploy TWO configs — the gateway (service binding, no
+// --- Function-shape templating (migration 0022) -----------------------------
+// Function-shaped apps deploy TWO configs — the gateway (service binding, no
 // container) and the app's own Worker (its storage bindings). Each carries a
 // DIFFERENT marker set than the container wrangler, so they get their own
 // templaters rather than overloading templateWrangler (whose exactly-2-REPLACE
@@ -264,7 +264,7 @@ function forceWorkersDevFalse(out, label) {
 }
 
 /**
- * Template the worker-type GATEWAY config (gateway/wrangler.worker.jsonc).
+ * Template the function-shape GATEWAY config (gateway/wrangler.worker.jsonc).
  * Markers: the service target ("inno-app-replace-app", substituted BEFORE the
  * name so the name marker can't match inside it), the worker name
  * ("inno-app-replace"), and ACCESS_AUD ("REPLACE"). Exactly one "REPLACE".
@@ -368,7 +368,7 @@ export function templateMcpContainerGateway(text, { app, databaseId, resource, l
 }
 
 /**
- * Template the worker-type APP WORKER config (gateway/app-worker.jsonc).
+ * Template the function-shape APP WORKER config (gateway/app-worker.jsonc).
  * Markers: the worker name ("inno-app-replace-app"), D1 name/id, R2 bucket.
  * Exactly one "REPLACE" (database_id) — no ACCESS_AUD (the gateway owns Access).
  *

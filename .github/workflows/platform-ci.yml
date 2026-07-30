@@ -92,10 +92,10 @@ jobs:
       shape: ${{ steps.fetch.outputs.shape }}
       perimeter: ${{ steps.fetch.outputs.perimeter }}
       # The shape axis, collapsed to a boolean: 'true' when the app's code is
-      # an app-owned Worker behind the gateway (shape == 'worker'), i.e. NOT a
+      # an app-owned Worker behind the gateway (shape == 'function'), i.e. NOT a
       # container image. Derived once here so the container-only gates and the
-      # worker-shaped deploy each test a single flag instead of enumerating types.
-      worker_shaped: ${{ steps.fetch.outputs.worker_shaped }}
+      # function-shaped deploy each test a single flag instead of enumerating types.
+      function_shaped: ${{ steps.fetch.outputs.function_shaped }}
       app: ${{ steps.app.outputs.app }}
     steps:
       # `app` is caller-asserted; safe only because the broker binds the signed
@@ -140,12 +140,12 @@ jobs:
             for t in semgrep trivy deps; do echo "ignores_$t=" >> "$GITHUB_OUTPUT"; done
             echo "gateway_ref=" >> "$GITHUB_OUTPUT"
             # Falls back to shape=container, perimeter=sso on a broker outage —
-            # the safe, original build path (a worker app that can't be
+            # the safe, original build path (a function app that can't be
             # identified just runs the container gates, which its repo won't
             # satisfy, and fails safely).
             echo "shape=container" >> "$GITHUB_OUTPUT"
             echo "perimeter=sso" >> "$GITHUB_OUTPUT"
-            echo "worker_shaped=false" >> "$GITHUB_OUTPUT"
+            echo "function_shaped=false" >> "$GITHUB_OUTPUT"
             # Cooldown has no "secure default" that could block a legit deploy on
             # a broker outage — a length-of-time gate isn't a safety scanner — so
             # it fails OPEN to 0 (off), consistent with never blocking on the
@@ -175,16 +175,16 @@ jobs:
           echo "min_release_age_days=$(printf '%s' "$resp" | jq -r '(.min_release_age_days // 0) | if type=="number" then . else 0 end')" >> "$GITHUB_OUTPUT"
           # Axes only (the legacy type field died with Phase B); unknown/absent
           # values fail safe to the container x sso path exactly as before.
-          shape="$(printf '%s' "$resp" | jq -r 'if .shape == "worker" then "worker" else "container" end')"
+          shape="$(printf '%s' "$resp" | jq -r 'if .shape == "function" then "function" else "container" end')"
           perimeter="$(printf '%s' "$resp" | jq -r 'if .perimeter == "oauth-rs" then "oauth-rs" else "sso" end')"
           echo "shape=$shape" >> "$GITHUB_OUTPUT"
           echo "perimeter=$perimeter" >> "$GITHUB_OUTPUT"
-          # worker_shaped survives as the gate-condition flag; it is now simply
+          # function_shaped survives as the gate-condition flag; it is now simply
           # the shape axis.
-          if [ "$shape" = "worker" ]; then
-            echo "worker_shaped=true" >> "$GITHUB_OUTPUT"
+          if [ "$shape" = "function" ]; then
+            echo "function_shaped=true" >> "$GITHUB_OUTPUT"
           else
-            echo "worker_shaped=false" >> "$GITHUB_OUTPUT"
+            echo "function_shaped=false" >> "$GITHUB_OUTPUT"
           fi
 
   config-integrity:
@@ -333,9 +333,9 @@ jobs:
             echo "no app/requirements.txt — skipping pip-audit"
           fi
 
-      # npm audit of the APP AUTHOR's own deps. Worker-type apps declare deps in
+      # npm audit of the APP AUTHOR's own deps. Function-type apps declare deps in
       # app/package.json (there is no root package.json — config-integrity forbids
-      # it, and worker apps have no container image for Trivy to scan), so without
+      # it, and function apps have no container image for Trivy to scan), so without
       # this their dependencies would ship un-audited — the parity gap vs the
       # container path (pip-audit + Trivy). Audits the lockfile without installing;
       # generates a throwaway lock if the app didn't commit one so the gate still
@@ -412,17 +412,17 @@ jobs:
             cat .trivyignore.platform
           fi
 
-      # Worker-shaped apps (the 'worker' and 'mcp-worker' presets) have no Dockerfile — every image
-      # step below is guarded by worker_shaped != 'true'. The job still runs (and
+      # Function-shaped apps (the 'function' and 'mcp-function' presets) have no Dockerfile — every image
+      # step below is guarded by function_shaped != 'true'. The job still runs (and
       # SUCCEEDS with the image steps skipped) so the deploy job's
       # `needs: [container]` is satisfied; a skipped whole job would instead skip
       # the deploy.
       - name: docker build (isolated — no deploy token present)
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         run: docker build -t app-under-test .
 
       - name: Trivy image scan (fail on HIGH/CRITICAL)
-        if: needs.policy.outputs.worker_shaped != 'true' && steps.gate.outputs.enabled == 'true'
+        if: needs.policy.outputs.function_shaped != 'true' && steps.gate.outputs.enabled == 'true'
         # Run trivy directly via its official image rather than the
         # setup-trivy action — deterministic, and we authenticate the
         # vuln-DB pull with github.token to avoid anonymous ghcr rate limits
@@ -457,7 +457,7 @@ jobs:
       # /deploy-complete promotes it to the live pointer. Best-effort: a failed
       # upload warns and the build proceeds (the sweep keeps the previous SBOM).
       - name: Generate SBOM (CycloneDX)
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         env:
           TRIVY_TOKEN: ${{ github.token }}
         run: |
@@ -479,7 +479,7 @@ jobs:
               app-under-test
 
       - name: Checkout inno-platform (ci/ scripts)
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: dlaporte/inno-platform-ci
@@ -488,7 +488,7 @@ jobs:
 
       - name: Get OIDC token (audience=inno-platform-deploy)
         id: oidc_sbom
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
@@ -497,7 +497,7 @@ jobs:
             core.setOutput('token', token);
 
       - name: Upload SBOM to broker (best-effort)
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         env:
           OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
           APP: ${{ needs.policy.outputs.app }}
@@ -506,7 +506,7 @@ jobs:
             || echo "::warning::SBOM upload failed — the safety sweep will keep using the previous deployment's SBOM"
 
       - name: Assert non-root user + EXPOSE 8080
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         run: |
           set -e
           user="$(docker inspect --format='{{.Config.User}}' app-under-test)"
@@ -529,7 +529,7 @@ jobs:
       # storage-independent, per the application contract). The platform's
       # runtime health probe binds to the same endpoint after deploy.
       - name: Smoke test /healthz
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         run: |
           set -e
           docker run -d --name smoke -p 8080:8080 app-under-test
@@ -670,24 +670,24 @@ jobs:
           # config differs. package.json/lock/tsconfig are the gateway's build inputs.
           cp gateway-src/gateway/*.ts src/gateway/
           cp gateway-src/gateway/package.json gateway-src/gateway/package-lock.json gateway-src/gateway/tsconfig.json .
-          if [ "$SHAPE" = "worker" ]; then
-            # Worker-shaped: the app's own Worker gets its own config, and the
+          if [ "$SHAPE" = "function" ]; then
+            # Function-shaped: the app's own Worker gets its own config, and the
             # gateway gets the variant matching its identity boundary — the
             # Access-terminating one for the sso perimeter, the
             # OAuth-terminating one for the oauth-rs perimeter. app/index.ts
             # (the app author's fetch handler) and app/package.json (its deps,
             # if any) come from the app repo.
-            [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
+            [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type — promote a current platform SHA"; exit 1; }
             cp gateway-src/gateway/app-worker.jsonc app-worker.jsonc
             if [ "$PERIMETER" = "oauth-rs" ]; then
               [ -f gateway-src/gateway/wrangler.mcp.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp deployment type — promote a current platform SHA"; exit 1; }
               cp gateway-src/gateway/wrangler.mcp.jsonc wrangler.jsonc
             else
-              [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the worker deployment type — promote a current platform SHA"; exit 1; }
+              [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type — promote a current platform SHA"; exit 1; }
               cp gateway-src/gateway/wrangler.worker.jsonc wrangler.jsonc
             fi
           else
-            # Container-shape splits by perimeter exactly like worker-shape above: the
+            # Container-shape splits by perimeter exactly like function-shape above: the
             # oauth-rs variant is the container-fronting gateway keyed by the app's
             # resource identifier instead of an Access AUD.
             if [ "$PERIMETER" = "oauth-rs" ]; then
@@ -783,7 +783,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Template wrangler.jsonc (container)
-        if: needs.policy.outputs.worker_shaped != 'true' && needs.policy.outputs.perimeter == 'sso'
+        if: needs.policy.outputs.function_shaped != 'true' && needs.policy.outputs.perimeter == 'sso'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -797,7 +797,7 @@ jobs:
       # from the broker so the value the gateway pins a token's audience
       # against is never rebuilt in CI.
       - name: Template wrangler.jsonc (mcp-container)
-        if: needs.policy.outputs.worker_shaped != 'true' && needs.policy.outputs.perimeter == 'oauth-rs'
+        if: needs.policy.outputs.function_shaped != 'true' && needs.policy.outputs.perimeter == 'oauth-rs'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -805,8 +805,8 @@ jobs:
           INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
         run: node inno-platform-ci/ci/template-wrangler.mjs --mcp-container-gateway "$APP" "$DATABASE_ID" "$OAUTH_RS_RESOURCE" wrangler.jsonc
 
-      - name: Template worker configs (gateway + app worker)
-        if: needs.policy.outputs.shape == 'worker' && needs.policy.outputs.perimeter == 'sso'
+      - name: Template function configs (gateway + app worker)
+        if: needs.policy.outputs.shape == 'function' && needs.policy.outputs.perimeter == 'sso'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -824,7 +824,7 @@ jobs:
       # Access application). OAUTH_RS_RESOURCE comes from the broker so the
       # value the gateway pins a token's audience against is never rebuilt in CI.
       - name: Template mcp configs (gateway + app worker)
-        if: needs.policy.outputs.shape == 'worker' && needs.policy.outputs.perimeter == 'oauth-rs'
+        if: needs.policy.outputs.shape == 'function' && needs.policy.outputs.perimeter == 'oauth-rs'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -850,7 +850,7 @@ jobs:
       # passes CLOUDFLARE_API_TOKEN — do not add one without re-reviewing the
       # token-exfil surface.
       - name: wrangler deploy (container)
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
           # The minted deploy token is narrowly scoped and cannot call
@@ -869,14 +869,14 @@ jobs:
         # one ever slipped through (suspenders).
         run: CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4" npx wrangler deploy --config wrangler.jsonc --var "SLEEP_AFTER:$SLEEP_AFTER"
 
-      # Worker-shaped (the 'worker' and 'mcp-worker' presets): deploy the app's own Worker FIRST (so
+      # Function-shaped (the 'function' and 'mcp-function' presets): deploy the app's own Worker FIRST (so
       # the gateway's service binding resolves), then the gateway. The app Worker
       # has workers_dev:false and no route, so only the gateway can reach it. No
       # SLEEP_AFTER (that is a container knob). The same deploy token deploys both
       # scripts. Identical for both types — only the gateway CONFIG differed, and
       # that was already chosen at injection/templating time.
-      - name: "wrangler deploy (worker-shaped: app Worker then gateway)"
-        if: needs.policy.outputs.worker_shaped == 'true'
+      - name: "wrangler deploy (function-shaped: app Worker then gateway)"
+        if: needs.policy.outputs.function_shaped == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
           CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24
