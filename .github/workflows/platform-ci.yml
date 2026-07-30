@@ -170,11 +170,10 @@ jobs:
           echo "gateway_ref=$(printf '%s' "$resp" | jq -r '(.gateway_ref // empty) | select(test("^[0-9a-fA-F]{7,40}$"))')" >> "$GITHUB_OUTPUT"
           # Numeric cooldown threshold; a missing/garbage value reads 0 (off).
           echo "min_release_age_days=$(printf '%s' "$resp" | jq -r '(.min_release_age_days // 0) | if type=="number" then . else 0 end')" >> "$GITHUB_OUTPUT"
-          # Axes-first (new broker), falling back to the legacy `type` field
-          # (old broker) — both normalize to known values, failing safe to the
-          # container x sso path exactly as before.
-          shape="$(printf '%s' "$resp" | jq -r 'if .shape == "worker" then "worker" elif .shape == "container" then "container" elif .type == "worker" or .type == "mcp" then "worker" else "container" end')"
-          perimeter="$(printf '%s' "$resp" | jq -r 'if .perimeter == "oauth-rs" then "oauth-rs" elif .perimeter == "sso" then "sso" elif .type == "mcp" then "oauth-rs" else "sso" end')"
+          # Axes only (the legacy type field died with Phase B); unknown/absent
+          # values fail safe to the container x sso path exactly as before.
+          shape="$(printf '%s' "$resp" | jq -r 'if .shape == "worker" then "worker" else "container" end')"
+          perimeter="$(printf '%s' "$resp" | jq -r 'if .perimeter == "oauth-rs" then "oauth-rs" else "sso" end')"
           echo "shape=$shape" >> "$GITHUB_OUTPUT"
           echo "perimeter=$perimeter" >> "$GITHUB_OUTPUT"
           # worker_shaped survives as the gate-condition flag; it is now simply
@@ -397,7 +396,7 @@ jobs:
             cat .trivyignore.platform
           fi
 
-      # Worker-shaped apps ('worker' and 'mcp') have no Dockerfile — every image
+      # Worker-shaped apps (the 'worker' and 'mcp-worker' presets) have no Dockerfile — every image
       # step below is guarded by worker_shaped != 'true'. The job still runs (and
       # SUCCEEDS with the image steps skipped) so the deploy job's
       # `needs: [container]` is satisfied; a skipped whole job would instead skip
@@ -633,7 +632,7 @@ jobs:
           rm -rf src/gateway
           mkdir -p src/gateway
           # The gateway SOURCE is identical for ALL types (src/gateway/index.ts
-          # dispatches on MCP_MODE and the APP_WORKER binding); only the wrangler
+          # dispatches on OAUTH_RS_MODE and the APP_WORKER binding); only the wrangler
           # config differs. package.json/lock/tsconfig are the gateway's build inputs.
           cp gateway-src/gateway/*.ts src/gateway/
           cp gateway-src/gateway/package.json gateway-src/gateway/package-lock.json gateway-src/gateway/tsconfig.json .
@@ -719,7 +718,7 @@ jobs:
           # Emitted as the empty string for the sso perimeter (the templater
           # rejects an empty value, so an oauth-rs deploy against an older
           # broker fails loudly rather than pinning a bogus audience).
-          mcp_resource="$(echo "$resp" | jq -r '.mcp_resource // empty')"
+          oauth_rs_resource="$(echo "$resp" | jq -r '.oauth_rs_resource // empty')"
           # Cross-app data links (migration 0027). Compact JSON array, empty for
           # almost every app. -c keeps it on ONE line so it survives $GITHUB_OUTPUT
           # (which is line-oriented); an older broker that omits the field yields
@@ -733,7 +732,7 @@ jobs:
             echo "access_aud=$access_aud"
             echo "deployment_id=$deployment_id"
             echo "sleep_after=$sleep_after"
-            echo "mcp_resource=$mcp_resource"
+            echo "oauth_rs_resource=$oauth_rs_resource"
             echo "linked_databases=$linked_databases"
           } >> "$GITHUB_OUTPUT"
 
@@ -766,17 +765,17 @@ jobs:
       # oauth-rs perimeter: the app worker config is identical to the sso
       # perimeter's, but the gateway is keyed by this app's RFC 8707/9728
       # resource identifier instead of an Access AUD (these apps have no
-      # Access application). MCP_RESOURCE comes from the broker so the value
-      # the gateway pins a token's audience against is never rebuilt in CI.
+      # Access application). OAUTH_RS_RESOURCE comes from the broker so the
+      # value the gateway pins a token's audience against is never rebuilt in CI.
       - name: Template mcp configs (gateway + app worker)
         if: needs.policy.outputs.shape == 'worker' && needs.policy.outputs.perimeter == 'oauth-rs'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
-          MCP_RESOURCE: ${{ steps.deploy_token.outputs.mcp_resource }}
+          OAUTH_RS_RESOURCE: ${{ steps.deploy_token.outputs.oauth_rs_resource }}
           INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
         run: |
-          node inno-platform-ci/ci/template-wrangler.mjs --mcp-gateway "$APP" "$MCP_RESOURCE" wrangler.jsonc
+          node inno-platform-ci/ci/template-wrangler.mjs --mcp-gateway "$APP" "$OAUTH_RS_RESOURCE" wrangler.jsonc
           node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
 
       # NOTE (token-ordering, spec §5.2): `wrangler deploy` re-builds the
@@ -814,7 +813,7 @@ jobs:
         # one ever slipped through (suspenders).
         run: CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4" npx wrangler deploy --config wrangler.jsonc --var "SLEEP_AFTER:$SLEEP_AFTER"
 
-      # Worker-shaped ('worker' and 'mcp'): deploy the app's own Worker FIRST (so
+      # Worker-shaped (the 'worker' and 'mcp-worker' presets): deploy the app's own Worker FIRST (so
       # the gateway's service binding resolves), then the gateway. The app Worker
       # has workers_dev:false and no route, so only the gateway can reach it. No
       # SLEEP_AFTER (that is a container knob). The same deploy token deploys both

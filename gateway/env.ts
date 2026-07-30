@@ -18,15 +18,18 @@ export type Env = {
   APP_WORKER?: Fetcher;
   // --- mcp-type apps only (gateway/wrangler.mcp.jsonc) ---------------------
   // Present ONLY on mcp-type deploys, where the gateway is an OAuth Resource
-  // Server instead of an Access-terminating proxy. MCP_MODE is the switch;
+  // Server instead of an Access-terminating proxy. OAUTH_RS_MODE is the switch;
   // ACCESS_AUD is absent on these apps because they have no Access application.
-  MCP_MODE?: string;
+  OAUTH_RS_MODE?: string;
   // This app's RFC 8707/9728 resource identifier — `https://inno-{app}.{domain}/mcp`,
-  // templated by CI from the deploy broker's `mcp_resource`. Compared by EXACT
+  // templated by CI from the deploy broker's `oauth_rs_resource`. Compared by EXACT
   // match against a token's audience, so it must not be rebuilt ad hoc.
-  MCP_RESOURCE?: string;
+  OAUTH_RS_RESOURCE?: string;
   // The Authorization Server issuer the protected-resource metadata advertises
-  // (the platform's own origin).
+  // (the platform's own origin). Keeps its MCP_ prefix: this names the
+  // MCP-protocol Authorization Server per RFC 9728, protocol vocabulary rather
+  // than the retired type vocabulary, so it is exempt from the Phase B rename
+  // (spec Decision 4 keep-list).
   MCP_AUTH_SERVER?: string;
   // Service binding to the platform Worker, used for token introspection. The
   // binding is ROUTING, not authentication — /app-introspect is publicly

@@ -287,10 +287,10 @@ export function templateWorkerGateway(text, { app, accessAud } = {}) {
 /**
  * Template the mcp-type GATEWAY config (gateway/wrangler.mcp.jsonc).
  * Same marker discipline as templateWorkerGateway, but the single "REPLACE" is
- * MCP_RESOURCE (this app's RFC 8707/9728 resource identifier) rather than
+ * OAUTH_RS_RESOURCE (this app's RFC 8707/9728 resource identifier) rather than
  * ACCESS_AUD — mcp apps have no Cloudflare Access application. The resource is
  * compared by EXACT match against a token's audience, so it is validated as a
- * deploy value and must arrive from the broker's `mcp_resource`, never be
+ * deploy value and must arrive from the broker's `oauth_rs_resource`, never be
  * rebuilt here.
  */
 export function templateMcpGateway(text, { app, mcpResource } = {}) {
@@ -298,12 +298,12 @@ export function templateMcpGateway(text, { app, mcpResource } = {}) {
   assertDeployValue("mcpResource", mcpResource);
   const replaceCount = countMatches(text, /"REPLACE"/g);
   if (replaceCount !== 1) {
-    throw new Error(`expected exactly 1 "REPLACE" marker (MCP_RESOURCE) in the mcp gateway config, found ${replaceCount}`);
+    throw new Error(`expected exactly 1 "REPLACE" marker (OAUTH_RS_RESOURCE) in the mcp gateway config, found ${replaceCount}`);
   }
   const out = applyMarkers(text, [
     { pattern: /"inno-app-replace-app"/, replacement: `"inno-app-${app}-app"` },
     { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
-    { pattern: /("MCP_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${mcpResource}"` },
+    { pattern: /("OAUTH_RS_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${mcpResource}"` },
   ]);
   return forceWorkersDevFalse(out, "mcp gateway config");
 }

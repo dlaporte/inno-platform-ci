@@ -24,17 +24,21 @@
     // what the presented token already contains) — see src/routes/mcp-introspect.ts.
     { "binding": "PLATFORM", "service": "inno-platform" }
   ],
-  // MCP_MODE switches the gateway onto the bearer-token path. MCP_RESOURCE is
-  // this app's RFC 8707/9728 resource identifier, templated from the deploy
-  // broker's `mcp_resource`; it is compared by EXACT match against a token's
+  // OAUTH_RS_MODE switches the gateway onto the bearer-token path. OAUTH_RS_RESOURCE is
+  // this app's RFC 8707/9728 resource identifier, templated from the broker's
+  // `oauth_rs_resource`; it is compared by EXACT match against a token's
   // audience, which is what stops a token minted for one app being replayed
   // against another. MCP_AUTH_SERVER is a static deployment constant (the
-  // platform's own origin) advertised in the protected-resource metadata.
+  // platform's own origin) advertised in the protected-resource metadata; it
+  // keeps its MCP_ prefix because it names the MCP-protocol Authorization
+  // Server per RFC 9728 — protocol vocabulary, not the retired type
+  // vocabulary, so it is exempt from the Phase B rename (spec Decision 4
+  // keep-list).
   // Deliberately NO ACCESS_AUD / ACCESS_TEAM_DOMAIN: these apps have no Access
   // application, and the gateway's Access branch fails closed without them.
   "vars": {
-    "MCP_MODE": "true",
-    "MCP_RESOURCE": "REPLACE",
+    "OAUTH_RS_MODE": "true",
+    "OAUTH_RS_RESOURCE": "REPLACE",
     "MCP_AUTH_SERVER": "https://inno-platform.davidlaporte.org",
     "ENVIRONMENT": "production"
   }

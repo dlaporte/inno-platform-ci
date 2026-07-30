@@ -92,7 +92,7 @@ function protectedResourcePathFor(resourcePath: string): string {
 export function isProtectedResourceRequest(env: Env, path: string): boolean {
   if (path === PROTECTED_RESOURCE_PATH) return true;
   let resourcePath = "";
-  try { resourcePath = new URL(env.MCP_RESOURCE ?? "").pathname; } catch { return false; }
+  try { resourcePath = new URL(env.OAUTH_RS_RESOURCE ?? "").pathname; } catch { return false; }
   return path === protectedResourcePathFor(resourcePath);
 }
 
@@ -164,13 +164,13 @@ export async function authenticateMcp(
   // the platform rejecting an empty resource across a gateway/platform version
   // skew. Also keeps every such gateway out of a shared `resource=""` key space.
   if (!resource) {
-    console.error("gateway: MCP mode without MCP_RESOURCE — refusing all requests");
+    console.error("gateway: OAUTH_RS mode without OAUTH_RS_RESOURCE — refusing all requests");
     return null;
   }
   if (!env.PLATFORM) {
     // Misconfiguration (an mcp gateway deployed without its service binding).
     // Fail closed rather than serve an app with no identity boundary at all.
-    console.error("gateway: MCP mode without a PLATFORM service binding — refusing all requests");
+    console.error("gateway: OAUTH_RS mode without a PLATFORM service binding — refusing all requests");
     return null;
   }
 
@@ -219,7 +219,7 @@ export async function authenticateMcp(
 // It contains no secret, only URLs.
 export function protectedResourceMetadata(env: Env): Response {
   return Response.json({
-    resource: env.MCP_RESOURCE,
+    resource: env.OAUTH_RS_RESOURCE,
     authorization_servers: [env.MCP_AUTH_SERVER],
     // Header only — see bearerToken above.
     bearer_methods_supported: ["header"],
@@ -240,11 +240,11 @@ export function protectedResourceMetadata(env: Env): Response {
 // authorization" — without it a client can re-present an expired token in a loop.
 export function unauthorizedChallenge(env: Env, invalidToken = false): Response {
   // The metadata document lives on the RESOURCE's origin, derived from
-  // MCP_RESOURCE so the two can never disagree. Advertises the spec-correct
+  // OAUTH_RS_RESOURCE so the two can never disagree. Advertises the spec-correct
   // path-inserted form (RFC 9728 §3.1).
   let url = "";
   try {
-    const resource = new URL(env.MCP_RESOURCE ?? "");
+    const resource = new URL(env.OAUTH_RS_RESOURCE ?? "");
     url = `${resource.origin}${protectedResourcePathFor(resource.pathname)}`;
   } catch { url = ""; }
   const params: string[] = [];

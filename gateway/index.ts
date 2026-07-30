@@ -79,14 +79,14 @@ export function makeApp(deps: Deps = realDeps) {
     // Access-terminating proxy. Handled before the dev branch so the discovery
     // document and the 401 challenge behave identically in dev and production —
     // an MCP client's very first request depends on both.
-    if (env.MCP_MODE === "true") {
+    if (env.OAUTH_RS_MODE === "true") {
       const path = c.req.path;
       // Public, unauthenticated by design: this is how a client with no token
       // discovers which Authorization Server to use. Contains only URLs.
       if (c.req.method === "GET" && isProtectedResourceRequest(env, path)) {
         return protectedResourceMetadata(env);
       }
-      const auth = await authenticateMcp(env, c.req.raw, env.MCP_RESOURCE ?? "");
+      const auth = await authenticateMcp(env, c.req.raw, env.OAUTH_RS_RESOURCE ?? "");
       if (!auth) {
         // Distinguish "presented a bad/expired token" (→ error=invalid_token, so
         // the client refreshes) from "presented none" (→ start authorization).
@@ -140,7 +140,7 @@ export function makeApp(deps: Deps = realDeps) {
     // handler above, reachable solely by the app's own container in-runtime.
     // Do not add a /_storage route here: that would let the public internet
     // reach handleStorage's arbitrary SQL/R2 access directly.
-    const proxied = sanitizeAndInject(c.req.raw, identity, { mcpMode: env.MCP_MODE === "true" });
+    const proxied = sanitizeAndInject(c.req.raw, identity, { mcpMode: env.OAUTH_RS_MODE === "true" });
     // Deployment-type dispatch: worker-type apps carry an APP_WORKER service
     // binding and forward to the app's own Worker; container-type apps (no such
     // binding) forward to the container. Either way the gateway did the Access
