@@ -653,7 +653,15 @@ jobs:
               cp gateway-src/gateway/wrangler.worker.jsonc wrangler.jsonc
             fi
           else
-            cp gateway-src/gateway/wrangler.jsonc .
+            # Container-shape splits by perimeter exactly like worker-shape above: the
+            # oauth-rs variant is the container-fronting gateway keyed by the app's
+            # resource identifier instead of an Access AUD.
+            if [ "$PERIMETER" = "oauth-rs" ]; then
+              [ -f gateway-src/gateway/wrangler.mcp-container.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp-container preset — promote a current platform SHA"; exit 1; }
+              cp gateway-src/gateway/wrangler.mcp-container.jsonc wrangler.jsonc
+            else
+              cp gateway-src/gateway/wrangler.jsonc .
+            fi
           fi
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -741,13 +749,27 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Template wrangler.jsonc (container)
-        if: needs.policy.outputs.worker_shaped != 'true'
+        if: needs.policy.outputs.worker_shaped != 'true' && needs.policy.outputs.perimeter == 'sso'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
           ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
           INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
         run: node inno-platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" wrangler.jsonc
+
+      # mcp-container: the container-fronting gateway keyed by the app's RFC
+      # 8707/9728 resource identifier instead of an Access AUD (no Access
+      # application exists for the oauth-rs perimeter). OAUTH_RS_RESOURCE comes
+      # from the broker so the value the gateway pins a token's audience
+      # against is never rebuilt in CI.
+      - name: Template wrangler.jsonc (mcp-container)
+        if: needs.policy.outputs.worker_shaped != 'true' && needs.policy.outputs.perimeter == 'oauth-rs'
+        env:
+          APP: ${{ needs.policy.outputs.app }}
+          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
+          OAUTH_RS_RESOURCE: ${{ steps.deploy_token.outputs.oauth_rs_resource }}
+          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
+        run: node inno-platform-ci/ci/template-wrangler.mjs --mcp-container-gateway "$APP" "$DATABASE_ID" "$OAUTH_RS_RESOURCE" wrangler.jsonc
 
       - name: Template worker configs (gateway + app worker)
         if: needs.policy.outputs.shape == 'worker' && needs.policy.outputs.perimeter == 'sso'

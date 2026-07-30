@@ -309,6 +309,65 @@ export function templateMcpGateway(text, { app, mcpResource } = {}) {
 }
 
 /**
+ * Template the mcp-container GATEWAY config (gateway/wrangler.mcp-container.jsonc)
+ * — the container × oauth-rs preset. This gateway HOLDS its own D1/R2 directly
+ * (no separate app-worker config, same as the plain container gateway), so it
+ * reuses the default container mode's name/D1/R2/linked-databases
+ * substitutions; the only swap versus that mode is the identity marker —
+ * OAUTH_RS_RESOURCE (this app's RFC 8707/9728 resource identifier) instead of
+ * ACCESS_AUD, because these apps have no Cloudflare Access application. Same
+ * exactly-one-marker corruption guard and empty-value refusal as
+ * templateMcpGateway, scoped to the OAUTH_RS_RESOURCE key so it doesn't
+ * collide with the also-present database_id REPLACE marker (unlike
+ * wrangler.mcp.jsonc, this variant carries d1_databases too).
+ *
+ * @param {string} text
+ * @param {{app: string, databaseId: string, resource: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string}[]}} params
+ * @returns {string} the substituted JSONC text
+ */
+export function templateMcpContainerGateway(text, { app, databaseId, resource, linkedDatabases = [] } = {}) {
+  assertAppName(app);
+  assertDeployValue("databaseId", databaseId);
+  assertDeployValue("resource", resource);
+
+  const resourceMarkerCount = countMatches(text, /"OAUTH_RS_RESOURCE"\s*:\s*"REPLACE"/g);
+  if (resourceMarkerCount !== 1) {
+    throw new Error(
+      `expected exactly 1 "OAUTH_RS_RESOURCE" REPLACE marker in the mcp-container gateway config, found ${resourceMarkerCount}`,
+    );
+  }
+
+  // Belt-and-suspenders, mirroring templateWrangler's own safety net: this
+  // variant (unlike wrangler.mcp.jsonc) carries d1_databases too, so it must
+  // have exactly two bare `"REPLACE"` literal occurrences total (database_id,
+  // OAUTH_RS_RESOURCE). Checked AFTER the scoped check above so a corrupted
+  // OAUTH_RS_RESOURCE marker still reports "found 0" against that specific
+  // key rather than being masked by this total falling to 1. This one instead
+  // catches a hypothetical THIRD marker added to the variant later — neither
+  // scoped check above would notice an extra "REPLACE" elsewhere.
+  const replaceLiteralCount = countMatches(text, /"REPLACE"/g);
+  if (replaceLiteralCount !== 2) {
+    throw new Error(
+      `expected exactly 2 "REPLACE" markers (database_id, OAUTH_RS_RESOURCE) in the mcp-container gateway config, found ${replaceLiteralCount}`,
+    );
+  }
+
+  const out = applyMarkers(text, [
+    { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
+    { pattern: /"inno-replace-db"/, replacement: `"inno-${app}-db"` },
+    { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${databaseId}"` },
+    { pattern: /"inno-replace-data"/, replacement: `"inno-${app}-data"` },
+    { pattern: /("OAUTH_RS_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${resource}"` },
+  ]);
+
+  // Cross-app data links (migration 0028): the gateway holds these bindings
+  // directly for a container app (it has no credential of its own to reach
+  // storage), same as the default container mode.
+  const withLinks = appendLinkedDatabases(out, linkedDatabases, "mcp-container gateway config");
+  return forceWorkersDevFalse(withLinks, "mcp-container gateway config");
+}
+
+/**
  * Template the worker-type APP WORKER config (gateway/app-worker.jsonc).
  * Markers: the worker name ("inno-app-replace-app"), D1 name/id, R2 bucket.
  * Exactly one "REPLACE" (database_id) — no ACCESS_AUD (the gateway owns Access).
@@ -356,6 +415,11 @@ if (isMainModule(import.meta.url)) {
     if (!app || !mcpResource) { console.error("Usage: node ci/template-wrangler.mjs --mcp-gateway <app> <mcpResource> [path]"); process.exit(1); }
     writeFileSync(path, templateMcpGateway(readFileSync(path, "utf8"), { app, mcpResource }));
     console.log(`templated mcp gateway ${path} for app "${app}"`);
+  } else if (mode === "--mcp-container-gateway") {
+    const [app, databaseId, resource, path = "wrangler.jsonc"] = rest;
+    if (!app || !databaseId || !resource) { console.error("Usage: node ci/template-wrangler.mjs --mcp-container-gateway <app> <databaseId> <resource> [path]"); process.exit(1); }
+    writeFileSync(path, templateMcpContainerGateway(readFileSync(path, "utf8"), { app, databaseId, resource, linkedDatabases }));
+    console.log(`templated mcp-container gateway ${path} for app "${app}"`);
   } else if (mode === "--worker-app") {
     const [app, databaseId, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId) { console.error("Usage: node ci/template-wrangler.mjs --worker-app <app> <databaseId> [path]"); process.exit(1); }
