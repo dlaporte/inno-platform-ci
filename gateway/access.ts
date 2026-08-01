@@ -7,7 +7,16 @@ export const ACCESS_COOKIE = "CF_Authorization";
 // one constant so the two paths can't drift.
 export const GROUP_PREFIX = "inno-";
 
-export interface AccessIdentity { email: string; groups: string[] }
+export interface AccessIdentity {
+  email: string;
+  groups: string[];
+  // Connections v1 (Task 14): the platform-minted, short-TTL statement of this
+  // caller's identity (see src/connections/assertion.ts), carried ONLY on the
+  // MCP path via introspection's `caller_assertion` (mcp-auth.ts). Injected as
+  // X-Caller-Assertion by sanitizeAndInject so the app can echo it back to
+  // /_connections/{name} without the gateway ever trusting an app-supplied value.
+  callerAssertion?: string;
+}
 
 export async function verifyAccessJwt(
   token: string,

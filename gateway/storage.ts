@@ -1,6 +1,15 @@
 import type { Env } from "./env";
 
-type S = Pick<Env, "DB" | "FILES">;
+// PLATFORM added for Connections v1's /_connections/{name} proxy below. It is
+// optional on Env (present only on the two oauth-rs wrangler variants — see
+// env.ts), so a sso-perimeter app simply has it undefined and the route below
+// answers 501 rather than throwing.
+type S = Pick<Env, "DB" | "FILES" | "PLATFORM">;
+
+// Same grammar the platform enforces for a connection name (src/connections/store.ts
+// CONN_NAME_RE) — restated rather than imported, same reason as APP_NAME_RE below:
+// the gateway builds separately from the platform Worker.
+const CONNECTION_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
 
 // Per-object upload cap (25 MiB). Enforced only when the client sends a
 // content-length header — a chunked PUT with no length streams to R2, where
@@ -100,6 +109,24 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
         return new Response(obj.body, { status: 200 });
       }
       if (m === "DELETE") { await env.FILES.delete(key); return json({ deleted: true }); }
+    }
+    if (path.startsWith("/_connections/") && m === "POST") {
+      // Per-user backend credentials (APP-CONTRACT Connections). The container
+      // echoes the gateway-injected X-Caller-Assertion; identity travels ONLY in
+      // that platform-signed token — this outbound handler cannot see the inbound
+      // request, and every header here is container-authored (untrusted).
+      // Method-gated like every sibling route above (path+method in one
+      // condition): the container always POSTs here, so any other verb should
+      // fall through to the same unknown_storage_route 404 as an unmatched path,
+      // not be silently forwarded to the platform as a hardcoded POST.
+      if (!env.PLATFORM) return json({ error: "connections_unavailable" }, 501);
+      const name = path.slice("/_connections/".length);
+      if (!CONNECTION_NAME_RE.test(name)) return json({ error: "bad_connection_name" }, 400);
+      return env.PLATFORM.fetch("https://platform.internal/_connections/fetch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ assertion: request.headers.get("x-caller-assertion") ?? "", connection: name }),
+      });
     }
     return json({ error: "unknown_storage_route" }, 404);
   } catch (e) {

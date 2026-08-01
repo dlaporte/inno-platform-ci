@@ -47,6 +47,13 @@ interface IntrospectionResponse {
   groups?: string[];
   service?: boolean;
   expires_in?: number;
+  // Connections v1 (Task 8, src/mcp/app-tokens.ts): a short-TTL (300s) signed
+  // statement of this caller's identity, minted platform-side and cached here
+  // right along with the rest of the introspection body. That's safe because
+  // this cache's own TTL is bounded at MAX_CACHE_SECONDS (60s) — strictly less
+  // than the assertion's 300s lifetime — so a cached assertion is always still
+  // within its validity window when reused.
+  caller_assertion?: string;
 }
 
 // The introspection cache, private to this isolate. Keyed by the hex digest
@@ -210,7 +217,9 @@ export async function authenticateMcp(
   // guarantee; enforce it here too.
   const groups = (Array.isArray(body.groups) ? body.groups : [])
     .filter((g): g is string => typeof g === "string" && g.startsWith(GROUP_PREFIX));
-  return { identity: { email, groups }, service: body.service === true };
+  const identity: AccessIdentity = { email, groups };
+  if (body.caller_assertion) identity.callerAssertion = body.caller_assertion;
+  return { identity, service: body.service === true };
 }
 
 // RFC 9728 §3: the metadata document that tells an MCP client which
