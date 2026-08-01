@@ -227,6 +227,16 @@ export async function authenticateMcp(
 // point: it is how an unauthenticated client discovers where to get a token.
 // It contains no secret, only URLs.
 export function protectedResourceMetadata(env: Env): Response {
+  // Fail closed on a mis-templated deploy, like every other path in this file.
+  // Serving the document with these unset yields {"authorization_servers":
+  // [null]} and no `resource` at all (JSON.stringify drops undefined) — and
+  // because the success response is `public, max-age=3600`, clients and
+  // intermediaries would keep that garbage for an hour after the config is
+  // corrected. 500 + no-store instead: loud, and never cached.
+  if (!env.OAUTH_RS_RESOURCE || !env.MCP_AUTH_SERVER) {
+    console.error("gateway: protected-resource metadata requested without OAUTH_RS_RESOURCE/MCP_AUTH_SERVER — refusing");
+    return new Response("misconfigured", { status: 500, headers: { "cache-control": "no-store" } });
+  }
   return Response.json({
     resource: env.OAUTH_RS_RESOURCE,
     authorization_servers: [env.MCP_AUTH_SERVER],

@@ -4,7 +4,14 @@ import type { Env } from "./env";
 // optional on Env (present only on the two oauth-rs wrangler variants — see
 // env.ts), so a sso-perimeter app simply has it undefined and the route below
 // answers 501 rather than throwing.
-type S = Pick<Env, "DB" | "FILES" | "PLATFORM">;
+// Not Pick<Env, …>: DB/FILES are optional on Env because the function-shaped
+// gateway variants don't bind them, but handleStorage is reachable ONLY as
+// AppContainer's storage.internal outbound handler — i.e. only on the
+// container-shaped deploys, where both always exist. Stating that here keeps
+// the narrowing at the one place the invariant actually holds (index.ts's
+// outboundByHost registration) instead of scattering `!` through this file.
+export type StorageEnv = { DB: D1Database; FILES: R2Bucket; PLATFORM?: Fetcher };
+type S = StorageEnv;
 
 // Same grammar the platform enforces for a connection name (src/connections/store.ts
 // CONN_NAME_RE) — restated rather than imported, same reason as APP_NAME_RE below:
@@ -91,8 +98,20 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       return json({ changes: r.meta.changes ?? 0, lastRowId: r.meta.last_row_id ?? null });
     }
     if (path === "/_storage/files" && m === "GET") {
-      const list = await env.FILES.list();
-      return json({ keys: list.objects.map((o) => o.key) });
+      // R2 caps list() at 1000 keys and sets `truncated` with a cursor — a
+      // single call silently returns a PARTIAL listing that an app author
+      // reads as "these are all my files". Page to exhaustion, with a hard
+      // stop far above any realistic per-app bucket so a truncated-but-
+      // cursorless response can never spin forever.
+      const keys: string[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < 1000; page++) {
+        const list = await env.FILES.list(cursor ? { cursor } : undefined);
+        for (const o of list.objects) keys.push(o.key);
+        cursor = list.truncated ? list.cursor : undefined;
+        if (!cursor) break;
+      }
+      return json({ keys });
     }
     const fileMatch = path.match(/^\/_storage\/files\/(.+)$/);
     if (fileMatch) {

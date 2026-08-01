@@ -40,13 +40,20 @@ export function parseRequirements(text) {
   return out;
 }
 
-// Resolved versions from an npm lockfile (v2/v3 `packages` map). The root
-// package (key "") and link/workspace entries (no version) are skipped.
+// Resolved versions from an npm lockfile (v2/v3 `packages` map). Three kinds
+// of entry are skipped: the root package (key ""), link entries (no version),
+// and workspace SOURCE entries — a path with no "node_modules/" segment, e.g.
+// "packages/foo". The last one matters: it carries a real version, so a naive
+// split("node_modules/").pop() yields the literal "packages/foo" and asks the
+// registry to date local code that was never published (a guaranteed miss, and
+// a spurious "age unknown" warning on every run). Its installed counterpart
+// under node_modules/ is a link entry with no version, so nothing is lost.
 export function parseNpmLock(json) {
   const out = [];
   const pkgs = json && json.packages ? json.packages : {};
   for (const [path, info] of Object.entries(pkgs)) {
     if (!path || !info || typeof info.version !== "string") continue;
+    if (!path.includes("node_modules/")) continue;
     const name = path.split("node_modules/").pop();
     if (name) out.push({ ecosystem: "npm", name, version: info.version });
   }
@@ -71,16 +78,26 @@ export function evaluateAges(entries, thresholdDays, nowMs) {
 
 // --- Registry lookups (I/O; injectable for tests) ---------------------------
 
+// Per-request ceiling. Without it a hung registry stalls the gate until the
+// job's own timeout kills it with no diagnosis; with it the entry simply
+// resolves to null and is reported as skipped.
+const REGISTRY_TIMEOUT_MS = 10_000;
+const timeout = () => ({ signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS) });
+
 async function pypiPublishedAt(fetchImpl, name, version) {
-  const res = await fetchImpl(`https://pypi.org/pypi/${encodeURIComponent(name)}/${encodeURIComponent(version)}/json`);
+  const res = await fetchImpl(`https://pypi.org/pypi/${encodeURIComponent(name)}/${encodeURIComponent(version)}/json`, timeout());
   if (!res.ok) return null;
   const data = await res.json();
   const times = (data.urls || []).map((u) => Date.parse(u.upload_time_iso_8601)).filter((t) => !Number.isNaN(t));
   return times.length ? Math.min(...times) : null;
 }
 
+// NOTE: this must fetch the FULL packument. The abbreviated-metadata document
+// (application/vnd.npm.install-v1+json) omits the `time` map entirely, so
+// requesting it would make every npm lookup return null — turning the cooldown
+// gate into a no-op that still prints a pass line.
 async function npmPublishedAt(fetchImpl, name, version) {
-  const res = await fetchImpl(`https://registry.npmjs.org/${name.replace("/", "%2F")}`);
+  const res = await fetchImpl(`https://registry.npmjs.org/${name.replace("/", "%2F")}`, timeout());
   if (!res.ok) return null;
   const data = await res.json();
   const iso = data.time && data.time[version];
@@ -91,15 +108,24 @@ async function npmPublishedAt(fetchImpl, name, version) {
 export async function resolvePublishTimes(entries, fetchImpl) {
   const resolved = [];
   const skipped = [];
+  // One lookup per DISTINCT ecosystem:name@version. A lockfile lists an entry
+  // per install PATH, so a dependency hoisted into several trees would
+  // otherwise be fetched once per copy — same answer every time.
+  const dates = new Map();
   for (const e of entries) {
-    let publishedAt = null;
-    try {
-      publishedAt = e.ecosystem === "pypi"
-        ? await pypiPublishedAt(fetchImpl, e.name, e.version)
-        : await npmPublishedAt(fetchImpl, e.name, e.version);
-    } catch {
-      publishedAt = null;
+    const key = `${e.ecosystem}:${e.name}@${e.version}`;
+    if (!dates.has(key)) {
+      let publishedAt = null;
+      try {
+        publishedAt = e.ecosystem === "pypi"
+          ? await pypiPublishedAt(fetchImpl, e.name, e.version)
+          : await npmPublishedAt(fetchImpl, e.name, e.version);
+      } catch {
+        publishedAt = null;
+      }
+      dates.set(key, publishedAt);
     }
+    const publishedAt = dates.get(key);
     if (publishedAt === null) skipped.push(e);
     resolved.push({ ...e, publishedAt });
   }
@@ -120,25 +146,54 @@ export async function checkDepAge({ appDir, thresholdDays, fetchImpl = fetch, no
     try { entries.push(...parseNpmLock(JSON.parse(lock))); } catch { /* malformed lock: nothing to date */ }
   }
 
-  if (entries.length === 0) return { violations: [], checked: 0, skipped: [] };
+  // package.json with NO committed lockfile: there are no exact pins to date,
+  // and the deploy job resolves the ranges fresh (`npm ci || npm install`), so
+  // the versions that actually ship were never seen by this gate. Reported so
+  // the CLI can say that plainly instead of printing a clean-pass line.
+  const unpinnedNpm = !lock && !!read(join(appDir, "package.json"));
+
+  if (entries.length === 0) return { violations: [], checked: 0, skipped: [], unpinnedNpm };
 
   const { resolved, skipped } = await resolvePublishTimes(entries, fetchImpl);
   const violations = evaluateAges(resolved, thresholdDays, nowMs);
-  return { violations, checked: resolved.length, skipped };
+  // `checked` counts entries actually DATED — an entry the registry couldn't
+  // date is reported under `skipped` and must not inflate the pass message.
+  return { violations, checked: resolved.length - skipped.length, skipped, unpinnedNpm };
 }
 
 // --- CLI --------------------------------------------------------------------
 
-async function main() {
-  const appDir = process.argv[2] || "app";
-  const thresholdDays = Number(process.env.MIN_RELEASE_AGE_DAYS || 0);
+// Exported so the gate's exit code is testable; the CLI block below is the
+// only production caller. `appDir`/`thresholdDays` fall back to argv/env.
+export async function main({ appDir, thresholdDays } = {}) {
+  appDir ??= process.argv[2] || "app";
+  thresholdDays ??= Number(process.env.MIN_RELEASE_AGE_DAYS || 0);
   if (!Number.isFinite(thresholdDays) || thresholdDays <= 0) {
     console.log("dep-age: min_release_age_days is 0 — cooldown gate disabled, nothing to check.");
     return 0;
   }
-  const { violations, checked, skipped } = await checkDepAge({ appDir, thresholdDays });
+  const { violations, checked, skipped, unpinnedNpm } = await checkDepAge({ appDir, thresholdDays });
   for (const s of skipped) {
     console.log(`::warning title=Dependency age unknown::${s.ecosystem}:${s.name}@${s.version} — no publish date from the registry; skipped`);
+  }
+  // Reaching here means an admin explicitly set safety.min_release_age_days —
+  // they asked for a cooldown. Without a committed lockfile there are no exact
+  // pins to date and the deploy job resolves the ranges fresh, so the cooldown
+  // cannot be applied to npm at all. Passing green would be exactly the defect
+  // this gate exists to prevent: a clean report over work that was never done.
+  // Note the asymmetry with the disabled case above — with the gate OFF (the
+  // default) an unpinned app is fine and never reaches this branch. The gate
+  // being ON is the opt-in; a committed app lockfile is not otherwise required
+  // by the app contract.
+  if (unpinnedNpm) {
+    console.error(
+      "::error title=Dependency cooldown cannot be applied::app/package.json has no committed " +
+      "app/package-lock.json, so there are no exact versions to date — and the deploy job resolves " +
+      `these ranges fresh. This app cannot satisfy the ${thresholdDays}-day cooldown its ` +
+      "safety.min_release_age_days setting requires. Commit app/package-lock.json, or ask a platform " +
+      "admin to set safety.min_release_age_days to 0 for this app.",
+    );
+    return 1;
   }
   if (violations.length === 0) {
     console.log(`dep-age: ${checked} pinned dependency version(s) checked; all at least ${thresholdDays} day(s) old.`);

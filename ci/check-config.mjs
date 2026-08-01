@@ -1,8 +1,12 @@
 #!/usr/bin/env node
-// Config-integrity gate: verifies an app repo has not weakened the
-// security posture the platform requires (CLAUDE.md guidance present,
-// production auth mode, container image/limits unchanged, gateway not
-// vendored into the app repo — the platform injects it at build time).
+// Config-integrity gate: verifies an app repo has not weakened the security
+// posture the platform requires — required CLAUDE.md guidance present, and no
+// platform-owned build input vendored into the app repo (gateway source,
+// worker build inputs, and ANY wrangler config; the platform injects all of
+// them at build time from the promoted gateway.ref). See checkConfig's own
+// note on the numbering: checks 2-6 (which inspected an app-owned
+// wrangler.jsonc for auth mode and container image/limits) were retired when
+// that file stopped being app-owned.
 //
 // Usage: node ci/check-config.mjs <app-dir>
 // Exits 0 if compliant, 1 (with violations printed) otherwise.
@@ -155,10 +159,12 @@ export function checkConfig(appDir) {
     }
   }
 
-  // --- Check 1b: no competing wrangler config file in the app root ---
-  // Only wrangler.jsonc may exist — any other wrangler config file could be
-  // silently preferred by `wrangler deploy`'s discovery order, bypassing the
-  // gate (which only vets wrangler.jsonc).
+  // --- Check 1b: no wrangler config file at all in the app root ---
+  // NO wrangler config may exist here — the platform injects the only
+  // permitted one at deploy time from the promoted gateway.ref. Anything
+  // committed could be silently preferred by `wrangler deploy`'s discovery
+  // order (wrangler.json OUTRANKS wrangler.jsonc), which is why this gate
+  // rejects rather than inspects: it vets none of them.
   //
   // The deploy step pins --config wrangler.jsonc (hard override of wrangler's
   // discovery + redirect); this gate check is the independent belt to that

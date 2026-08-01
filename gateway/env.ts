@@ -1,7 +1,14 @@
 import type { AppContainer } from "./index";
 
 export type Env = {
-  DB: D1Database; FILES: R2Bucket; APP: DurableObjectNamespace<AppContainer>;
+  // Container-shaped deploys only (gateway/wrangler.jsonc and
+  // wrangler.mcp-container.jsonc). The function-shaped variants declare no
+  // D1/R2/container at all — storage belongs to the app Worker there — so
+  // these are OPTIONAL like every other per-variant binding below. Nothing
+  // reads them outside the container path: handleStorage is reachable only as
+  // AppContainer's storage.internal outbound handler, and the request
+  // dispatch checks APP_WORKER first (see index.ts).
+  DB?: D1Database; FILES?: R2Bucket; APP?: DurableObjectNamespace<AppContainer>;
   // Cloudflare Access config, templated per app. OPTIONAL because mcp-type apps
   // have no Access application at all (see the MCP block below) — the Access
   // branch in index.ts refuses to run without them rather than verifying a JWT

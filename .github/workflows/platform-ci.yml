@@ -269,10 +269,12 @@ jobs:
 
       - name: semgrep (OWASP Top Ten ruleset)
         if: steps.gate.outputs.enabled == 'true'
-        # Scope to the app author's code (app/). The gateway (src/) is
-        # hash-pinned by config-integrity and the caller workflow is inert +
-        # platform-defined, so scanning them only yields findings on the
-        # platform's own intentional patterns (e.g. secrets: inherit).
+        # Scope to the app author's code (app/) — it is the only code in the
+        # tree the app author controls. Everything else (the gateway under
+        # src/gateway, the worker build inputs, wrangler.jsonc) is injected at
+        # deploy time from the promoted gateway.ref, and config-integrity
+        # REJECTS an app repo that ships its own copy, so scanning them would
+        # only yield findings on the platform's own intentional patterns.
         # Admin-set rule ignores arrive as repeatable --exclude-rule flags;
         # the set --/positional-args pattern is POSIX-sh safe in this
         # container, and the IDs are grammar-pinned server-side.
@@ -524,7 +526,9 @@ jobs:
           echo "container-validate: exposes 8080"
 
       # Contract R2 made real at build time: the container must come up and
-      # answer GET /healthz -> 200. Generous 90s window (slow app boots are
+      # answer GET /healthz -> 200. Generous ~90s window — 18 tries with a 5s
+      # sleep between; a port that ACCEPTS but hangs stretches it to ~160s via
+      # curl's 4s per-attempt timeout. (Slow app boots are
       # legitimate; a healthz that needs storage is not — the endpoint must be
       # storage-independent, per the application contract). The platform's
       # runtime health probe binds to the same endpoint after deploy.
@@ -539,7 +543,7 @@ jobs:
             sleep 5
           done
           if [ -z "$ok" ]; then
-            echo "container-validate: /healthz did not answer 200 within 90s — refusing" >&2
+            echo "container-validate: /healthz did not answer 200 within 18 tries (~90s) — refusing" >&2
             echo "--- container logs ---" >&2
             docker logs smoke >&2 || true
             docker rm -f smoke || true
@@ -610,6 +614,19 @@ jobs:
     # independently re-verifies it from the signed OIDC claims.
     if: ${{ needs.scaffold-check.outputs.built == 'true' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
+    # Serialize deploys per app repo. The broker already makes its OWN side
+    # safe (deploy-complete runs under withAppLease and the status flip is
+    # guarded on 'deploying', so a loser gets 409 rather than interleaving),
+    # but the two `wrangler deploy` calls below race at Cloudflare with no
+    # interlock: two tags pushed in quick succession can land the OLDER code
+    # last while the registry records the newer deployment as live.
+    # Keyed on repository, NOT github.ref — inside a reusable workflow that ref
+    # is the CALLER's, so a ref-keyed group would put two tags in two groups
+    # and serialize nothing. Queued, never cancelled: a half-finished deploy is
+    # worse than a slow one.
+    concurrency:
+      group: inno-deploy-${{ github.repository }}
+      cancel-in-progress: false
     timeout-minutes: 45
     permissions:
       id-token: write   # mints a broker OIDC token
@@ -661,7 +678,7 @@ jobs:
           SHAPE: ${{ needs.policy.outputs.shape }}
           PERIMETER: ${{ needs.policy.outputs.perimeter }}
         run: |
-          [ -f gateway-src/gateway/package.json ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the build-input move — promote a post-f866c96 platform SHA"; exit 1; }
+          [ -f gateway-src/gateway/package.json ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the build-input move (no gateway/package.json at that ref) — promote a current inno-platform-ci mirror SHA with the sync_gateway_ref MCP tool"; exit 1; }
           [ -f gateway-src/gateway/wrangler.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the wrangler.jsonc move — promote a current platform SHA"; exit 1; }
           rm -rf src/gateway
           mkdir -p src/gateway
@@ -761,7 +778,7 @@ jobs:
           # rejects an empty value, so an oauth-rs deploy against an older
           # broker fails loudly rather than pinning a bogus audience).
           oauth_rs_resource="$(echo "$resp" | jq -r '.oauth_rs_resource // empty')"
-          # Cross-app data links (migration 0027). Compact JSON array, empty for
+          # Cross-app data links (migration 0028). Compact JSON array, empty for
           # almost every app. -c keeps it on ONE line so it survives $GITHUB_OUTPUT
           # (which is line-oriented); an older broker that omits the field yields
           # [], which the templater treats as "no links".
@@ -835,14 +852,18 @@ jobs:
           node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
 
       # NOTE (token-ordering, spec §5.2): `wrangler deploy` re-builds the
-      # Dockerfile locally (containers[0].image is "./Dockerfile", enforced
-      # by the config-integrity gate) — this is a SECOND build of the same
-      # user-controlled Dockerfile, this time with CLOUDFLARE_API_TOKEN in
+      # Dockerfile locally (containers[0].image is "./Dockerfile", which comes
+      # from the wrangler.jsonc INJECTED above from the promoted gateway.ref —
+      # the app repo may not carry one at all) — this is a SECOND build of the
+      # same user-controlled Dockerfile, this time with CLOUDFLARE_API_TOKEN in
       # env. See this file's header comment / the Task 5 report for the
       # investigated alternative (a pre-built-image `image:` reference) and
       # why it isn't used here.
-      # --config wrangler.jsonc: pin the exact file the config-integrity gate
-      # vetted. wrangler discovers config as wrangler.json ?? wrangler.jsonc ??
+      # --config wrangler.jsonc: pin the exact file injected from the promoted
+      # gateway.ref. (config-integrity does not vet this file — it REJECTS any
+      # wrangler config committed to the app repo; the guarantee is provenance,
+      # not inspection.)
+      # wrangler discovers config as wrangler.json ?? wrangler.jsonc ??
       # wrangler.toml (wrangler.json OUTRANKS .jsonc, and multiple files don't
       # error), so without --config an attacker could add an unvetted
       # wrangler.json and have wrangler silently use it. The token is NOT
@@ -886,7 +907,21 @@ jobs:
           # (config-integrity forbids a ROOT package.json, not this one). Install
           # them the same hardened way as the gateway's — --ignore-scripts near the
           # deploy token — so wrangler can bundle app/index.ts. No deps => skip.
-          if [ -f app/package.json ]; then (cd app && npm ci --ignore-scripts || npm install --ignore-scripts); fi
+          #
+          # `npm ci` needs a committed app/package-lock.json. Without one we fall
+          # back to resolving the ranges fresh, which means the versions that
+          # DEPLOY were never the ones the deps gate audited. Kept working (a
+          # committed app lockfile is not in the app contract) but made loud, so
+          # the divergence appears in the run instead of being invisible.
+          # Note this run never gets here if safety.min_release_age_days > 0:
+          # the dep-age gate hard-fails an unpinned app rather than report a
+          # cooldown it could not apply (ci/check-dep-age.mjs).
+          if [ -f app/package.json ]; then
+            (cd app && npm ci --ignore-scripts) || {
+              echo "::warning title=Unpinned app dependencies::app/package-lock.json is missing or stale — resolving app/package.json fresh at deploy time. These versions were NOT the ones the dependency gates audited; commit app/package-lock.json to close the gap."
+              (cd app && npm install --ignore-scripts)
+            }
+          fi
           export CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4"
           npx wrangler deploy --config app-worker.jsonc
           npx wrangler deploy --config wrangler.jsonc
@@ -911,7 +946,15 @@ jobs:
           set -e
           result="$(node inno-platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$GATEWAY_REF")"
           echo "$result"
-          url="$(echo "$result" | jq -r .url)"
+          # Guard the shape, not just the exit status: a well-formed JSON body
+          # that isn't the broker's would otherwise write "Deployed: null" into
+          # a GREEN summary. (The broker's success path always carries url —
+          # this is the belt to that.)
+          url="$(echo "$result" | jq -r '.url // empty')"
+          if [ -z "$url" ]; then
+            echo "::error title=Finalize::broker returned no url: $result" >&2
+            exit 1
+          fi
           echo "Deployed: $url"
           {
             echo "### Deployed"

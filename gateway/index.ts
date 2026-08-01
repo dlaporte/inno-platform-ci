@@ -4,7 +4,7 @@ import { createRemoteJWKSet } from "jose";
 import type { Env } from "./env";
 import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, GROUP_PREFIX, type AccessIdentity } from "./access";
 import { sanitizeAndInject } from "./identity";
-import { handleStorage } from "./storage";
+import { handleStorage, type StorageEnv } from "./storage";
 import {
   authenticateMcp, bearerToken, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
 } from "./mcp-auth";
@@ -32,6 +32,13 @@ export class AppContainer extends Container<Env> {
     super(...args);
     const env = args[1] as Env;
     if (env.SLEEP_AFTER && /^[0-9]{1,4}(s|m|h)$/.test(env.SLEEP_AFTER)) this.sleepAfter = env.SLEEP_AFTER;
+    // Say so rather than silently keeping the default: an owner who sets
+    // container.sleep_after to something this grammar rejects otherwise sees
+    // the config store accept the value while the container keeps sleeping at
+    // 10m, with no surface anywhere explaining the discrepancy.
+    else if (env.SLEEP_AFTER) {
+      console.warn(`gateway: ignoring malformed SLEEP_AFTER ${JSON.stringify(env.SLEEP_AFTER)} — keeping ${this.sleepAfter}`);
+    }
   }
 }
 // Register the storage.internal outbound handler by ASSIGNING after the class
@@ -41,7 +48,13 @@ export class AppContainer extends Container<Env> {
 // property that SHADOWS the setter — the handler is never registered, so the
 // container's http://storage.internal calls fall through to the enableInternet
 // fallback and fail with HTTP 530 (the live "no D1 writes" bug).
-AppContainer.outboundByHost = { "storage.internal": (req: Request, env: Env) => handleStorage(req, env) };
+// The cast is the ONE place the container-only invariant is asserted: this
+// handler is reachable solely from a running AppContainer, which exists only
+// on the container-shaped variants, which are exactly the ones that bind
+// DB/FILES (optional on Env because the function-shaped variants don't).
+AppContainer.outboundByHost = {
+  "storage.internal": (req: Request, env: Env) => handleStorage(req, env as StorageEnv),
+};
 
 type Deps = {
   jwks: (env: Env) => ReturnType<typeof createRemoteJWKSet>;
@@ -59,7 +72,10 @@ export const realDeps: Deps = {
     if (!j) { j = createRemoteJWKSet(new URL(url)); jwksCache.set(url, j); }
     return j;
   },
-  forwardToContainer: (env, req) => getContainer(env.APP).fetch(req),
+  // env.APP exists only on container-shaped deploys; the `!` is safe because
+  // makeApp reaches this branch only when APP_WORKER is absent, and the two
+  // are bound by mutually exclusive wrangler variants.
+  forwardToContainer: (env, req) => getContainer(env.APP!).fetch(req),
   // env.APP_WORKER exists only on function-shaped deploys, where makeApp dispatches
   // here; the `!` is safe because the container branch is chosen whenever it's absent.
   forwardToWorker: (env, req) => env.APP_WORKER!.fetch(req),
@@ -98,7 +114,15 @@ export function makeApp(deps: Deps = realDeps) {
       // with no user identity is good for GET /healthz and nothing else.
       if (auth.service && !(c.req.method === "GET" && path === "/healthz")) {
         console.warn(`gateway: 403 service credential outside /healthz (${c.req.method} ${path})`);
-        return c.text("forbidden", 403);
+        // 403, not the Access path's 401, and deliberately so: the token is
+        // VALID, it just isn't authorized for this request, which RFC 6750
+        // §3.1 calls insufficient_scope. A 401 would tell the client to
+        // re-authenticate, and a service credential re-authenticating gets
+        // the same credential back — an infinite loop. The challenge header
+        // is what RFC 6750 §3 says a 403 SHOULD carry.
+        return c.text("forbidden", 403, {
+          "www-authenticate": 'Bearer error="insufficient_scope", error_description="service credential is accepted only for GET /healthz"',
+        });
       }
       identity = auth.identity;
     } else if (env.ENVIRONMENT === "dev") {
