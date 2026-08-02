@@ -20,25 +20,29 @@ export { ContainerProxy } from "@cloudflare/containers";
 // application name as `<worker>-appcontainer` from `class AppContainer`.
 // Renaming this class silently orphans the billed container on teardown; keep
 // the two in sync (see the reciprocal note in src/naming.ts).
+// Scale-to-zero timeout resolution. The platform injects SLEEP_AFTER at
+// deploy time (`wrangler deploy --var SLEEP_AFTER:...` in platform-ci,
+// sourced from the config store's container.sleep_after — app-overridable);
+// the grammar guard mirrors the platform's server-side validation so a
+// malformed var can never wedge container startup. Exported as a function so
+// the guard is EXECUTABLE in tests — workerd's native DurableObject base
+// rejects stub state objects, so the constructor path itself can't be.
+export function resolveSleepAfter(v: string | undefined, fallback = "10m"): string {
+  if (v && /^[0-9]{1,4}(s|m|h)$/.test(v)) return v;
+  // Say so rather than silently keeping the default: an owner who sets
+  // container.sleep_after to something this grammar rejects otherwise sees
+  // the config store accept the value while the container keeps sleeping at
+  // 10m, with no surface anywhere explaining the discrepancy.
+  if (v) console.warn(`gateway: ignoring malformed SLEEP_AFTER ${JSON.stringify(v)} — keeping ${fallback}`);
+  return fallback;
+}
+
 export class AppContainer extends Container<Env> {
   defaultPort = 8080;
-  // Scale-to-zero timeout. The platform injects SLEEP_AFTER at deploy time
-  // (`wrangler deploy --var SLEEP_AFTER:...` in platform-ci, sourced from the
-  // config store's container.sleep_after — app-overridable); the grammar guard
-  // mirrors the platform's server-side validation so a malformed var can never
-  // wedge container startup.
   sleepAfter = "10m";
   constructor(...args: ConstructorParameters<typeof Container<Env>>) {
     super(...args);
-    const env = args[1] as Env;
-    if (env.SLEEP_AFTER && /^[0-9]{1,4}(s|m|h)$/.test(env.SLEEP_AFTER)) this.sleepAfter = env.SLEEP_AFTER;
-    // Say so rather than silently keeping the default: an owner who sets
-    // container.sleep_after to something this grammar rejects otherwise sees
-    // the config store accept the value while the container keeps sleeping at
-    // 10m, with no surface anywhere explaining the discrepancy.
-    else if (env.SLEEP_AFTER) {
-      console.warn(`gateway: ignoring malformed SLEEP_AFTER ${JSON.stringify(env.SLEEP_AFTER)} — keeping ${this.sleepAfter}`);
-    }
+    this.sleepAfter = resolveSleepAfter((args[1] as Env).SLEEP_AFTER, this.sleepAfter);
   }
 }
 // Register the storage.internal outbound handler by ASSIGNING after the class
