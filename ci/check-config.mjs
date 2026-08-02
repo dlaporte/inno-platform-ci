@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { isMainModule } from "./cli.mjs";
 
 // Headers every app's CLAUDE.md must carry, regardless of deployment type.
-export const REQUIRED_CLAUDE_MD_HEADERS = [
+const REQUIRED_CLAUDE_MD_HEADERS = [
   "## Innovation Platform App",
   "## Identity (do not build auth)",
   "## What CI enforces",
@@ -33,7 +33,7 @@ export const REQUIRED_CLAUDE_MD_HEADERS = [
 // contract" is the legacy heading of "## Function contract" (the 'worker'
 // preset was renamed 'function' 2026-07-30): scaffolds emit the new heading,
 // but existing app repos keep their CLAUDE.md forever, so both satisfy.
-export const CLAUDE_MD_HEADER_VARIANTS = [
+const CLAUDE_MD_HEADER_VARIANTS = [
   ["## Persistence (use the storage client)", "## Persistence (use your bindings)"],
   ["## Container contract", "## Function contract", "## Worker contract"],
 ];

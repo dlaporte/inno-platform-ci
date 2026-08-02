@@ -1,4 +1,3 @@
-import type { Env } from "./env";
 
 // PLATFORM added for Connections v1's /_connections/{name} proxy below. It is
 // optional on Env (present only on the two oauth-rs wrangler variants — see
@@ -100,18 +99,25 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
     if (path === "/_storage/files" && m === "GET") {
       // R2 caps list() at 1000 keys and sets `truncated` with a cursor — a
       // single call silently returns a PARTIAL listing that an app author
-      // reads as "these are all my files". Page to exhaustion, with a hard
-      // stop far above any realistic per-app bucket so a truncated-but-
-      // cursorless response can never spin forever.
+      // reads as "these are all my files". Page with a bound sized like the
+      // platform's own R2 sweeps (support-bundle/exports run 10 pages), each
+      // list() being one subrequest against the container-outbound invocation
+      // budget — 10 × 1000 keys covers any sane app bucket. If the cap is
+      // ever hit, the response SAYS so (`truncated: true`) rather than
+      // passing a partial listing off as complete; an app needing more than
+      // 10k keys listed should track its keys in D1, not walk the bucket.
+      const MAX_LIST_PAGES = 10;
       const keys: string[] = [];
       let cursor: string | undefined;
-      for (let page = 0; page < 1000; page++) {
-        const list = await env.FILES.list(cursor ? { cursor } : undefined);
+      let truncated = false;
+      for (let page = 0; page < MAX_LIST_PAGES; page++) {
+        const list = await env.FILES.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
         for (const o of list.objects) keys.push(o.key);
         cursor = list.truncated ? list.cursor : undefined;
         if (!cursor) break;
+        if (page === MAX_LIST_PAGES - 1) truncated = true;
       }
-      return json({ keys });
+      return json(truncated ? { keys, truncated } : { keys });
     }
     const fileMatch = path.match(/^\/_storage\/files\/(.+)$/);
     if (fileMatch) {

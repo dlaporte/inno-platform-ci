@@ -105,7 +105,7 @@ async function npmPublishedAt(fetchImpl, name, version) {
   return Number.isNaN(t) ? null : t;
 }
 
-export async function resolvePublishTimes(entries, fetchImpl) {
+async function resolvePublishTimes(entries, fetchImpl) {
   const resolved = [];
   const skipped = [];
   // One lookup per DISTINCT ecosystem:name@version. A lockfile lists an entry
@@ -142,15 +142,19 @@ export async function checkDepAge({ appDir, thresholdDays, fetchImpl = fetch, no
   if (reqs) entries.push(...parseRequirements(reqs));
 
   const lock = read(join(appDir, "package-lock.json"));
+  let lockUsable = false;
   if (lock) {
-    try { entries.push(...parseNpmLock(JSON.parse(lock))); } catch { /* malformed lock: nothing to date */ }
+    try { entries.push(...parseNpmLock(JSON.parse(lock))); lockUsable = true; } catch { /* malformed: handled below */ }
   }
 
-  // package.json with NO committed lockfile: there are no exact pins to date,
-  // and the deploy job resolves the ranges fresh (`npm ci || npm install`), so
-  // the versions that actually ship were never seen by this gate. Reported so
-  // the CLI can say that plainly instead of printing a clean-pass line.
-  const unpinnedNpm = !lock && !!read(join(appDir, "package.json"));
+  // package.json with NO usable lockfile — absent OR malformed, the
+  // operator's own state either way: there are no exact pins to date, and the
+  // deploy job resolves the ranges fresh (`npm ci || npm install`), so the
+  // versions that actually ship were never seen by this gate. Reported so the
+  // CLI fails an ENABLED cooldown plainly instead of printing a clean-pass
+  // line over nothing. (Registry-unreachable entries stay warn-only by
+  // design — a transient registry outage must not block a release.)
+  const unpinnedNpm = !lockUsable && !!read(join(appDir, "package.json"));
 
   if (entries.length === 0) return { violations: [], checked: 0, skipped: [], unpinnedNpm };
 
@@ -187,24 +191,26 @@ export async function main({ appDir, thresholdDays } = {}) {
   // by the app contract.
   if (unpinnedNpm) {
     console.error(
-      "::error title=Dependency cooldown cannot be applied::app/package.json has no committed " +
-      "app/package-lock.json, so there are no exact versions to date — and the deploy job resolves " +
-      `these ranges fresh. This app cannot satisfy the ${thresholdDays}-day cooldown its ` +
+      "::error title=Dependency cooldown cannot be applied::app/package.json has no committed, " +
+      "parseable app/package-lock.json, so there are no exact npm versions to date — and the deploy " +
+      `job resolves these ranges fresh. This app cannot satisfy the ${thresholdDays}-day cooldown its ` +
       "safety.min_release_age_days setting requires. Commit app/package-lock.json, or ask a platform " +
       "admin to set safety.min_release_age_days to 0 for this app.",
     );
-    return 1;
   }
-  if (violations.length === 0) {
-    console.log(`dep-age: ${checked} pinned dependency version(s) checked; all at least ${thresholdDays} day(s) old.`);
-    return 0;
+  // Violations print even when unpinnedNpm already failed the run: a Python
+  // app with cooldown violations AND an unpinned package.json should learn
+  // about both now, not discover the second failure after fixing the first.
+  if (violations.length > 0) {
+    console.error(`dep-age: ${violations.length} dependency version(s) younger than the ${thresholdDays}-day cooldown:`);
+    for (const v of violations) {
+      console.error(`  - ${v.ecosystem}:${v.name}@${v.version} published ${v.ageDays} day(s) ago`);
+    }
+    console.error("Pin an older, vetted version, or ask a platform admin to lower safety.min_release_age_days for this app.");
   }
-  console.error(`dep-age: ${violations.length} dependency version(s) younger than the ${thresholdDays}-day cooldown:`);
-  for (const v of violations) {
-    console.error(`  - ${v.ecosystem}:${v.name}@${v.version} published ${v.ageDays} day(s) ago`);
-  }
-  console.error("Pin an older, vetted version, or ask a platform admin to lower safety.min_release_age_days for this app.");
-  return 1;
+  if (unpinnedNpm || violations.length > 0) return 1;
+  console.log(`dep-age: ${checked} pinned dependency version(s) checked; all at least ${thresholdDays} day(s) old.`);
+  return 0;
 }
 
 if (isMainModule(import.meta.url)) {

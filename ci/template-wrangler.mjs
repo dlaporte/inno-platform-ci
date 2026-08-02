@@ -94,7 +94,7 @@ export function parseLinkedDatabases(raw) {
  * single-line literal containing no `]`, which is what makes this safe; the
  * exactly-one assertion below fails loud if that ever stops being true.
  */
-export function appendLinkedDatabases(text, links, label) {
+function appendLinkedDatabases(text, links, label) {
   if (links.length === 0) return text;
   const arrayRe = /("d1_databases"\s*:\s*\[)([^\]]*)(\])/g;
   const count = countMatches(text, arrayRe);

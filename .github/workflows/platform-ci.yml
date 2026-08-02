@@ -622,8 +622,11 @@ jobs:
     # last while the registry records the newer deployment as live.
     # Keyed on repository, NOT github.ref — inside a reusable workflow that ref
     # is the CALLER's, so a ref-keyed group would put two tags in two groups
-    # and serialize nothing. Queued, never cancelled: a half-finished deploy is
-    # worse than a slow one.
+    # and serialize nothing. cancel-in-progress:false protects the RUNNING
+    # deploy; GitHub still replaces a merely-PENDING run in the group when a
+    # newer one queues, so of three rapid tags the middle one is skipped and
+    # newest-wins — acceptable, since the newest tag is the one that should
+    # end up live.
     concurrency:
       group: inno-deploy-${{ github.repository }}
       cancel-in-progress: false
