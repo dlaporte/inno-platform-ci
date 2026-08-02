@@ -682,7 +682,7 @@ jobs:
           PERIMETER: ${{ needs.policy.outputs.perimeter }}
         run: |
           [ -f gateway-src/gateway/package.json ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the build-input move (no gateway/package.json at that ref) — promote a current inno-platform-ci mirror SHA with the sync_gateway_ref MCP tool"; exit 1; }
-          [ -f gateway-src/gateway/wrangler.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the wrangler.jsonc move — promote a current platform SHA"; exit 1; }
+          [ -f gateway-src/gateway/wrangler.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the wrangler.jsonc move — promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
           rm -rf src/gateway
           mkdir -p src/gateway
           # The gateway SOURCE is identical for ALL types (src/gateway/index.ts
@@ -697,13 +697,13 @@ jobs:
             # OAuth-terminating one for the oauth-rs perimeter. app/index.ts
             # (the app author's fetch handler) and app/package.json (its deps,
             # if any) come from the app repo.
-            [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type — promote a current platform SHA"; exit 1; }
+            [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type — promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
             cp gateway-src/gateway/app-worker.jsonc app-worker.jsonc
             if [ "$PERIMETER" = "oauth-rs" ]; then
-              [ -f gateway-src/gateway/wrangler.mcp.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp deployment type — promote a current platform SHA"; exit 1; }
+              [ -f gateway-src/gateway/wrangler.mcp.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp deployment type — promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
               cp gateway-src/gateway/wrangler.mcp.jsonc wrangler.jsonc
             else
-              [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type — promote a current platform SHA"; exit 1; }
+              [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type — promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
               cp gateway-src/gateway/wrangler.worker.jsonc wrangler.jsonc
             fi
           else
@@ -711,7 +711,7 @@ jobs:
             # oauth-rs variant is the container-fronting gateway keyed by the app's
             # resource identifier instead of an Access AUD.
             if [ "$PERIMETER" = "oauth-rs" ]; then
-              [ -f gateway-src/gateway/wrangler.mcp-container.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp-container preset — promote a current platform SHA"; exit 1; }
+              [ -f gateway-src/gateway/wrangler.mcp-container.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp-container preset — promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
               cp gateway-src/gateway/wrangler.mcp-container.jsonc wrangler.jsonc
             else
               cp gateway-src/gateway/wrangler.jsonc .
