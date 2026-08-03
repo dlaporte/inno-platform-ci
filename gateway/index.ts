@@ -108,8 +108,28 @@ function readCookie(req: Request, name: string): string | undefined {
   return raw.split(";").map((s) => s.trim()).find((c) => c.startsWith(`${name}=`))?.slice(name.length + 1);
 }
 
+// HSTS for app hostnames lives HERE, not at an edge setting: APP-SECURITY
+// tells authors transport headers are handled in front of the app, and the
+// panel's public/_headers covers only the platform's own hostname. A proxied
+// fetch() Response carries immutable headers, so the header is added on a
+// rebuilt Response — except upgrade responses (101/WebSocket), which a
+// rebuild would strip the socket from.
+const HSTS_VALUE = "max-age=31536000";
+export function withHsts(res: Response): Response {
+  if (res.status === 101 || (res as { webSocket?: unknown }).webSocket) return res;
+  const out = new Response(res.body, res);
+  out.headers.set("Strict-Transport-Security", HSTS_VALUE);
+  return out;
+}
+
 export function makeApp(deps: Deps = realDeps) {
   const app = new Hono<{ Bindings: Env }>();
+  // Every response served on the app hostname carries HSTS — the proxied app
+  // response and the gateway's own refusals (401/403/metadata) alike.
+  app.use("*", async (c, next) => {
+    await next();
+    c.res = withHsts(c.res);
+  });
   app.all("*", async (c) => {
     const env = c.env;
     let identity: AccessIdentity;
