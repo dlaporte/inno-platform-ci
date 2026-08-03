@@ -37,12 +37,30 @@ export function resolveSleepAfter(v: string | undefined, fallback = "10m"): stri
   return fallback;
 }
 
+// Variables delivery: the platform pushes per-app env vars onto THIS gateway
+// script as APPVAR_-prefixed Worker secrets (src/variables/sync.ts holds the
+// twin constant — gateway/ builds separately and cannot import it;
+// constant-parity pins the two). Unpack them into the container's env at
+// instance start, stripped of the prefix, so app code reads the literal
+// name. Secrets surface on `env` as plain strings exactly like vars; the
+// typeof filter keeps bindings (DB/FILES/...) out. Pure function for the
+// same workerd reason as resolveSleepAfter above.
+const APPVAR_PREFIX = "APPVAR_";
+export function collectAppVars(env: Env): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (k.startsWith(APPVAR_PREFIX) && typeof v === "string") out[k.slice(APPVAR_PREFIX.length)] = v;
+  }
+  return out;
+}
+
 export class AppContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "10m";
   constructor(...args: ConstructorParameters<typeof Container<Env>>) {
     super(...args);
     this.sleepAfter = resolveSleepAfter((args[1] as Env).SLEEP_AFTER, this.sleepAfter);
+    this.envVars = collectAppVars(args[1] as Env);
   }
 }
 // Register the storage.internal outbound handler by ASSIGNING after the class
