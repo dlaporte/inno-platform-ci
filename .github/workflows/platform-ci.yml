@@ -304,6 +304,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.enabled == 'true'
 
+      - name: Checkout inno-platform (ci/ scripts)
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform-ci
+          ref: ${{ env.PLATFORM_REF }}
+          path: inno-platform-ci
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.gate.outputs.enabled == 'true'
         with:
@@ -341,10 +349,13 @@ jobs:
       # this their dependencies would ship un-audited — the parity gap vs the
       # container path (pip-audit + Trivy). Audits the lockfile without installing;
       # generates a throwaway lock if the app didn't commit one so the gate still
-      # runs. (npm audit has no per-advisory ignore flag; safety.ignore.deps.*
-      # applies to pip-audit only.)
+      # runs. Runs with --json through deps-normalize.mjs gate so
+      # safety.ignore.deps.* applies to npm exactly as it does to pip-audit —
+      # keeping the gate and the deps sweep lane on one ignore mechanism.
       - name: npm audit (app/package.json, if present)
         if: steps.gate.outputs.enabled == 'true'
+        env:
+          IGNORES: ${{ needs.policy.outputs.ignores_deps }}
         run: |
           if [ -f app/package.json ]; then
             cd app
@@ -357,7 +368,9 @@ jobs:
                 exit 1
               }
             fi
-            npm audit --package-lock-only --omit=dev --audit-level=high
+            # npm exits 1 on findings; the filter script is the gate's verdict.
+            npm audit --package-lock-only --omit=dev --audit-level=high --json > audit.json || true
+            node ../inno-platform-ci/ci/deps-normalize.mjs gate audit.json
           else
             echo "no app/package.json — skipping app npm audit"
           fi
