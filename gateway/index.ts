@@ -8,6 +8,7 @@ import { handleStorage, type StorageEnv } from "./storage";
 import {
   authenticateMcp, bearerToken, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
 } from "./mcp-auth";
+import { mcpWorkRequest, shouldTouch, markTouched, sendTouch } from "./activity";
 
 // The @cloudflare/containers runtime routes container calls through an internal
 // `ContainerProxy` Durable Object that it looks up via `ctx.exports.ContainerProxy`.
@@ -122,6 +123,13 @@ export function withHsts(res: Response): Response {
   return out;
 }
 
+// Queue a fire-and-forget activity touch. waitUntil when available; the
+// detached promise still runs (and sendTouch never rejects) when not.
+function queueTouch(c: { executionCtx: { waitUntil(p: Promise<unknown>): void } }, platform: Fetcher, payload: Record<string, string>): void {
+  const send = sendTouch(platform, payload);
+  try { c.executionCtx.waitUntil(send); } catch { /* no ExecutionContext (tests) */ }
+}
+
 export function makeApp(deps: Deps = realDeps) {
   const app = new Hono<{ Bindings: Env }>();
   // Every response served on the app hostname carries HSTS — the proxied app
@@ -167,6 +175,21 @@ export function makeApp(deps: Deps = realDeps) {
         });
       }
       identity = auth.identity;
+      // Human-activity touch (spec 2026-08-18): a work request from a real
+      // user advances the idle clock. Debounce-gated BEFORE the body peek so
+      // the clone/parse cost is paid at most once per window; protocol
+      // chatter, probes, and tokenless noise never qualify.
+      if (env.PLATFORM && identity.callerAssertion && c.req.method === "POST" && path === "/mcp") {
+        // The Host header is not guaranteed present on every Request object
+        // (notably absent on synthetic requests built with `new Request()`,
+        // as opposed to ones that arrived over real HTTP) — the URL's own
+        // hostname is always populated and always matches what routed here.
+        const host = new URL(c.req.url).hostname;
+        if (shouldTouch(host, Date.now()) && (await mcpWorkRequest(c.req.raw))) {
+          markTouched(host, Date.now());
+          queueTouch(c, env.PLATFORM, { assertion: identity.callerAssertion });
+        }
+      }
     } else if (env.ENVIRONMENT === "dev") {
       identity = {
         email: c.req.header("X-Mock-User") ?? "dev@davidlaporte.org",
@@ -198,6 +221,19 @@ export function makeApp(deps: Deps = realDeps) {
       } catch (e) {
         console.warn(`gateway: 401 ${String(e).slice(0, 120)} (${c.req.method} ${path})`);
         return c.text("unauthorized", 401);
+      }
+      // Human-activity touch (spec 2026-08-18): any Access-verified request
+      // with a real user identity is human use — the service token's empty
+      // email excludes probes by construction. The platform re-verifies the
+      // forwarded JWT against this app's stored AUD before stamping.
+      if (env.PLATFORM && identity.email) {
+        // See the MCP branch's comment above: derived from the URL, not the
+        // Host header, so it is populated on every request shape.
+        const host = new URL(c.req.url).hostname;
+        if (shouldTouch(host, Date.now())) {
+          markTouched(host, Date.now());
+          queueTouch(c, env.PLATFORM, { host, jwt: token });
+        }
       }
     }
     // NOTE: this handler proxies ALL paths (including /_storage/*) to the

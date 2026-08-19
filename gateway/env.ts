@@ -38,9 +38,10 @@ export type Env = {
   // than the retired type vocabulary, so it is exempt from the Phase B rename
   // (spec Decision 4 keep-list).
   MCP_AUTH_SERVER?: string;
-  // Service binding to the platform Worker, used for token introspection. The
-  // binding is ROUTING, not authentication — /app-introspect is publicly
-  // reachable and safe by construction (it has no authority and returns only
-  // what is already inside the presented token); see src/routes/mcp-introspect.ts.
+  // Service binding to the platform Worker. On oauth-rs variants it carries
+  // token introspection; on ALL variants (as of spec 2026-08-18) it carries
+  // the human-activity touch. The binding is ROUTING, not authentication —
+  // both platform routes are publicly reachable and authenticate by payload;
+  // see src/routes/mcp-introspect.ts and src/routes/activity.ts.
   PLATFORM?: Fetcher;
 };

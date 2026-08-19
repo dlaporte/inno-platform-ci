@@ -13,7 +13,11 @@
   // The app's own Worker. It has workers_dev:false and NO route, so it is
   // reachable ONLY through this binding — the gateway (which verifies Access and
   // injects identity FIRST) stays the sole entrypoint and identity boundary.
-  "services": [{ "binding": "APP_WORKER", "service": "inno-app-replace-app" }],
+  "services": [
+    { "binding": "APP_WORKER", "service": "inno-app-replace-app" },
+    // The human-activity touch channel (spec 2026-08-18) — see wrangler.jsonc.
+    { "binding": "PLATFORM", "service": "inno-platform" }
+  ],
   // ACCESS_TEAM_DOMAIN is a STATIC deployment constant (see wrangler.jsonc);
   // ACCESS_AUD is templated per app. No D1/R2 here — storage belongs to the app
   // Worker, which holds its own scoped bindings.

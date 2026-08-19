@@ -11,6 +11,10 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppContainer"] }],
   "d1_databases": [{ "binding": "DB", "database_name": "inno-replace-db", "database_id": "REPLACE" }],
   "r2_buckets": [{ "binding": "FILES", "bucket_name": "inno-replace-data" }],
+  // Service binding to the platform Worker — the human-activity touch channel
+  // (spec 2026-08-18). Routing, not authentication: the touch authenticates
+  // by payload (the forwarded Access JWT), like every platform seam.
+  "services": [{ "binding": "PLATFORM", "service": "inno-platform" }],
   // ACCESS_TEAM_DOMAIN is a STATIC deployment constant, not templated per app:
   // the gateway verifies every Access JWT's issuer against it. When adapting
   // this platform to your own accounts, set it to your <team>.cloudflareaccess.com
