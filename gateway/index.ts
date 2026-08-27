@@ -9,6 +9,7 @@ import {
   authenticateMcp, bearerToken, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
 } from "./mcp-auth";
 import { mcpWorkRequest, shouldTouch, markTouched, sendTouch } from "./activity";
+import { writeRed, pathClass, classifyStatus, appFromHostname, userBucket } from "./red";
 
 // The @cloudflare/containers runtime routes container calls through an internal
 // `ContainerProxy` Durable Object that it looks up via `ctx.exports.ContainerProxy`.
@@ -130,13 +131,46 @@ function queueTouch(c: { executionCtx: { waitUntil(p: Promise<unknown>): void } 
   try { c.executionCtx.waitUntil(send); } catch { /* no ExecutionContext (tests) */ }
 }
 
+// The caller bucket recorded for a request that never got as far as an
+// identity: the gateway's own 401/403 refusals. Those requests MUST still be
+// counted — a fleet-wide auth breakage (a stale ACCESS_AUD, an expired
+// service token) is exactly the kind of outage that shows up as "every
+// request 4xx" and nowhere else.
+const ANON_BUCKET = "anon";
+
 export function makeApp(deps: Deps = realDeps) {
-  const app = new Hono<{ Bindings: Env }>();
+  const app = new Hono<{ Bindings: Env; Variables: { redUser?: string; redStatus?: "err" } }>();
   // Every response served on the app hostname carries HSTS — the proxied app
   // response and the gateway's own refusals (401/403/metadata) alike.
   app.use("*", async (c, next) => {
     await next();
     c.res = withHsts(c.res);
+  });
+  // RED signal (Phase 2). Wraps the whole handler so the gateway's own
+  // refusals are measured alongside proxied app responses — a fleet-wide auth
+  // breakage is "every request 4xx" and shows up nowhere else. Observation
+  // only: nothing here changes a status, a body, or an error.
+  //
+  // `err` (the app was unreachable) cannot be read off the response, because
+  // Hono catches a handler throw and turns it into a 500 BEFORE next()
+  // returns — indistinguishable from an app that genuinely answered 500. So
+  // the forward marks the class in `redStatus` and this reads the override.
+  app.use("*", async (c, next) => {
+    const started = Date.now();
+    const app_ = appFromHostname(new URL(c.req.url).hostname);
+    const path = pathClass(c.req.path);
+    const record = (status: Parameters<typeof writeRed>[1]["status"]) => writeRed(c.env, {
+      app: app_, path, status,
+      user: c.get("redUser") ?? ANON_BUCKET,
+      latencyMs: Date.now() - started,
+    });
+    try {
+      await next();
+    } catch (e) {
+      record("err");
+      throw e;
+    }
+    record(c.get("redStatus") ?? classifyStatus(c.res.status));
   });
   app.all("*", async (c) => {
     const env = c.env;
@@ -242,14 +276,28 @@ export function makeApp(deps: Deps = realDeps) {
     // handler above, reachable solely by the app's own container in-runtime.
     // Do not add a /_storage route here: that would let the public internet
     // reach handleStorage's arbitrary SQL/R2 access directly.
+    // RED's caller bucket, now that there IS a verified identity. Set before
+    // the forward so the surrounding middleware reads it whichever way the
+    // request ends (proxied response, or a throw from the app).
+    c.set("redUser", await userBucket(appFromHostname(new URL(c.req.url).hostname), identity.email || "service"));
+
     const proxied = sanitizeAndInject(c.req.raw, identity, { mcpMode: env.OAUTH_RS_MODE === "true" });
     // Deployment-type dispatch: function-shaped apps carry an APP_WORKER service
     // binding and forward to the app's own Worker; container-type apps (no such
     // binding) forward to the container. Either way the gateway did the Access
     // verification and identity injection FIRST, so the target only ever sees a
     // sanitized, authenticated request with spoof-proof X-Forwarded-* headers.
-    if (env.APP_WORKER) return deps.forwardToWorker(env, proxied);
-    return deps.forwardToContainer(env, proxied);
+    // AWAITED inside the try (not returned as a promise) so a forward that
+    // rejects is caught HERE and can be recorded as RED's `err` class — the
+    // "app unreachable" signal a 5xx-only classifier misses. The error is
+    // re-thrown unchanged; the caller sees exactly what it saw before.
+    try {
+      if (env.APP_WORKER) return await deps.forwardToWorker(env, proxied);
+      return await deps.forwardToContainer(env, proxied);
+    } catch (e) {
+      c.set("redStatus", "err");
+      throw e;
+    }
   });
   return app;
 }

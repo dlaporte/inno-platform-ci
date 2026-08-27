@@ -38,6 +38,12 @@ export type Env = {
   // than the retired type vocabulary, so it is exempt from the Phase B rename
   // (spec Decision 4 keep-list).
   MCP_AUTH_SERVER?: string;
+  // RED signal (NoOp Phase 2, gateway/red.ts). Bound on all four gateway
+  // variants, and OPTIONAL for a reason that is load-bearing rather than
+  // stylistic: an app whose gateway build predates the binding writes nothing
+  // and reads `unknown` (never zero) until its next deploy. The absence IS the
+  // rollout gate, so nothing here may assume the binding exists.
+  RED?: AnalyticsEngineDataset;
   // Service binding to the platform Worker. On oauth-rs variants it carries
   // token introspection; on ALL variants (as of spec 2026-08-18) it carries
   // the human-activity touch. The binding is ROUTING, not authentication —

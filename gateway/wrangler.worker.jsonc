@@ -10,6 +10,12 @@
   "main": "src/gateway/index.ts",
   "compatibility_date": "2026-03-10",
   "observability": { "enabled": true },
+  // RED signal (NoOp Phase 2): one data point per request, written by
+  // gateway/red.ts. ONE dataset platform-wide; constant-parity pins the name
+  // across all four gateway variants. The dataset name is a static
+  // constant, carrying no per-app template marker, so
+  // ci/template-wrangler.mjs's exact marker counts are unchanged.
+  "analytics_engine_datasets": [{ "binding": "RED", "dataset": "inno_app_red" }],
   // The app's own Worker. It has workers_dev:false and NO route, so it is
   // reachable ONLY through this binding — the gateway (which verifies Access and
   // injects identity FIRST) stays the sole entrypoint and identity boundary.
