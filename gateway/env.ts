@@ -43,8 +43,9 @@ export type Env = {
   // caller_assertion — the credential that opens /_connections/fetch. Pushed as
   // a Worker secret by the platform at deploy time, never templated into the
   // config (the app's CI can read its own config, and must not read this).
-  // Absent on pre-cutover deploys, which the platform tolerates (the gate is
-  // inert until GATEWAY_INTROSPECT_KEY is provisioned platform-side too).
+  // Absent on pre-cutover deploys, which the platform tolerates: enforcement is
+  // its own config switch (connections.gateway_key_required), flipped only once
+  // every gateway has redeployed and therefore carries this.
   GATEWAY_INTROSPECT_KEY?: string;
   // RED signal (NoOp Phase 2, gateway/red.ts). Bound on all four gateway
   // variants, and OPTIONAL for a reason that is load-bearing rather than
