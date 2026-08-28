@@ -105,6 +105,14 @@ async function npmPublishedAt(fetchImpl, name, version) {
   return Number.isNaN(t) ? null : t;
 }
 
+// Registry lookups run in bounded-concurrency chunks. Serial fetches added
+// minutes of wall clock to every deploy of exactly the apps that opted into
+// the cooldown gate (whole-repo review 2026-08-28: 800+ distinct packages at
+// one full packument each), and one slow registry entry stalled the line for
+// its whole 10s timeout. A failed/thrown lookup still resolves to null
+// (skipped, reported), exactly as the serial loop did.
+const LOOKUP_CONCURRENCY = 10;
+
 async function resolvePublishTimes(entries, fetchImpl) {
   const resolved = [];
   const skipped = [];
@@ -112,20 +120,24 @@ async function resolvePublishTimes(entries, fetchImpl) {
   // per install PATH, so a dependency hoisted into several trees would
   // otherwise be fetched once per copy — same answer every time.
   const dates = new Map();
+  const distinct = [];
   for (const e of entries) {
     const key = `${e.ecosystem}:${e.name}@${e.version}`;
-    if (!dates.has(key)) {
-      let publishedAt = null;
+    if (!dates.has(key)) { dates.set(key, null); distinct.push({ key, e }); }
+  }
+  for (let i = 0; i < distinct.length; i += LOOKUP_CONCURRENCY) {
+    await Promise.all(distinct.slice(i, i + LOOKUP_CONCURRENCY).map(async ({ key, e }) => {
       try {
-        publishedAt = e.ecosystem === "pypi"
+        dates.set(key, e.ecosystem === "pypi"
           ? await pypiPublishedAt(fetchImpl, e.name, e.version)
-          : await npmPublishedAt(fetchImpl, e.name, e.version);
+          : await npmPublishedAt(fetchImpl, e.name, e.version));
       } catch {
-        publishedAt = null;
+        dates.set(key, null);
       }
-      dates.set(key, publishedAt);
-    }
-    const publishedAt = dates.get(key);
+    }));
+  }
+  for (const e of entries) {
+    const publishedAt = dates.get(`${e.ecosystem}:${e.name}@${e.version}`);
     if (publishedAt === null) skipped.push(e);
     resolved.push({ ...e, publishedAt });
   }

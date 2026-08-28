@@ -15,6 +15,9 @@ type S = StorageEnv;
 // Same grammar the platform enforces for a connection name (src/connections/store.ts
 // CONN_NAME_RE) — restated rather than imported, same reason as APP_NAME_RE below:
 // the gateway builds separately from the platform Worker.
+// Hand-written twin of src/routes/connections.ts's CONNECTIONS_FETCH_PATH
+// (gateway/ builds separately) — pinned by test/constant-parity.node.test.ts.
+const CONNECTIONS_FETCH_PATH = "/_connections/fetch";
 const CONNECTION_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
 
 // Per-object upload cap (25 MiB). Enforced only when the client sends a
@@ -147,7 +150,7 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       if (!env.PLATFORM) return json({ error: "connections_unavailable" }, 501);
       const name = path.slice("/_connections/".length);
       if (!CONNECTION_NAME_RE.test(name)) return json({ error: "bad_connection_name" }, 400);
-      return env.PLATFORM.fetch("https://platform.internal/_connections/fetch", {
+      return env.PLATFORM.fetch(`https://platform.internal${CONNECTIONS_FETCH_PATH}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ assertion: request.headers.get("x-caller-assertion") ?? "", connection: name }),

@@ -140,11 +140,16 @@ async function cacheKeyFor(token: string, resource: string): Promise<string> {
 // non-JSON body all resolve to {active:false}, so the caller answers the
 // recoverable 401 challenge (never a 500, which an MCP client treats as fatal
 // and does not retry).
+// gateway/ builds separately from src/ and cannot import it — this is a
+// hand-written twin of src/routes/mcp-introspect.ts's APP_INTROSPECT_PATH,
+// pinned by test/constant-parity.node.test.ts (TOUCH_PATH-style).
+const APP_INTROSPECT_PATH = "/app-introspect";
+
 async function introspectViaPlatform(
   env: Env, token: string, resource: string,
 ): Promise<IntrospectionResponse> {
   try {
-    const res = await env.PLATFORM!.fetch("https://platform.internal/app-introspect", {
+    const res = await env.PLATFORM!.fetch(`https://platform.internal${APP_INTROSPECT_PATH}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token, resource }),
