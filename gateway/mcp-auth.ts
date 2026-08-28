@@ -145,13 +145,26 @@ async function cacheKeyFor(token: string, resource: string): Promise<string> {
 // pinned by test/constant-parity.node.test.ts (TOUCH_PATH-style).
 const APP_INTROSPECT_PATH = "/app-introspect";
 
+// Twin of src/routes/mcp-introspect.ts's GATEWAY_KEY_HEADER — parity-pinned by
+// test/constant-parity.node.test.ts alongside the path above.
+const GATEWAY_KEY_HEADER = "x-inno-gateway-key";
+
 async function introspectViaPlatform(
   env: Env, token: string, resource: string,
 ): Promise<IntrospectionResponse> {
   try {
     const res = await env.PLATFORM!.fetch(`https://platform.internal${APP_INTROSPECT_PATH}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        // Proof that this caller is a gateway. The platform mints a
+        // caller_assertion — a credential that opens /_connections/fetch —
+        // only for a caller holding this, because /app-introspect is publicly
+        // reachable and the service binding is routing, not authentication.
+        // Omitted entirely when unprovisioned, which the platform's own
+        // feature flag tolerates during the cutover.
+        ...(env.GATEWAY_INTROSPECT_KEY ? { [GATEWAY_KEY_HEADER]: env.GATEWAY_INTROSPECT_KEY } : {}),
+      },
       body: JSON.stringify({ token, resource }),
     });
     if (!res.ok) {

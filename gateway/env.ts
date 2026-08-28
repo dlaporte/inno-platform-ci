@@ -38,6 +38,14 @@ export type Env = {
   // than the retired type vocabulary, so it is exempt from the Phase B rename
   // (spec Decision 4 keep-list).
   MCP_AUTH_SERVER?: string;
+  // Shared secret proving to /app-introspect that this caller is a GATEWAY, not
+  // some holder of an app access token. Only a caller presenting it receives a
+  // caller_assertion — the credential that opens /_connections/fetch. Pushed as
+  // a Worker secret by the platform at deploy time, never templated into the
+  // config (the app's CI can read its own config, and must not read this).
+  // Absent on pre-cutover deploys, which the platform tolerates (the gate is
+  // inert until GATEWAY_INTROSPECT_KEY is provisioned platform-side too).
+  GATEWAY_INTROSPECT_KEY?: string;
   // RED signal (NoOp Phase 2, gateway/red.ts). Bound on all four gateway
   // variants, and OPTIONAL for a reason that is load-bearing rather than
   // stylistic: an app whose gateway build predates the binding writes nothing
