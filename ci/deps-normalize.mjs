@@ -6,7 +6,7 @@
 //     This is what lets safety.ignore.deps.* apply to npm the way it already
 //     applies to pip-audit — without it, a sweep-side ignore still bricks
 //     every future deploy.
-//   post <base> <app> <deploymentId> <auditJson> [token] — safety-sweep lane:
+//   post <base> <app> <deploymentId> <auditJson> <token> — safety-sweep lane:
 //     POST ALL normalized findings to /sweep/deps-results; the Worker is the
 //     policy brain (floor + ignores) exactly as with trivy results.
 // A top-level `error` in the audit JSON means npm audit DID NOT RUN — that is
@@ -85,10 +85,9 @@ if (isMainModule(import.meta.url)) {
         console.log(`dependency gate clean (${findings.length} total advisories below floor or ignored)`);
       }
     } else if (mode === "post") {
-      const [base, app, deploymentId, auditPath, tokenArg] = args;
-      const token = tokenArg ?? process.env.ACTIONS_ID_TOKEN;
+      const [base, app, deploymentId, auditPath, token] = args;
       if (!base || !app || !deploymentId || !auditPath || !token) {
-        throw new Error("Usage: deps-normalize.mjs post <base> <app> <deploymentId> <auditJson> [token]");
+        throw new Error("Usage: deps-normalize.mjs post <base> <app> <deploymentId> <auditJson> <token>");
       }
       const deploymentIdNum = Number(deploymentId);
       if (!Number.isInteger(deploymentIdNum)) throw new Error(`invalid deploymentId ${JSON.stringify(deploymentId)}`);

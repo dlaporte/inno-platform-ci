@@ -6,9 +6,8 @@
 // scans what actually deployed. Best-effort in CI: a failed upload warns and
 // the build proceeds (the sweep keeps using the previous deployment's SBOM).
 //
-// Usage: node ci/sbom-upload.mjs <brokerUrl> <app> <sbomPath> [token]
-// `token` (the GitHub Actions OIDC token, verified server-side) falls back to
-// $ACTIONS_ID_TOKEN if not passed as an argument.
+// Usage: node ci/sbom-upload.mjs <brokerUrl> <app> <sbomPath> <token>
+// `token` is the GitHub Actions OIDC token (verified server-side).
 
 import { readFile } from "node:fs/promises";
 import { brokerPost } from "./broker-post.mjs";
@@ -35,13 +34,9 @@ export async function uploadSbom(base, token, app, sbom, fetcher = fetch) {
 
 if (isMainModule(import.meta.url)) {
   try {
-    const [base, app, sbomPath, tokenArg] = process.argv.slice(2);
-    const token = tokenArg ?? process.env.ACTIONS_ID_TOKEN;
+    const [base, app, sbomPath, token] = process.argv.slice(2);
     if (!base || !app || !sbomPath || !token) {
-      throw new Error(
-        "Usage: node ci/sbom-upload.mjs <brokerUrl> <app> <sbomPath> [token]\n" +
-          "(token falls back to $ACTIONS_ID_TOKEN if not passed as an arg)",
-      );
+      throw new Error("Usage: node ci/sbom-upload.mjs <brokerUrl> <app> <sbomPath> <token>");
     }
     let sbom;
     try {

@@ -3,10 +3,10 @@
 // deploy` succeeds, so the broker can attach the app's DNS/domain and mark
 // the deployment (and app) as live.
 //
-// Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> [token] [gatewayRef]
-// `token` (the GitHub Actions OIDC token, verified server-side) falls back to
-// $ACTIONS_ID_TOKEN if not passed as an argument. `gatewayRef` records which
-// promoted gateway build was injected into this deploy.
+// Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef]
+// `token` is the GitHub Actions OIDC token (verified server-side).
+// `gatewayRef` records which promoted gateway build was injected into this
+// deploy.
 
 import { brokerPost } from "./broker-post.mjs";
 import { isMainModule } from "./cli.mjs";
@@ -34,13 +34,9 @@ export async function finalize(base, token, app, deploymentId, fetcher = fetch, 
 
 if (isMainModule(import.meta.url)) {
   try {
-    const [base, app, deploymentId, tokenArg, gatewayRefArg] = process.argv.slice(2);
-    const token = tokenArg ?? process.env.ACTIONS_ID_TOKEN;
+    const [base, app, deploymentId, token, gatewayRefArg] = process.argv.slice(2);
     if (!base || !app || !deploymentId || !token) {
-      throw new Error(
-        "Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> [token] [gatewayRef]\n" +
-          "(token falls back to $ACTIONS_ID_TOKEN if not passed as an arg)",
-      );
+      throw new Error("Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef]");
     }
     // `jq -r .deployment_id` on a missing field yields the literal string
     // "null", which is truthy above; Number("null") is NaN. Fail here with a
