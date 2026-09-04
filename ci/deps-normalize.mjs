@@ -25,7 +25,7 @@ const RANK = { CRITICAL: 0, HIGH: 1, MODERATE: 2, LOW: 3, INFO: 4 };
  * top-level `error` (npm audit did not run — never "clean").
  *
  * @param {any} audit - parsed `npm audit --json` output
- * @returns {Array<{id: string, pkg?: string, fixed?: string, severity: string, title?: string}>}
+ * @returns {Array<{id: string, pkg?: string, fixed?: string, fix_available: boolean, severity: string, title?: string, class: string, type: string}>}
  */
 export function normalize(audit) {
   if (audit && typeof audit === "object" && audit.error) {
@@ -44,8 +44,17 @@ export function normalize(audit) {
         id,
         pkg: typeof via.name === "string" ? via.name : undefined,
         fixed: fix && typeof fix === "object" ? `${fix.name}@${fix.version}` : undefined,
+        // npm's fixAvailable is `true`, `false`, or an object (fix pinned to
+        // a specific top-level version) — collapse to a plain boolean. A
+        // MISSING key (fix === undefined) reads as fixable too, matching
+        // remediationClass's absent-means-fixable policy (src/advisory.ts).
+        fix_available: fix !== false,
         severity: String(via.severity ?? v.severity ?? "").toUpperCase(),
         title: typeof via.title === "string" ? via.title.slice(0, 120) : undefined,
+        // Lane marker for remediation advice (src/advisory.ts): everything
+        // npm audit reports is an app dependency.
+        class: "lang-pkgs",
+        type: "npm",
       });
     }
   }
