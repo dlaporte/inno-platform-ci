@@ -3,7 +3,10 @@
 // posture the platform requires — required CLAUDE.md guidance present, and no
 // platform-owned build input vendored into the app repo (gateway source,
 // worker build inputs, and ANY wrangler config; the platform injects all of
-// them at build time from the promoted gateway.ref). See checkConfig's own
+// them at build time from the promoted gateway.ref), nothing of the author's
+// under src/ (the gateway is bundled from there), and no package-manager
+// configuration at any depth (npm expands ${VAR} from the environment into
+// it). See checkConfig's own
 // note on the numbering: checks 2-6 (which inspected an app-owned
 // wrangler.jsonc for auth mode and container image/limits) were retired when
 // that file stopped being app-owned.
@@ -123,6 +126,38 @@ const PINNED_BUILD_INPUT_FILES = ["package.json", "package-lock.json", "tsconfig
 // reached via the env-variant arm which requires a `.<env>.` in between).
 const COMPETING_WRANGLER_RE = /^wrangler\.(json|toml|.+\.(json|jsonc|toml))$/;
 
+// Every package manager's project-level configuration, rejected at the repo
+// ROOT: wrangler and the platform's own `npm ci` run there, the build inputs
+// are pinned there, and a .pnpmfile.cjs is arbitrary JavaScript an install
+// would execute. At depth only .npmrc matters (check 6b): npm is the one
+// package manager the deploy job runs inside the author-owned app/.
+const ROOT_PACKAGE_MANAGER_CONFIG_RE = /^(\.npmrc|\.yarnrc|\.yarnrc\.yml|\.pnpmfile\.cjs|pnpm-workspace\.yaml|bunfig\.toml)$/;
+
+// Depth-first listing of everything below `root` as repo-relative POSIX paths.
+// lstat semantics throughout: symlinks are reported as themselves and never
+// followed, so a link to a directory outside the repo cannot make the walk
+// leave it. Skips .git; reports but does not enter node_modules. A directory
+// that cannot be read is NOT the same as an empty one: ENOENT (the path
+// vanished between being listed and being read, a genuine race) is the only
+// error swallowed — anything else (EACCES, EIO, ...) is rethrown, so the gate
+// crashes red rather than silently passing a subtree it could not inspect.
+function* walkTree(root, rel = "") {
+  const abs = rel ? join(root, rel) : root;
+  let entries;
+  try {
+    entries = readdirSync(abs, { withFileTypes: true });
+  } catch (err) {
+    if (err.code === "ENOENT") return;
+    throw err;
+  }
+  for (const entry of entries) {
+    if (rel === "" && entry.name === ".git") continue;
+    const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+    yield { rel: childRel, name: entry.name };
+    if (entry.isDirectory() && !entry.isSymbolicLink() && entry.name !== "node_modules") yield* walkTree(root, childRel);
+  }
+}
+
 /**
  * Check that `appDir` (a registered app repo) complies with the platform's
  * config-integrity requirements. Everything platform-owned (gateway source,
@@ -194,11 +229,18 @@ export function checkConfig(appDir) {
             `(wrangler's config discovery could silently prefer it over the gate-vetted file)`,
         );
       }
-      // A committed .npmrc / .yarnrc(.yml) is an unpinned input to `npm ci` in
-      // the deploy job — it can redirect the registry, set install flags, or
-      // enable lifecycle behavior. The package-lock is byte-pinned and the
-      // deploy runs --ignore-scripts, so no exploit is proven, but these files
-      // have no legitimate reason to exist in an app repo: reject them.
+      // Every package manager's project-level config is rejected here at the
+      // repo root — npm, yarn classic and berry, pnpm, and bun (see
+      // ROOT_PACKAGE_MANAGER_CONFIG_RE for the exact file list). npm and
+      // yarn classic's rc files are an unpinned input to `npm ci` in the
+      // deploy job — they can redirect the registry, set install flags, or
+      // enable lifecycle behavior. npm also expands ${VAR} from the environment
+      // into rc values, so an rc file that reaches a step holding a credential
+      // exfiltrates it on the tarball fetch (reproduced 2026-09-14; the
+      // function-shaped deploy's app/ install has since moved to a token-less
+      // step). --ignore-scripts does not help. Root-level here; check 6b below
+      // covers every other directory, because npm reads the rc of the directory
+      // it RUNS in, not only the repo root.
       // wrangler loads .env/.env.* from cwd at CLI startup, and env keys the
       // deploy step doesn't set are ADOPTED — a committed .env with
       // CLOUDFLARE_API_BASE_URL (or WRANGLER_DOCKER_BIN/DOCKER_HOST) redirects
@@ -211,7 +253,7 @@ export function checkConfig(appDir) {
         );
         continue;
       }
-      if (/^\.(npmrc|yarnrc)(\.yml)?$/.test(name)) {
+      if (ROOT_PACKAGE_MANAGER_CONFIG_RE.test(name)) {
         violations.push(
           `${name} must not be committed — package manager config is an unpinned deploy-build input; remove it`,
         );
@@ -219,17 +261,114 @@ export function checkConfig(appDir) {
     }
   }
 
-  // --- Check 7: src/gateway/ must NOT exist — the platform injects the ---
-  // promoted gateway (config gateway.ref) at build time; a vendored copy
-  // would shadow it and is always stale. No legacy acceptance.
-  // lstat (not existsSync): a dangling symlink must fail closed too — same
-  // rule as check 8 below.
-  let gatewayPresent = false;
-  try { lstatSync(join(appDir, "src", "gateway")); gatewayPresent = true; } catch {}
-  if (gatewayPresent) {
+  // --- Check 6b: a nested .npmrc ANYWHERE in the tree ---
+  // Check 6 inspects the root because that is where wrangler and the root
+  // `npm ci` run. The deploy job runs exactly one package manager inside the
+  // author-owned app/ directory: npm (`npm ci` / `npm install`, in the
+  // function-shaped install step) — nothing in CI runs yarn, pnpm or bun
+  // there. npm reads the PROJECT .npmrc of the directory it is invoked in and
+  // expands ${VAR} from the environment into it, so a nested .npmrc is an
+  // unpinned, credential-exfiltrating deploy-build input the same way the
+  // root one is. Other package managers' config at depth — app/.yarnrc.yml
+  // (yarn berry's nodeLinker), app/pnpm-workspace.yaml (a pnpm workspace),
+  // app/bunfig.toml — is legitimate inside a container build and is left
+  // alone; only their ROOT copies are rejected, by check 6 above. NOT .env at
+  // depth either: wrangler reads .env from its cwd (the root, which check 6
+  // covers) and npm never reads it, so a nested .env.example is harmless and
+  // common.
+  //
+  // The walk never follows symlinks (readdir types + lstat), fails closed on
+  // type (a symlink NAMED .npmrc is rejected without resolving it), skips
+  // .git, and does not descend into node_modules — nothing under a
+  // node_modules directory is examined at all, because npm resolves its
+  // project rc from the directory it is run in, never from inside
+  // node_modules.
+  //
+  // walkTree rethrows anything but ENOENT (see its own comment), so a
+  // directory this walk cannot read must not silently pass as empty — but it
+  // also must not abort checkConfig itself before check 7 gets a chance to
+  // report its own targeted message for the same directory (e.g. an
+  // unreadable src/). Catch it here and fail closed with a violation.
+  try {
+    for (const { rel, name } of walkTree(appDir)) {
+      if (!rel.includes("/")) continue;
+      if (name === ".npmrc") {
+        violations.push(
+          `${rel} must not be committed — npm reads the .npmrc of whichever directory it runs in ` +
+            `and expands \${VAR} from the environment into it (an unpinned deploy-build input); remove it`,
+        );
+      }
+    }
+  } catch (err) {
     violations.push(
-      "delete src/gateway/ — the platform injects the gateway at build time (see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)",
+      `config-integrity check could not fully inspect the app tree (${err.path ?? appDir}: ` +
+        `${err.code ?? err}); a directory the gate cannot read fails closed`,
     );
+  }
+
+  // --- Check 7: src/ is platform-owned; nothing of the author's may exist ---
+  // under it. The platform injects the promoted gateway (config gateway.ref)
+  // into src/gateway/ at build time and bundles it FROM there, inside the app
+  // checkout. esbuild resolves bare imports by walking up from the importing
+  // file, so a committed src/node_modules/<dep> outranks the platform's pinned
+  // root copy, and src/tsconfig.json (paths) or src/package.json (browser
+  // field) redirect resolution the same way — an author could replace hono or
+  // jose inside their own app's authentication perimeter while the deployment
+  // records a legitimate gateway ref (2026-09-13 review F08, reproduced with
+  // wrangler --dry-run 2026-09-14). A vendored src/gateway/ is the same class
+  // and keeps its original message. The deploy job additionally wipes src/
+  // before injecting (belt to this suspenders).
+  //
+  // lstat (not existsSync): a symlink at src/ or src/gateway must fail closed
+  // without being followed — same rule as check 8 below. An EMPTY src/
+  // directory is tolerated (nothing to shadow with).
+  let srcStat = null;
+  try { srcStat = lstatSync(join(appDir, "src")); } catch (err) { if (err?.code !== "ENOENT") throw err; }
+  if (srcStat) {
+    let entries = [];
+    let srcUnreadable = false;
+    if (srcStat.isDirectory()) {
+      try {
+        entries = readdirSync(join(appDir, "src")).filter((n) => n !== "gateway");
+      } catch (err) {
+        // An unreadable src/ is NOT the same as an empty one: fail closed
+        // rather than silently treating "we couldn't find out" as "nothing to
+        // shadow with", and skip the entries-based violation below (it would
+        // otherwise report an empty list for a directory we never saw into).
+        srcUnreadable = true;
+        violations.push(
+          `delete src/ — the platform owns src/ and it could not be read (${err.code ?? err}); ` +
+            `a src/ the gate cannot inspect fails closed`,
+        );
+      }
+    }
+    // Only probe src/gateway once src/ is known to be a readable directory —
+    // otherwise (src is a file, or unreadable) the readdirSync above has
+    // already produced the right violation, and lstat-ing a "gateway" child
+    // of something that isn't a normal directory would throw ENOTDIR/EACCES
+    // for a fact we already have, not a new one.
+    let gatewayPresent = false;
+    if (srcStat.isDirectory() && !srcUnreadable) {
+      try {
+        lstatSync(join(appDir, "src", "gateway"));
+        gatewayPresent = true;
+      } catch (err) {
+        if (err?.code !== "ENOENT") throw err;
+      }
+    }
+    if (gatewayPresent) {
+      violations.push(
+        "delete src/gateway/ — the platform injects the gateway at build time (see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)",
+      );
+    }
+    if (!srcUnreadable && (!srcStat.isDirectory() || entries.length > 0)) {
+      const what = srcStat.isDirectory() ? entries.map((n) => `src/${n}`).join(", ") : "src is not a directory";
+      violations.push(
+        `delete src/ — the platform owns src/ (it injects the gateway there and bundles it from there; ` +
+          `anything else under src/ can shadow the gateway's dependencies or compiler configuration): ${what} ` +
+          `(see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)`,
+      );
+    }
   }
 
   // --- Check 7b: scaffold/ must NOT exist — registration prunes the ---

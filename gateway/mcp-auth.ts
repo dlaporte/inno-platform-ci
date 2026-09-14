@@ -161,8 +161,10 @@ async function introspectViaPlatform(
         // caller_assertion — a credential that opens /_connections/fetch —
         // only for a caller holding this, because /app-introspect is publicly
         // reachable and the service binding is routing, not authentication.
-        // Omitted entirely when unprovisioned, which the platform's own
-        // feature flag tolerates during the cutover.
+        // Omitted entirely when unprovisioned; the platform then withholds
+        // the caller assertion unless its admin switch is explicitly false
+        // (the cutover override), so a keyless gateway loses Connections
+        // until it is redeployed with the key.
         ...(env.GATEWAY_INTROSPECT_KEY ? { [GATEWAY_KEY_HEADER]: env.GATEWAY_INTROSPECT_KEY } : {}),
       },
       body: JSON.stringify({ token, resource }),
