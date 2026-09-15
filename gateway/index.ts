@@ -224,7 +224,7 @@ export function makeApp(deps: Deps = realDeps) {
           queueTouch(c, env.PLATFORM, { assertion: identity.callerAssertion });
         }
       }
-    } else if (env.ENVIRONMENT === "dev") {
+    } else if (env.ENVIRONMENT === "dev" && env.DEV_MOCK_IDENTITY === "enabled") {
       identity = {
         email: c.req.header("X-Mock-User") ?? "dev@davidlaporte.org",
         // Same inno- filter production applies (access.ts), so dev can't inject

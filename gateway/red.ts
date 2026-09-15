@@ -63,6 +63,12 @@ export function isError(cls: StatusClass): boolean {
 // mirror's templater would have to land in lockstep or every app's deploy
 // breaks. Restated here rather than imported from src/naming.ts for the same
 // reason APPVAR_PREFIX and APP_NAME_RE are: the gateway builds separately.
+//
+// NOT only a metrics helper: identity.ts's sanitizeAndInject also uses it to
+// pick which groups an app may see (R29). Reshaping this for RED cardinality
+// (truncating a long name, folding rare names into one bucket) would silently
+// strip a correctly routed app's groups from X-Forwarded-Groups. Any change
+// must still return the exact app name the request was routed to.
 const INNO_PREFIX = "inno-";
 export function appFromHostname(hostname: string): string {
   const label = hostname.split(".")[0] ?? "";

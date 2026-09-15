@@ -15,6 +15,17 @@ export type Env = {
   // against `undefined`.
   ACCESS_AUD?: string; ACCESS_TEAM_DOMAIN?: string;
   ENVIRONMENT: string;
+  // The dev mock-identity switch (R37): index.ts's X-Mock-User branch requires
+  // it to equal "enabled". NOTHING SUPPLIES IT TODAY, in any runtime. The
+  // gateway configs name it inside their `dev` block, but `vars` is not a field
+  // wrangler accepts there (wrangler 4.x warns "Unexpected fields found in dev
+  // field" and discards the block), so the value reaches neither `wrangler dev`
+  // nor a deploy, and the mock-identity branch is unreachable as configured.
+  // This stays declared as the belt: a gitignored `.dev.vars` file is the
+  // supported way to supply a local-only var (OPERATIONS §4.5), and even then a
+  // DEPLOY still cannot carry it, because ci/template-wrangler.mjs refuses to
+  // template any gateway config whose deployed vars name it.
+  DEV_MOCK_IDENTITY?: string;
   // Injected at deploy time by platform-ci (config store: container.sleep_after).
   SLEEP_AFTER?: string;
   // Present ONLY on function-shaped apps: a service binding to the app's own Worker

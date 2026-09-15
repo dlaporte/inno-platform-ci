@@ -17,7 +17,9 @@
 //     is a valid slug, and "inno-app-toreplace" legitimately contains
 //     "replace"). If a real marker survives, we fail loud rather than ever
 //     deploy a half-templated config.
-//   - It never touches ENVIRONMENT or any other field.
+//   - It never REWRITES ENVIRONMENT or any other field. It does ASSERT that a
+//     gateway config's deployed vars say ENVIRONMENT "production" and do not
+//     carry DEV_MOCK_IDENTITY, which is a refusal, not a substitution (R37).
 //
 // Usage: node ci/template-wrangler.mjs <app> <databaseId> <accessAud> [wranglerPath=wrangler.jsonc]
 
@@ -245,7 +247,7 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud, ima
   // URL is NOT behind Cloudflare Access — closing it makes the Access-protected
   // custom hostname the sole ingress; applied to EVERY app at deploy, including
   // apps whose committed wrangler.jsonc predates this policy.
-  return forceWorkersDevFalse(withGenerations, "wrangler.jsonc");
+  return forceProductionEnvironment(forceWorkersDevFalse(withGenerations, "wrangler.jsonc"), "wrangler.jsonc");
 }
 
 // --- Function-shape templating (migration 0022) -----------------------------
@@ -347,6 +349,36 @@ function forceWorkersDevFalse(out, label) {
   return out;
 }
 
+// Every deployed gateway runs in production mode, and nothing but this says so
+// (R37). gateway/index.ts carries a dev branch that synthesizes an identity
+// from an X-Mock-User request header; it is gated on DEV_MOCK_IDENTITY, which
+// nothing supplies in any runtime today (the gateway configs name it inside a
+// `dev` block, and wrangler discards a `vars` key there), and this is the
+// second lock: a config whose DEPLOYED vars say anything but production, or
+// that names the mock-identity var at all, is refused rather than templated.
+//
+// Decided from the comment-stripped PARSE, exactly what `wrangler deploy`
+// reads, for the same reason forceWorkersDevFalse is: a raw-text check can be
+// fooled by a comment that merely mentions the key.
+//
+// This REFUSES rather than corrects. workers_dev is a policy the platform
+// imposes on a config the app's repo may legitimately have written; a gateway
+// config saying "dev" is a config that did not come from where it should have,
+// and quietly rewriting it would hide that.
+function forceProductionEnvironment(out, label) {
+  let config;
+  try { config = JSON.parse(stripJsonComments(out)); }
+  catch (e) { throw new Error(`templated ${label} is not valid JSON: ${e.message}`); }
+  const vars = config.vars ?? {};
+  if (vars.ENVIRONMENT !== "production") {
+    throw new Error(`${label}: ENVIRONMENT must be "production" in a deployed gateway, got ${JSON.stringify(vars.ENVIRONMENT)}`);
+  }
+  if (vars.DEV_MOCK_IDENTITY !== undefined) {
+    throw new Error(`${label}: DEV_MOCK_IDENTITY must not appear in a deployed gateway's vars at all. It is a local-development switch, and a config that deploys must never carry it. To set it for local work, use a gitignored .dev.vars file (OPERATIONS §4.5); do not move it into these vars and do not remove this check.`);
+  }
+  return out;
+}
+
 /**
  * Template the function-shape GATEWAY config (gateway/wrangler.worker.jsonc).
  * Markers: the service target ("inno-app-replace-app", substituted BEFORE the
@@ -365,7 +397,7 @@ export function templateWorkerGateway(text, { app, accessAud } = {}) {
     { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
     { pattern: /("ACCESS_AUD"\s*:\s*)"REPLACE"/, replacement: `$1"${accessAud}"` },
   ]);
-  return forceWorkersDevFalse(out, "worker gateway config");
+  return forceProductionEnvironment(forceWorkersDevFalse(out, "worker gateway config"), "worker gateway config");
 }
 
 /**
@@ -389,7 +421,7 @@ export function templateMcpGateway(text, { app, mcpResource } = {}) {
     { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
     { pattern: /("OAUTH_RS_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${mcpResource}"` },
   ]);
-  return forceWorkersDevFalse(out, "mcp gateway config");
+  return forceProductionEnvironment(forceWorkersDevFalse(out, "mcp gateway config"), "mcp gateway config");
 }
 
 /**
@@ -451,7 +483,7 @@ export function templateMcpContainerGateway(text, { app, databaseId, resource, i
   // storage), same as the default container mode.
   const withLinks = appendLinkedDatabases(out, linkedDatabases, "mcp-container gateway config");
   const withGenerations = appendLinkGenerationVars(withLinks, linkedDatabases, "mcp-container gateway config");
-  return forceWorkersDevFalse(withGenerations, "mcp-container gateway config");
+  return forceProductionEnvironment(forceWorkersDevFalse(withGenerations, "mcp-container gateway config"), "mcp-container gateway config");
 }
 
 /**
