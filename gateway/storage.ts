@@ -20,6 +20,76 @@ type S = StorageEnv;
 const CONNECTIONS_FETCH_PATH = "/_connections/fetch";
 const CONNECTION_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
 
+// Hand-written twin of src/routes/links.ts's LINKS_CHECK_PATH (gateway/ builds
+// separately) — pinned by test/constant-parity.node.test.ts.
+const LINK_CHECK_PATH = "/_links/check";
+// Twin of src/routes/mcp-introspect.ts's GATEWAY_KEY_HEADER — parity-pinned
+// alongside the copy in gateway/mcp-auth.ts.
+const LINK_GATEWAY_KEY_HEADER = "x-inno-gateway-key";
+
+// Per-isolate memo of the platform's answer. A linked-storage call is a hot
+// path for a consumer app, and the platform's answer changes only when someone
+// revokes a link — 60 s matches the platform's own admin-roster and
+// account-status caches and bounds the revocation lag to the same window every
+// other control on this platform uses.
+const LINK_CHECK_TTL_MS = 60_000;
+const linkCheckCache = new Map<string, { live: boolean; at: number }>();
+
+export function linkGenerationVar(sourceApp: string): string {
+  return `LINK_GEN_${sourceApp.toUpperCase().replace(/-/g, "_")}`;
+}
+
+/**
+ * Ask the platform whether this deployed link is still live.
+ *
+ * Returns null in exactly ONE case: this gateway carries no baked generation
+ * for the source app (a gateway deployed before R09). The caller treats null
+ * as "keep the pre-R09 behavior" so promoting this gateway does not break
+ * every already-deployed linked app before its redeploy.
+ *
+ * Returns false for every other way the question goes unanswered: no PLATFORM
+ * binding, no gateway key, a transport failure, or a non-200. Once an app IS
+ * carrying a generation, an unanswerable check fails CLOSED. That is the whole
+ * point of the control (a revoked link must stop working even when the
+ * platform is having a bad day), and it is why the negative is not cached (a
+ * blip must not stick for a minute).
+ */
+async function linkStillLive(env: S, sourceApp: string): Promise<boolean | null> {
+  const generation = (env as unknown as Record<string, unknown>)[linkGenerationVar(sourceApp)];
+  // Generation first, binding second: a gateway that carries a generation but
+  // cannot ask (no binding, no key) must fail CLOSED, uniformly. Testing the
+  // binding first made the no-PLATFORM case return null, i.e. ALLOW.
+  if (typeof generation !== "string" || generation === "") return null;
+  if (!env.PLATFORM) return false;
+  const now = Date.now();
+  const hit = linkCheckCache.get(generation);
+  if (hit && now - hit.at < LINK_CHECK_TTL_MS) return hit.live;
+  const key = (env as unknown as { GATEWAY_INTROSPECT_KEY?: string }).GATEWAY_INTROSPECT_KEY;
+  if (!key) {
+    console.warn("gateway: linked storage carries a generation but no GATEWAY_INTROSPECT_KEY — refusing");
+    return false;
+  }
+  try {
+    const res = await env.PLATFORM.fetch(`https://platform.internal${LINK_CHECK_PATH}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", [LINK_GATEWAY_KEY_HEADER]: key },
+      body: JSON.stringify({ source_app: sourceApp, generation }),
+    });
+    if (!res.ok) {
+      console.warn(`gateway: link check refused (${res.status}) for ${sourceApp}`);
+      return false;
+    }
+    const body = (await res.json()) as { live?: unknown };
+    const live = body?.live === true;
+    // Positive and negative answers both memo; only an UNANSWERED check does not.
+    linkCheckCache.set(generation, { live, at: now });
+    return live;
+  } catch (e) {
+    console.warn(`gateway: link check failed for ${sourceApp}: ${String(e).slice(0, 120)}`);
+    return false;
+  }
+}
+
 // Per-object upload cap (25 MiB). Enforced only when the client sends a
 // content-length header — a chunked PUT with no length streams to R2, where
 // R2's own object-size limits apply as the backstop.
@@ -88,6 +158,19 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
             `No deployed data link to "${sourceApp}". Create one with the link_app_data MCP tool ` +
             "(same owner only), then redeploy this app — links are bound at deploy time.",
         }, 404);
+      }
+      // The binding proves the platform templated this link at DEPLOY time.
+      // It does not prove the link is still live: revoking one stamped
+      // revoked_at in D1 and left the deployed binding working until the
+      // consumer happened to redeploy (review F04 / M-7). Ask.
+      const live = await linkStillLive(env, sourceApp);
+      if (live === false) {
+        return json({
+          error: "link_revoked",
+          detail:
+            `The data link to "${sourceApp}" is no longer live, or the platform could not confirm it. ` +
+            "Ask the source app's owner to re-link, then redeploy this app.",
+        }, 403);
       }
       const body = await readJson<{ sql: string; params?: unknown[] }>(request);
       if (!body?.sql) return json({ error: "bad_request" }, 400);

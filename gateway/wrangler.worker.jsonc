@@ -8,6 +8,12 @@
   "workers_dev": false,                 // perimeter: the *.workers.dev URL is not behind Access
   "name": "inno-app-replace",           // orchestrator/deploy sets to inno-app-{name}
   "main": "src/gateway/index.ts",
+  // Pinned, not discovered: wrangler's nearest-tsconfig lookup walks up from
+  // the entry point, so whichever tsconfig.json happens to sit above the
+  // gateway's sources would otherwise decide how the platform's own
+  // authentication perimeter compiles (review F08). Path is relative to THIS
+  // config, which the platform writes next to the injected build inputs.
+  "tsconfig": "./tsconfig.json",
   "compatibility_date": "2026-03-10",
   "observability": { "enabled": true },
   // RED signal (NoOp Phase 2): one data point per request, written by

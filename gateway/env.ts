@@ -60,4 +60,10 @@ export type Env = {
   // both platform routes are publicly reachable and authenticate by payload;
   // see src/routes/mcp-introspect.ts and src/routes/activity.ts.
   PLATFORM?: Fetcher;
+  // Per-link generation secrets, one per deployed data link, templated by CI as
+  // LINK_GEN_<SOURCE_APP_UPPER> (ci/template-wrangler.mjs). Cannot appear in
+  // this static type because the names derive from source app names — read
+  // dynamically in storage.ts, exactly like the LINKED_* D1 bindings they
+  // accompany. Absent on a gateway deployed before R09: that app keeps the old
+  // "the binding IS the authorization" behavior until its next deploy.
 };

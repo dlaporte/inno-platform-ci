@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@cloudflare/containers": "^0.2.4",
-    "hono": "^4",
+    "hono": "^4.13.7",
     "jose": "^5"
   },
   "devDependencies": {

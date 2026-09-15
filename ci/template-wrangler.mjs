@@ -54,6 +54,8 @@ function countMatches(text, re) {
 const LINK_BINDING_RE = /^LINKED_[A-Z][A-Z0-9_]*$/;
 const RESERVED_BINDINGS = new Set(["DATA", "FILES", "DB", "APP", "APP_WORKER", "PLATFORM"]);
 
+const LINK_GENERATION_RE = /^[0-9a-f]{32}$/;
+
 /**
  * Parse and validate the linked-database payload the broker emitted
  * (`linked_databases` on the deploy-token response), passed through CI as JSON
@@ -83,7 +85,23 @@ export function parseLinkedDatabases(raw) {
     seen.add(binding);
     assertDeployValue(`linked ${binding} database_name`, databaseName);
     assertDeployValue(`linked ${binding} database_id`, databaseId);
-    return { binding, databaseName, databaseId };
+    const generation = entry.generation;
+    // A liveness token the gateway presents back to /_links/check (R09), not
+    // a capability: the seam also requires the gateway key, which app CI
+    // never sees. Absent/null whenever the platform has no
+    // GATEWAY_INTROSPECT_KEY provisioned (src/routes/deploy.ts's
+    // resolveLinkedDatabases, R09 fix round I-1) — the common case on a
+    // keyless platform. That is not an error: appendLinkGenerationVars below
+    // simply bakes no LINK_GEN_<SOURCE> var for this entry, leaving the
+    // gateway in its pre-R09 state for this link. When present, it is
+    // validated to the exact shape src/links.ts mints, because it is
+    // interpolated verbatim into the deployed config's vars.
+    if (generation !== undefined && generation !== null) {
+      if (typeof generation !== "string" || !LINK_GENERATION_RE.test(generation)) {
+        throw new Error(`invalid linked generation for ${binding}`);
+      }
+    }
+    return { binding, databaseName, databaseId, generation: generation ?? null };
   });
 }
 
@@ -110,6 +128,37 @@ function appendLinkedDatabases(text, links, label) {
   });
 }
 
+// Bake LINK_GEN_<SOURCE> for each linked database into the config's TOP-LEVEL
+// `vars` object. Container gateways only: a function-shaped consumer holds its
+// linked D1 binding on the app Worker and talks to D1 directly, so there is no
+// gateway proxy to gate (R09).
+//
+// An entry with no generation (null/absent — no GATEWAY_INTROSPECT_KEY
+// provisioned platform-wide, R09 fix round I-1) is skipped rather than baked
+// as the literal string "null": appendLinkedDatabases above still appends its
+// D1 binding, so the link keeps working, just without the liveness gate —
+// the same state every container data link was in before R09 shipped.
+//
+// Anchored at line start so it cannot match the nested `"dev": { "vars": ... }`
+// block that two of the templates carry. The top-level object in every
+// template contains no `}` of its own, which is what makes the textual splice
+// safe; the exactly-one assertion fails loud if that stops being true.
+const TOP_LEVEL_VARS_RE = /^([ \t]*"vars"\s*:\s*\{)([^}]*)(\})/m;
+
+function appendLinkGenerationVars(text, links, label) {
+  const withGeneration = links.filter((l) => l.generation != null);
+  if (withGeneration.length === 0) return text;
+  const count = countMatches(text, new RegExp(TOP_LEVEL_VARS_RE.source, "gm"));
+  if (count !== 1) {
+    throw new Error(`expected exactly 1 top-level "vars" object in the ${label}, found ${count}`);
+  }
+  const entries = withGeneration
+    .map((l) => `"LINK_GEN_${l.binding.slice("LINKED_".length)}": "${l.generation}"`)
+    .join(", ");
+  return text.replace(TOP_LEVEL_VARS_RE, (_m, open, body, close) =>
+    `${open}${body.trim() ? `${body.replace(/\s*$/, "")}, ` : " "}${entries}${close}`);
+}
+
 /**
  * Substitute the wrangler.jsonc template markers with real deploy-time values.
  *
@@ -126,16 +175,17 @@ function appendLinkedDatabases(text, links, label) {
  * those bindings and serves them over /_storage/linked/{app}/sql/*.
  *
  * @param {string} wranglerText
- * @param {{app: string, databaseId: string, accessAud: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string}[]}} params
+ * @param {{app: string, databaseId: string, accessAud: string, image?: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string, generation: string | null}[]}} params
  * @returns {string} the substituted JSONC text
  */
-export function templateWrangler(wranglerText, { app, databaseId, accessAud, linkedDatabases = [] } = {}) {
+export function templateWrangler(wranglerText, { app, databaseId, accessAud, image, linkedDatabases = [] } = {}) {
   // Shared validation so the container path and the worker templaters enforce
   // identical app-name and deploy-value rules (jq missing-field literals,
   // unsafe characters). See assertAppName/assertDeployValue below.
   assertAppName(app);
   assertDeployValue("databaseId", databaseId);
   assertDeployValue("accessAud", accessAud);
+  const imageValue = containerImageValue({ image });
 
   // Safety net: the template must have exactly two bare `"REPLACE"` literal
   // occurrences (database_id and ACCESS_AUD both start out as "REPLACE").
@@ -162,6 +212,7 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud, lin
     { pattern: /"inno-replace-data"/i, replacement: `"inno-${app}-data"` },
     { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${databaseId}"` },
     { pattern: /("ACCESS_AUD"\s*:\s*)"REPLACE"/, replacement: `$1"${accessAud}"` },
+    { pattern: /("image"\s*:\s*)"\.\/Dockerfile"/, replacement: `$1"${imageValue}"` },
   ];
 
   let out = wranglerText;
@@ -187,13 +238,14 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud, lin
   // gateway binding which gateway/storage.ts exposes under
   // /_storage/linked/{app}/sql/*.
   const withLinks = appendLinkedDatabases(out, linkedDatabases, "wrangler.jsonc");
+  const withGenerations = appendLinkGenerationVars(withLinks, linkedDatabases, "wrangler.jsonc");
 
   // Enforce workers_dev: false (perimeter hardening) via the shared helper, so
   // the container and worker paths apply the identical rule. The *.workers.dev
   // URL is NOT behind Cloudflare Access — closing it makes the Access-protected
   // custom hostname the sole ingress; applied to EVERY app at deploy, including
   // apps whose committed wrangler.jsonc predates this policy.
-  return forceWorkersDevFalse(withLinks, "wrangler.jsonc");
+  return forceWorkersDevFalse(withGenerations, "wrangler.jsonc");
 }
 
 // --- Function-shape templating (migration 0022) -----------------------------
@@ -218,6 +270,38 @@ function assertDeployValue(label, v) {
     throw new Error(`invalid ${label}: ${JSON.stringify(v)}`);
   }
   if (UNSAFE_VALUE_RE.test(v)) throw new Error(`invalid character in ${label}`);
+}
+
+// A Cloudflare container registry reference pinned by digest (R11). The form
+// is what wrangler's own parseImageName accepts and resolveImageName passes
+// through unchanged: NAME@sha256:<hex>, where NAME is already scoped to this
+// account. A tag alone is deliberately not accepted here — the whole point of
+// this reference is that it names one exact image.
+const IMAGE_DIGEST_RE = /^registry\.cloudflare\.com\/[0-9a-f]{32}\/[a-z0-9][a-z0-9._-]*@sha256:[0-9a-f]{64}$/;
+
+function assertImageReference(v) {
+  assertDeployValue("image", v);
+  if (!IMAGE_DIGEST_RE.test(v)) throw new Error(`image must be a digest-pinned Cloudflare registry reference, got ${JSON.stringify(v)}`);
+}
+
+// A digest-pinned registry reference is the ONLY value this accepts (I-4 fix
+// round). Before this, an empty `image` fell back to a Dockerfile path and
+// wrangler rebuilt it at deploy time — with CLOUDFLARE_API_TOKEN already in
+// the environment, producing a second image the safety gates never saw, and
+// silently reopening on any future edit that let the push step be skipped,
+// reordered, or given `continue-on-error`. That fallback is gone entirely: a
+// container deploy with no verified, pushed image reference is refused
+// outright, never silently downgraded to a rebuild. (No caller outside this
+// script's own tests still needs the old Dockerfile path — grepped for one
+// during the I-4 fix round and found none.)
+function containerImageValue({ image }) {
+  if (!image) {
+    throw new Error(
+      "container deploys must reference the pushed image digest; a Dockerfile build in the deploy job is no longer allowed",
+    );
+  }
+  assertImageReference(image);
+  return image;
 }
 
 // Per-marker present -> replace -> absent, matching templateWrangler's
@@ -322,13 +406,14 @@ export function templateMcpGateway(text, { app, mcpResource } = {}) {
  * wrangler.mcp.jsonc, this variant carries d1_databases too).
  *
  * @param {string} text
- * @param {{app: string, databaseId: string, resource: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string}[]}} params
+ * @param {{app: string, databaseId: string, resource: string, image?: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string, generation: string | null}[]}} params
  * @returns {string} the substituted JSONC text
  */
-export function templateMcpContainerGateway(text, { app, databaseId, resource, linkedDatabases = [] } = {}) {
+export function templateMcpContainerGateway(text, { app, databaseId, resource, image, linkedDatabases = [] } = {}) {
   assertAppName(app);
   assertDeployValue("databaseId", databaseId);
   assertDeployValue("resource", resource);
+  const imageValue = containerImageValue({ image });
 
   const resourceMarkerCount = countMatches(text, /"OAUTH_RS_RESOURCE"\s*:\s*"REPLACE"/g);
   if (resourceMarkerCount !== 1) {
@@ -358,13 +443,15 @@ export function templateMcpContainerGateway(text, { app, databaseId, resource, l
     { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${databaseId}"` },
     { pattern: /"inno-replace-data"/, replacement: `"inno-${app}-data"` },
     { pattern: /("OAUTH_RS_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${resource}"` },
+    { pattern: /("image"\s*:\s*)"\.\/Dockerfile"/, replacement: `$1"${imageValue}"` },
   ]);
 
   // Cross-app data links (migration 0028): the gateway holds these bindings
   // directly for a container app (it has no credential of its own to reach
   // storage), same as the default container mode.
   const withLinks = appendLinkedDatabases(out, linkedDatabases, "mcp-container gateway config");
-  return forceWorkersDevFalse(withLinks, "mcp-container gateway config");
+  const withGenerations = appendLinkGenerationVars(withLinks, linkedDatabases, "mcp-container gateway config");
+  return forceWorkersDevFalse(withGenerations, "mcp-container gateway config");
 }
 
 /**
@@ -402,6 +489,11 @@ if (isMainModule(import.meta.url)) {
   // payload is a nested structure and every shell-quoting mistake here would be
   // a config-corruption bug. Empty/absent is the common case.
   const linkedDatabases = parseLinkedDatabases(process.env.INNO_LINKED_DATABASES);
+  // Digest-pinned registry reference for the already-scanned, already-pushed
+  // image (R11). The ONLY accepted image source for a container-shaped
+  // deploy — containerImageValue refuses outright when this is empty; there
+  // is no Dockerfile-path fallback any more (I-4 fix round).
+  const image = process.env.INNO_IMAGE;
   if (linkedDatabases.length > 0) {
     console.log(`linking ${linkedDatabases.length} cross-app database(s): ${linkedDatabases.map((l) => l.binding).join(", ")}`);
   }
@@ -418,7 +510,7 @@ if (isMainModule(import.meta.url)) {
   } else if (mode === "--mcp-container-gateway") {
     const [app, databaseId, resource, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId || !resource) { console.error("Usage: node ci/template-wrangler.mjs --mcp-container-gateway <app> <databaseId> <resource> [path]"); process.exit(1); }
-    writeFileSync(path, templateMcpContainerGateway(readFileSync(path, "utf8"), { app, databaseId, resource, linkedDatabases }));
+    writeFileSync(path, templateMcpContainerGateway(readFileSync(path, "utf8"), { app, databaseId, resource, image, linkedDatabases }));
     console.log(`templated mcp-container gateway ${path} for app "${app}"`);
   } else if (mode === "--worker-app") {
     const [app, databaseId, path = "wrangler.jsonc"] = rest;
@@ -431,7 +523,7 @@ if (isMainModule(import.meta.url)) {
       console.error("Usage: node ci/template-wrangler.mjs <app> <databaseId> <accessAud> [wranglerPath=wrangler.jsonc]");
       process.exit(1);
     }
-    const templated = templateWrangler(readFileSync(wranglerPath, "utf8"), { app, databaseId, accessAud, linkedDatabases });
+    const templated = templateWrangler(readFileSync(wranglerPath, "utf8"), { app, databaseId, accessAud, image, linkedDatabases });
     writeFileSync(wranglerPath, templated);
     console.log(`templated ${wranglerPath} for app "${app}"`);
   }

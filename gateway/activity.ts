@@ -34,15 +34,41 @@ export function markTouched(host: string, nowMs: number): void {
 
 // Does this POST /mcp carry a work method? Parses a CLONE so the forwarded
 // body is untouched. Unparseable → false (the app will reject it anyway).
+//
+// The clone read is byte-counted and abandoned past PEEK_MAX_BYTES: the old
+// form checked the declared Content-Length and then buffered the clone whole,
+// so a chunked body of any size was peeked in full (its own comment said so).
+// Over the cap still counts as WORK — a large POST /mcp under a real user
+// token is almost certainly a tools/call payload.
 export async function mcpWorkRequest(req: Request): Promise<boolean> {
-  // A chunked body (no content-length header) falls through this cap
-  // uncounted and is buffered whole by the clone-parse below — accepted for
-  // now; a read-N-bytes guard belongs to the platform's seam size-caps
-  // workstream, not here.
-  if (Number(req.headers.get("content-length") ?? "0") > PEEK_MAX_BYTES) return true;
-  let body: unknown;
-  try { body = await req.clone().json(); } catch { return false; }
-  const items = Array.isArray(body) ? body : [body];
+  const declared = Number(req.headers.get("content-length") ?? "0");
+  if (declared > PEEK_MAX_BYTES) return true;
+  const body = req.clone().body;
+  if (!body) return false;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    const reader = body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > PEEK_MAX_BYTES) {
+        await reader.cancel().catch(() => {});
+        return true;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return false;
+  }
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const ch of chunks) { merged.set(ch, off); off += ch.byteLength; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(new TextDecoder().decode(merged)); } catch { return false; }
+  const items = Array.isArray(parsed) ? parsed : [parsed];
   return items.some((m) => WORK_METHODS.has((m as { method?: string })?.method ?? ""));
 }
 
