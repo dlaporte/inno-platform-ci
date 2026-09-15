@@ -307,17 +307,19 @@ export function checkConfig(appDir) {
   }
 
   // --- Check 7: src/ is platform-owned; nothing of the author's may exist ---
-  // under it. The platform injects the promoted gateway (config gateway.ref)
-  // into src/gateway/ at build time and bundles it FROM there, inside the app
+  // under it. Before v0.14.2 the platform injected the promoted gateway (config
+  // gateway.ref) into src/gateway/ and bundled it FROM there, inside the app
   // checkout. esbuild resolves bare imports by walking up from the importing
-  // file, so a committed src/node_modules/<dep> outranks the platform's pinned
-  // root copy, and src/tsconfig.json (paths) or src/package.json (browser
-  // field) redirect resolution the same way — an author could replace hono or
+  // file, so a committed src/node_modules/<dep> outranked the platform's
+  // pinned copy, and src/tsconfig.json (paths) or src/package.json (browser
+  // field) redirected resolution the same way: an author could replace hono or
   // jose inside their own app's authentication perimeter while the deployment
-  // records a legitimate gateway ref (2026-09-13 review F08, reproduced with
-  // wrangler --dry-run 2026-09-14). A vendored src/gateway/ is the same class
-  // and keeps its original message. The deploy job additionally wipes src/
-  // before injecting (belt to this suspenders).
+  // recorded a legitimate gateway ref (2026-09-13 review F08, reproduced with
+  // wrangler --dry-run 2026-09-14). The deploy job now builds the gateway in a
+  // platform-owned directory outside the checkout (R02), which takes the
+  // author's tree off the resolution path; this check and the deploy job's
+  // wipe of src/ stay as the belt. A vendored src/gateway/ keeps its original
+  // message.
   //
   // lstat (not existsSync): a symlink at src/ or src/gateway must fail closed
   // without being followed — same rule as check 8 below. An EMPTY src/
@@ -364,8 +366,9 @@ export function checkConfig(appDir) {
     if (!srcUnreadable && (!srcStat.isDirectory() || entries.length > 0)) {
       const what = srcStat.isDirectory() ? entries.map((n) => `src/${n}`).join(", ") : "src is not a directory";
       violations.push(
-        `delete src/ — the platform owns src/ (it injects the gateway there and bundles it from there; ` +
-          `anything else under src/ can shadow the gateway's dependencies or compiler configuration): ${what} ` +
+        `delete src/ — the platform owns src/ (reserved for the gateway: the deploy builds it outside your checkout ` +
+          `and wipes src/, and the gate refuses author files there so none can shadow the gateway's dependencies ` +
+          `or compiler configuration): ${what} ` +
           `(see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)`,
       );
     }
