@@ -23,9 +23,18 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AppContainer"] }],
   "d1_databases": [{ "binding": "DB", "database_name": "inno-replace-db", "database_id": "REPLACE" }],
   "r2_buckets": [{ "binding": "FILES", "bucket_name": "inno-replace-data" }],
-  // Service binding to the platform Worker — the human-activity touch channel
-  // (spec 2026-08-18). Routing, not authentication: the touch authenticates
-  // by payload (the forwarded Access JWT), like every platform seam.
+  // Service binding to the platform Worker, bound on all four gateway
+  // variants (the other three say "see wrangler.jsonc"). On every variant it
+  // carries the human-activity touch (spec 2026-08-18); on the container
+  // variants the Connections proxy and link checks (gateway/storage.ts); on
+  // the two oauth-rs variants token introspection (POST /app-introspect),
+  // because the platform's access tokens are opaque and cannot be verified
+  // locally. Routing, NOT authentication: every one of those platform routes
+  // is publicly reachable and authenticates by payload (the forwarded Access
+  // JWT, the presented token, the gateway key), and /app-introspect is safe
+  // by construction (no authority, returns only what the presented token
+  // already contains; see src/routes/mcp-introspect.ts). The target must be
+  // the root wrangler.jsonc's "name": constant-parity pins it.
   "services": [{ "binding": "PLATFORM", "service": "inno-platform" }],
   // ACCESS_TEAM_DOMAIN is a STATIC deployment constant, not templated per app:
   // the gateway verifies every Access JWT's issuer against it. When adapting

@@ -8,7 +8,7 @@ name: Platform CI
 # public contract mirror: five fetch the ci/ scripts, one the promoted
 # gateway), and the one CLOUDFLARE_ACCOUNT_ID in the deploy job's env. Counts
 # drift, so run this rather than trusting them:
-#   grep -n '^ *repository: \|^ *CLOUDFLARE_ACCOUNT_ID:' .github/workflows/*.yml
+#   grep -n '^ *repository: \|^ *CLOUDFLARE_ACCOUNT_ID:\|^ *BROKER_URL:' .github/workflows/*.yml
 # This file itself lives in BOTH repos: source-of-truth here in inno-platform,
 # published byte-for-byte into dlaporte/inno-platform-ci by
 # scripts/publish-mirror.sh (see OPERATIONS §7.2.2), and that mirror copy is
@@ -814,7 +814,7 @@ jobs:
     # gates above and stops here — the push IS the safety preflight. github.ref
     # in a reusable workflow is the CALLER run's ref, and the broker
     # independently re-verifies it from the signed OIDC claims.
-    if: ${{ needs.scaffold-check.outputs.built == 'true' && startsWith(github.ref, 'refs/tags/v') }}
+    if: needs.scaffold-check.outputs.built == 'true' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # Serialize deploys per app repo. The broker already makes its OWN side
     # safe (deploy-complete runs under withAppLease and the status flip is

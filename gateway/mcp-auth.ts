@@ -146,11 +146,13 @@ async function cacheKeyFor(token: string, resource: string): Promise<string> {
 // pinned by test/constant-parity.node.test.ts (TOUCH_PATH-style).
 const APP_INTROSPECT_PATH = "/app-introspect";
 
+// Takes the binding, not Env, the way activity.ts's sendTouch does: the
+// caller has already narrowed env.PLATFORM, so no `!` is needed here.
 async function introspectViaPlatform(
-  env: Env, token: string, resource: string,
+  platform: Fetcher, gatewayKey: string | undefined, token: string, resource: string,
 ): Promise<IntrospectionResponse> {
   try {
-    const res = await env.PLATFORM!.fetch(`${PLATFORM_ORIGIN}${APP_INTROSPECT_PATH}`, {
+    const res = await platform.fetch(`${PLATFORM_ORIGIN}${APP_INTROSPECT_PATH}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -162,7 +164,7 @@ async function introspectViaPlatform(
         // the caller assertion unless its admin switch is explicitly false
         // (the cutover override), so a keyless gateway loses Connections
         // until it is redeployed with the key.
-        ...(env.GATEWAY_INTROSPECT_KEY ? { [GATEWAY_KEY_HEADER]: env.GATEWAY_INTROSPECT_KEY } : {}),
+        ...(gatewayKey ? { [GATEWAY_KEY_HEADER]: gatewayKey } : {}),
       },
       body: JSON.stringify({ token, resource }),
     });
@@ -203,7 +205,7 @@ export async function authenticateMcp(
   let body = cacheGet(key, now);
 
   if (!body) {
-    body = await introspectViaPlatform(env, token, resource);
+    body = await introspectViaPlatform(env.PLATFORM, env.GATEWAY_INTROSPECT_KEY, token, resource);
     // Only positive results are cached, and only when they have real remaining
     // life — caching an already-expired token (expires_in <= 0) would honor it
     // for up to the 1s TTL floor. Negatives are never cached: a just-granted

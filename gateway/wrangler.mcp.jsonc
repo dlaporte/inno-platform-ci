@@ -1,6 +1,6 @@
 {
   // Injected gateway config for MCP-TYPE apps. Same gateway code as the other
-  // two variants (src/gateway/index.ts); the difference is the IDENTITY
+  // three variants (src/gateway/index.ts); the difference is the IDENTITY
   // BOUNDARY. An MCP client cannot complete an interactive Cloudflare Access
   // login, so these apps have NO Access application: the gateway runs in MCP
   // mode as an OAuth 2.1 Resource Server, verifying a platform-issued bearer
@@ -29,11 +29,8 @@
     // ONLY through this binding. The gateway (which authenticates FIRST) stays
     // the sole entrypoint and identity boundary, exactly as for function-type apps.
     { "binding": "APP_WORKER", "service": "inno-app-replace-app" },
-    // The control plane, for token introspection (POST /app-introspect). The
-    // platform's access tokens are opaque, so they cannot be verified locally.
-    // The binding is ROUTING convenience, NOT authentication: /app-introspect is
-    // publicly reachable and safe by construction (no authority, returns only
-    // what the presented token already contains) — see src/routes/mcp-introspect.ts.
+    // The platform Worker: token introspection here as well as the touch
+    // channel; routing, not authentication. See wrangler.jsonc.
     { "binding": "PLATFORM", "service": "inno-platform" }
   ],
   // OAUTH_RS_MODE switches the gateway onto the bearer-token path. OAUTH_RS_RESOURCE is

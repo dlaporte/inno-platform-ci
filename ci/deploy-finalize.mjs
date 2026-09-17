@@ -11,7 +11,7 @@
 // what the container job recorded.
 
 import { brokerPost } from "./broker-post.mjs";
-import { isMainModule } from "./cli.mjs";
+import { isMainModule, parseIntegerArg } from "./cli.mjs";
 
 /**
  * POST {app, deployment_id, gateway_ref?, image_id?} to `${base}/deploy-complete`, authenticated with
@@ -21,13 +21,14 @@ import { isMainModule } from "./cli.mjs";
  * @param {string} token - GitHub Actions OIDC token
  * @param {string} app
  * @param {number|string} deploymentId
- * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} fetcher
- *   - injectable for testing; defaults to global fetch
  * @param {string} [gatewayRef] - optional gateway reference
  * @param {string} [imageId] - the image id actually deployed (R11)
+ * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} [fetcher]
+ *   - injectable for testing; defaults to global fetch. Last, like every
+ *   sibling helper's (uploadSbom, postResults, postDepsResults, brokerPost).
  * @returns {Promise<any>} the parsed JSON response body (e.g. { url })
  */
-export async function finalize(base, token, app, deploymentId, fetcher = fetch, gatewayRef, imageId) {
+export async function finalize(base, token, app, deploymentId, gatewayRef, imageId, fetcher = fetch) {
   const body = {
     app, deployment_id: deploymentId,
     ...(gatewayRef ? { gateway_ref: gatewayRef } : {}),
@@ -45,14 +46,11 @@ if (isMainModule(import.meta.url)) {
     if (!base || !app || !deploymentId || !token) {
       throw new Error("Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef] [imageId]");
     }
-    // `jq -r .deployment_id` on a missing field yields the literal string
-    // "null", which is truthy above; Number("null") is NaN. Fail here with a
-    // clear message instead of POSTing a malformed body to the broker.
-    const deploymentIdNum = Number(deploymentId);
-    if (!Number.isInteger(deploymentIdNum)) {
-      throw new Error(`invalid deploymentId ${JSON.stringify(deploymentId)} — the broker's /deploy-token response may be malformed`);
-    }
-    const result = await finalize(base, token, app, deploymentIdNum, fetch, gatewayRefArg, imageIdArg);
+    // The broker's /deploy-token response is where this came from (via
+    // `jq -r .deployment_id`); parseIntegerArg says what a malformed one
+    // looks like rather than POSTing it back to the broker.
+    const deploymentIdNum = parseIntegerArg("deploymentId", deploymentId);
+    const result = await finalize(base, token, app, deploymentIdNum, gatewayRefArg, imageIdArg);
     // Human-readable line to stderr; the raw JSON result to stdout, so the
     // workflow can capture stdout and pipe it straight into `jq -r .url`
     // instead of re-parsing this log line with sed.

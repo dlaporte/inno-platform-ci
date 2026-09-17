@@ -17,11 +17,6 @@ import { writeRed, pathClass, classifyStatus, appFromHostname, userBucket } from
 // this, container startup fails with "ctx.exports.ContainerProxy is undefined".
 export { ContainerProxy } from "@cloudflare/containers";
 
-// NOTE: the lowercased class name is load-bearing OUTSIDE this worker —
-// src/naming.ts `containerAppName` derives the billed Cloudflare Container
-// application name as `<worker>-appcontainer` from `class AppContainer`.
-// Renaming this class silently orphans the billed container on teardown; keep
-// the two in sync (see the reciprocal note in src/naming.ts).
 // Scale-to-zero timeout resolution. The platform injects SLEEP_AFTER at
 // deploy time (`wrangler deploy --var SLEEP_AFTER:...` in platform-ci,
 // sourced from the config store's container.sleep_after — app-overridable);
@@ -56,6 +51,11 @@ export function collectAppVars(env: Env): Record<string, string> {
   return out;
 }
 
+// NOTE: the lowercased class name is load-bearing OUTSIDE this worker:
+// src/naming.ts `containerAppName` derives the billed Cloudflare Container
+// application name as `<worker>-appcontainer` from `class AppContainer`.
+// Renaming this class silently orphans the billed container on teardown; keep
+// the two in sync (see the reciprocal note in src/naming.ts).
 export class AppContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "10m";
@@ -174,13 +174,27 @@ export function makeApp(deps: Deps = realDeps) {
   });
   app.all("*", async (c) => {
     const env = c.env;
+    const path = c.req.path;
+    // The Host header is not guaranteed present on every Request object
+    // (notably absent on synthetic requests built with `new Request()`, as
+    // opposed to ones that arrived over real HTTP); the URL's own hostname
+    // is always populated and always matches what routed here. Derived once
+    // for the touch debounce key and RED's caller bucket (identity.ts makes
+    // the same derivation for R29's narrowing, inside sanitizeAndInject so
+    // no branch can skip it).
+    const host = new URL(c.req.url).hostname;
+    // The one request shape a credential with NO user identity is good for,
+    // on both perimeters: the platform's health probe (an Access SERVICE
+    // token on the sso path, the health-probe bearer on the MCP path). Any
+    // other path keeps the hard identity requirement: a service credential
+    // can never browse the app or reach data as a person.
+    const isHealthProbe = c.req.method === "GET" && path === "/healthz";
     let identity: AccessIdentity;
     // MCP mode (mcp-type apps): this gateway is an OAuth Resource Server, not an
     // Access-terminating proxy. Handled before the dev branch so the discovery
     // document and the 401 challenge behave identically in dev and production —
     // an MCP client's very first request depends on both.
     if (env.OAUTH_RS_MODE === "true") {
-      const path = c.req.path;
       // Public, unauthenticated by design: this is how a client with no token
       // discovers which Authorization Server to use. Contains only URLs.
       if (c.req.method === "GET" && isProtectedResourceRequest(env, path)) {
@@ -194,9 +208,10 @@ export function makeApp(deps: Deps = realDeps) {
         console.warn(`gateway: 401 ${hadToken ? "invalid" : "no"} bearer (${c.req.method} ${path})`);
         return unauthorizedChallenge(env, hadToken);
       }
-      // Same rule the Access path applies to its service token: a credential
-      // with no user identity is good for GET /healthz and nothing else.
-      if (auth.service && !(c.req.method === "GET" && path === "/healthz")) {
+      // Same rule the Access path applies to its service token (isHealthProbe
+      // above): a credential with no user identity is good for GET /healthz
+      // and nothing else.
+      if (auth.service && !isHealthProbe) {
         console.warn(`gateway: 403 service credential outside /healthz (${c.req.method} ${path})`);
         // 403, not the Access path's 401, and deliberately so: the token is
         // VALID, it just isn't authorized for this request, which RFC 6750
@@ -214,11 +229,6 @@ export function makeApp(deps: Deps = realDeps) {
       // the clone/parse cost is paid at most once per window; protocol
       // chatter, probes, and tokenless noise never qualify.
       if (env.PLATFORM && identity.callerAssertion && c.req.method === "POST" && path === "/mcp") {
-        // The Host header is not guaranteed present on every Request object
-        // (notably absent on synthetic requests built with `new Request()`,
-        // as opposed to ones that arrived over real HTTP) — the URL's own
-        // hostname is always populated and always matches what routed here.
-        const host = new URL(c.req.url).hostname;
         if (shouldTouch(host, Date.now()) && (await mcpWorkRequest(c.req.raw))) {
           markTouched(host, Date.now());
           queueTouch(c, env.PLATFORM, { assertion: identity.callerAssertion });
@@ -232,7 +242,6 @@ export function makeApp(deps: Deps = realDeps) {
         groups: (c.req.header("X-Mock-Groups") ?? "").split(",").map((s) => s.trim()).filter((g) => g.startsWith(GROUP_PREFIX)),
       };
     } else {
-      const path = c.req.path;
       // Fail CLOSED on a mis-templated deploy: without an AUD and team domain
       // there is nothing to verify a JWT against, and proceeding would check the
       // token against `undefined` rather than this app's Access application.
@@ -243,11 +252,8 @@ export function makeApp(deps: Deps = realDeps) {
       const token = c.req.header(ACCESS_JWT_HEADER) ?? readCookie(c.req.raw, ACCESS_COOKIE);
       if (!token) { console.warn(`gateway: 401 no Access token (${c.req.method} ${path})`); return c.text("unauthorized", 401); }
       // The platform's health probe authenticates with an Access SERVICE
-      // token — a valid JWT with no user identity. It is accepted for
-      // exactly one request shape: GET /healthz. Any other path keeps the
-      // hard identity requirement (a service token can never browse the app
-      // or reach data as a person).
-      const isHealthProbe = c.req.method === "GET" && path === "/healthz";
+      // token, a valid JWT with no user identity, accepted for exactly the
+      // one request shape isHealthProbe (above) names.
       try {
         identity = await verifyAccessJwt(token,
           { jwks: deps.jwks(env), aud: env.ACCESS_AUD, teamDomain: env.ACCESS_TEAM_DOMAIN },
@@ -261,9 +267,6 @@ export function makeApp(deps: Deps = realDeps) {
       // email excludes probes by construction. The platform re-verifies the
       // forwarded JWT against this app's stored AUD before stamping.
       if (env.PLATFORM && identity.email) {
-        // See the MCP branch's comment above: derived from the URL, not the
-        // Host header, so it is populated on every request shape.
-        const host = new URL(c.req.url).hostname;
         if (shouldTouch(host, Date.now())) {
           markTouched(host, Date.now());
           queueTouch(c, env.PLATFORM, { host, jwt: token });
@@ -279,7 +282,7 @@ export function makeApp(deps: Deps = realDeps) {
     // RED's caller bucket, now that there IS a verified identity. Set before
     // the forward so the surrounding middleware reads it whichever way the
     // request ends (proxied response, or a throw from the app).
-    c.set("redUser", await userBucket(appFromHostname(new URL(c.req.url).hostname), identity.email || "service"));
+    c.set("redUser", await userBucket(appFromHostname(host), identity.email || "service"));
 
     const proxied = sanitizeAndInject(c.req.raw, identity, { mcpMode: env.OAUTH_RS_MODE === "true" });
     // Deployment-type dispatch: function-shaped apps carry an APP_WORKER service

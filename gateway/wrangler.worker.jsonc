@@ -1,6 +1,6 @@
 {
   // Injected gateway config for FUNCTION-SHAPED apps (migration 0022). Same gateway
-  // code as the container variant (src/gateway/index.ts) — it dispatches on the
+  // code as the three other variants (src/gateway/index.ts); it dispatches on the
   // APP_WORKER binding (gateway/index.ts forwardToWorker). The difference from
   // wrangler.jsonc: no container/Durable Object, and a service binding to the
   // app's own Worker instead. Templated per app by ci/template-wrangler.mjs
@@ -27,7 +27,7 @@
   // injects identity FIRST) stays the sole entrypoint and identity boundary.
   "services": [
     { "binding": "APP_WORKER", "service": "inno-app-replace-app" },
-    // The human-activity touch channel (spec 2026-08-18) — see wrangler.jsonc.
+    // The platform Worker (the human-activity touch channel); see wrangler.jsonc.
     { "binding": "PLATFORM", "service": "inno-platform" }
   ],
   // ACCESS_TEAM_DOMAIN is a STATIC deployment constant (see wrangler.jsonc);

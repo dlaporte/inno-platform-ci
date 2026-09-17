@@ -29,11 +29,9 @@
   "d1_databases": [{ "binding": "DB", "database_name": "inno-replace-db", "database_id": "REPLACE" }],
   "r2_buckets": [{ "binding": "FILES", "bucket_name": "inno-replace-data" }],
   "services": [
-    // The control plane, for token introspection (POST /app-introspect). The
-    // platform's access tokens are opaque, so they cannot be verified locally.
-    // The binding is ROUTING convenience, NOT authentication: /app-introspect is
-    // publicly reachable and safe by construction (no authority, returns only
-    // what the presented token already contains) — see src/routes/mcp-introspect.ts.
+    // The platform Worker: token introspection here as well as the touch
+    // channel, the Connections proxy and link checks; routing, not
+    // authentication. See wrangler.jsonc.
     { "binding": "PLATFORM", "service": "inno-platform" }
   ],
   // OAUTH_RS_MODE switches the gateway onto the bearer-token path. OAUTH_RS_RESOURCE is

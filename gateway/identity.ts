@@ -10,16 +10,15 @@ import { appFromHostname } from "./red";
 // a client-supplied value must never survive to be re-injected or forwarded.
 const STRIP_EXACT = ["x-forwarded-user", "x-forwarded-groups", "x-forwarded-email", "x-caller-assertion"];
 const STRIP_PREFIXES = ["cf-access-"];
-// The Access JWT arrives TWICE: as cf-access-jwt-assertion (covered by the
-// prefix rule above) and as the CF_Authorization cookie — and index.ts accepts
-// either as a credential, so stripping only the header left the app holding a live bearer
-// for its own gateway. It is valid until exp (Access session_duration 24h) and
-// re-accepted with no session or revocation lookup, so app code could replay
-// any visitor's identity for a day, past a revoke_access.
 // Both of Cloudflare Access's session cookies, on the app's own hostname. The
-// gateway has already consumed the Access session before this runs, so the app
-// needs neither, and leaving either behind hands the app a live bearer for its
-// own perimeter that it could replay as any visitor until the session expires.
+// Access JWT arrives TWICE, as cf-access-jwt-assertion (covered by the prefix
+// rule above) and as the CF_Authorization cookie, and index.ts accepts either
+// as a credential. The gateway has already consumed the session before this
+// runs, so the app needs neither cookie, and leaving either behind (stripping
+// only the header once did) hands the app a live bearer for its own perimeter:
+// valid until exp (Access session_duration 24h) and re-accepted with no
+// session or revocation lookup, so app code could replay any visitor's
+// identity for a day, past a revoke_access.
 const STRIP_COOKIES = ["CF_Authorization", "CF_AppSession"];
 
 // In MCP mode the caller's credential is a platform-issued OAuth bearer token in

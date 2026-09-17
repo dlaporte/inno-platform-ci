@@ -1,7 +1,7 @@
 // Shared brokerPost() helper for the ci/ scripts: the "POST JSON to a broker
-// endpoint" call that deploy-finalize.mjs, sbom-upload.mjs, export-app.mjs
-// and — in inno-platform only, it is not part of the published mirror —
-// sweep-post.mjs each opened with. Each did exactly the same thing: POST a JSON body to
+// endpoint" call every ci/ script that POSTs to the broker used to open with.
+// Which of those callers ship in the public mirror is scripts/publish-mirror.sh's
+// manifest (test-enforced), not a list kept here. Each did exactly the same thing: POST a JSON body to
 // a broker endpoint with the GitHub Actions OIDC token as a bearer, read the
 // response as text FIRST (so a non-2xx, non-JSON body — e.g. an HTML 500
 // page — surfaces the real status + body instead of a raw JSON parse error),

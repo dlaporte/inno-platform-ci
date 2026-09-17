@@ -14,7 +14,7 @@
 
 import { readFile } from "node:fs/promises";
 import { brokerPost } from "./broker-post.mjs";
-import { isMainModule } from "./cli.mjs";
+import { isMainModule, parseIntegerArg } from "./cli.mjs";
 
 const RANK = { CRITICAL: 0, HIGH: 1, MODERATE: 2, LOW: 3, INFO: 4 };
 
@@ -75,6 +75,27 @@ export function gateSurvivors(findings, ignores) {
     (f.severity === "HIGH" || f.severity === "CRITICAL") && !ignores.includes(f.id));
 }
 
+/**
+ * POST {app, deployment_id, findings} to `${base}/sweep/deps-results`, the
+ * deps lane's twin of sweep-post.mjs's postResults (same body, different
+ * path), exported so the POST is unit-testable the way the trivy lane's is.
+ *
+ * @param {string} base - broker base URL
+ * @param {string} token - GitHub Actions OIDC token (sweep audience)
+ * @param {string} app
+ * @param {number} deploymentId
+ * @param {ReturnType<typeof normalize>} findings
+ * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} [fetcher]
+ *   - injectable for testing; defaults to global fetch
+ * @returns {Promise<any>} the parsed JSON response body (e.g. { recorded } or { stale })
+ */
+export async function postDepsResults(base, token, app, deploymentId, findings, fetcher = fetch) {
+  return brokerPost(
+    { base, path: "/sweep/deps-results", label: "deps-results", token, body: { app, deployment_id: deploymentId, findings } },
+    fetcher,
+  );
+}
+
 if (isMainModule(import.meta.url)) {
   try {
     const [mode, ...args] = process.argv.slice(2);
@@ -98,13 +119,9 @@ if (isMainModule(import.meta.url)) {
       if (!base || !app || !deploymentId || !auditPath || !token) {
         throw new Error("Usage: deps-normalize.mjs post <base> <app> <deploymentId> <auditJson> <token>");
       }
-      const deploymentIdNum = Number(deploymentId);
-      if (!Number.isInteger(deploymentIdNum)) throw new Error(`invalid deploymentId ${JSON.stringify(deploymentId)}`);
+      const deploymentIdNum = parseIntegerArg("deploymentId", deploymentId);
       const findings = normalize(JSON.parse(await readFile(auditPath, "utf8")));
-      const result = await brokerPost(
-        { base, path: "/sweep/deps-results", label: "deps-results", token,
-          body: { app, deployment_id: deploymentIdNum, findings } },
-      );
+      const result = await postDepsResults(base, token, app, deploymentIdNum, findings);
       console.log(`deps-results: ${JSON.stringify(result)}`);
     } else {
       throw new Error(`unknown mode ${JSON.stringify(mode)} — use "gate" or "post"`);

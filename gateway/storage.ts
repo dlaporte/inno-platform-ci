@@ -1,11 +1,15 @@
 import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
-// PLATFORM added for Connections v1's /_connections/{name} proxy below. It is
-// optional on Env (present only on the two oauth-rs wrangler variants — see
-// env.ts), so a sso-perimeter app simply has it undefined and the route below
-// answers 501 rather than throwing. GATEWAY_INTROSPECT_KEY is the proof of
-// gateway-hood linkStillLive presents on /_links/check; optional on Env for
-// the same provisioning reason, and its absence fails that check closed.
+// PLATFORM carries Connections v1's /_connections/{name} proxy below. It is
+// bound on every current variant (the human-activity touch channel, spec
+// 2026-08-18; see env.ts), so the 501 below covers only a gateway deployed
+// from a config that predates that binding. An sso-perimeter app therefore
+// reaches the platform seam, but carries no caller assertion (the Access path
+// mints none; only introspection does), so the platform refuses it with 400
+// bad_request rather than this file answering 501. GATEWAY_INTROSPECT_KEY is
+// the proof of gateway-hood linkStillLive presents on /_links/check; optional
+// on Env because a gateway deployed before the key existed has none, and its
+// absence fails that check closed.
 // Not Pick<Env, …>: DB/FILES are optional on Env because the function-shaped
 // gateway variants don't bind them, but handleStorage is reachable ONLY as
 // AppContainer's storage.internal outbound handler — i.e. only on the
@@ -23,10 +27,10 @@ type S = StorageEnv;
 // Same grammar the platform enforces for a connection name (src/connections/store.ts
 // CONN_NAME_RE) — restated rather than imported, same reason as APP_NAME_RE below:
 // the gateway builds separately from the platform Worker.
+const CONNECTION_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
 // Hand-written twin of src/routes/connections.ts's CONNECTIONS_FETCH_PATH
 // (gateway/ builds separately) — pinned by test/constant-parity.node.test.ts.
 const CONNECTIONS_FETCH_PATH = "/_connections/fetch";
-const CONNECTION_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
 
 // Hand-written twin of src/routes/links.ts's LINKS_CHECK_PATH (gateway/ builds
 // separately) — pinned by test/constant-parity.node.test.ts.
@@ -129,29 +133,39 @@ function resolveLinkedDb(env: S, sourceApp: string): D1Database | null {
     : null;
 }
 
+type SqlOp = "query" | "execute";
+
+// The SQL surface, once, for the app's own database and for a linked one:
+// read the body, refuse a missing `sql`, bind, and shape the result per op.
+// The linked branch deliberately serves the same API as the own-database
+// branch (an author who can read their own D1 can read a linked one without
+// learning anything new), so the request and response shapes live here and
+// a change to either lands in one place, not four.
+async function runSql(db: D1Database, op: SqlOp, request: Request): Promise<Response> {
+  const body = await readJson<{ sql: string; params?: unknown[] }>(request);
+  if (!body?.sql) return json({ error: "bad_request" }, 400);
+  const stmt = db.prepare(body.sql).bind(...(body.params ?? []));
+  if (op === "query") {
+    const { results } = await stmt.all();
+    return json({ results });
+  }
+  const r = await stmt.run();
+  return json({ changes: r.meta.changes ?? 0, lastRowId: r.meta.last_row_id ?? null });
+}
+
 export async function handleStorage(request: Request, env: S): Promise<Response> {
   try {
     const url = new URL(request.url);
     const path = url.pathname;
     const m = request.method;
 
-    if (path === "/_storage/sql/query" && m === "POST") {
-      const body = await readJson<{ sql: string; params?: unknown[] }>(request);
-      if (!body?.sql) return json({ error: "bad_request" }, 400);
-      const { results } = await env.DB.prepare(body.sql).bind(...(body.params ?? [])).all();
-      return json({ results });
-    }
-    if (path === "/_storage/sql/execute" && m === "POST") {
-      const body = await readJson<{ sql: string; params?: unknown[] }>(request);
-      if (!body?.sql) return json({ error: "bad_request" }, 400);
-      const r = await env.DB.prepare(body.sql).bind(...(body.params ?? [])).run();
-      return json({ changes: r.meta.changes ?? 0, lastRowId: r.meta.last_row_id ?? null });
-    }
+    const ownMatch = path.match(/^\/_storage\/sql\/(query|execute)$/);
+    // AWAITED, not returned as a promise, so a D1 rejection (bad SQL) is
+    // caught by this function's catch and answered as storage_error 500.
+    if (ownMatch && m === "POST") return await runSql(env.DB, ownMatch[1] as SqlOp, request);
     // Cross-app data links (migration 0028). Same query/execute surface as the
-    // app's own database, scoped to a source app it has a deployed link to.
-    // Deliberately mirrors the shape above rather than inventing a second API,
-    // so an app author who can read from their own D1 can read from a linked one
-    // without learning anything new.
+    // app's own database (runSql), scoped to a source app it has a deployed
+    // link to.
     const linkMatch = path.match(/^\/_storage\/linked\/([^/]+)\/sql\/(query|execute)$/);
     if (linkMatch && m === "POST") {
       const [, sourceApp, op] = linkMatch;
@@ -177,15 +191,7 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
             "Ask the source app's owner to re-link, then redeploy this app.",
         }, 403);
       }
-      const body = await readJson<{ sql: string; params?: unknown[] }>(request);
-      if (!body?.sql) return json({ error: "bad_request" }, 400);
-      const stmt = linkedDb.prepare(body.sql).bind(...(body.params ?? []));
-      if (op === "query") {
-        const { results } = await stmt.all();
-        return json({ results });
-      }
-      const r = await stmt.run();
-      return json({ changes: r.meta.changes ?? 0, lastRowId: r.meta.last_row_id ?? null });
+      return await runSql(linkedDb, op as SqlOp, request);
     }
     if (path === "/_storage/files" && m === "GET") {
       // R2 caps list() at 1000 keys and sets `truncated` with a cursor — a

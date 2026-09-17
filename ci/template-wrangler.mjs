@@ -1,8 +1,12 @@
 #!/usr/bin/env node
-// Templates a generated app's wrangler.jsonc: substitutes the platform's
-// known placeholder markers (worker name, D1 database name/id, R2 bucket
-// name, Access AUD) with the app's real deploy-time values, just before
-// `wrangler deploy` runs.
+// Templates the platform's injected wrangler configs (gateway/wrangler*.jsonc
+// and gateway/app-worker.jsonc): substitutes the known placeholder markers
+// (worker name, D1 database name/id, R2 bucket name, the identity value:
+// Access AUD or OAuth RS resource) with the app's real deploy-time values,
+// just before `wrangler deploy` runs. The input is always one of those
+// templates: no app repo may carry a wrangler config of its own
+// (ci/check-config.mjs check 1b), and the platform no longer generates
+// inno-{app} repos.
 //
 // This is a config-mutating script for a security-sensitive file, so it is
 // deliberately conservative:
@@ -21,7 +25,15 @@
 //     gateway config's deployed vars say ENVIRONMENT "production" and do not
 //     carry DEV_MOCK_IDENTITY, which is a refusal, not a substitution (R37).
 //
-// Usage: node ci/template-wrangler.mjs <app> <databaseId> <accessAud> [wranglerPath=wrangler.jsonc]
+// Usage, one invocation per injected config (platform-ci.yml picks by preset;
+// the container gateway is the positional, flagless form):
+//   node ci/template-wrangler.mjs <app> <databaseId> <accessAud> [path]                  wrangler.jsonc
+//   node ci/template-wrangler.mjs --mcp-container-gateway <app> <databaseId> <resource> [path]  wrangler.mcp-container.jsonc
+//   node ci/template-wrangler.mjs --worker-gateway <app> <accessAud> [path]              wrangler.worker.jsonc
+//   node ci/template-wrangler.mjs --mcp-gateway <app> <mcpResource> [path]               wrangler.mcp.jsonc
+//   node ci/template-wrangler.mjs --worker-app <app> <databaseId> [path]                 app-worker.jsonc
+// [path] defaults to wrangler.jsonc. Container-shaped deploys also read
+// INNO_IMAGE and INNO_LINKED_DATABASES from the environment (see the CLI block).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { stripJsonComments } from "./check-config.mjs";
@@ -52,9 +64,11 @@ function countMatches(text, re) {
 // A linked binding name is derived by the platform (src/links.ts linkBindingFor)
 // from an app name, so it is always LINKED_ + upper-snake. Re-assert the shape
 // here rather than trusting the payload: this value is interpolated into the
-// deployed config, and the two reserved names below are the app's OWN storage.
+// deployed config, and the mandatory LINKED_ prefix is what keeps a link off
+// the app's own bindings (DATA, FILES, DB, APP, APP_WORKER, PLATFORM): no
+// string that matches this can equal any of them, so no separate reserved
+// set is needed. Widen the prefix and that guarantee goes with it.
 const LINK_BINDING_RE = /^LINKED_[A-Z][A-Z0-9_]*$/;
-const RESERVED_BINDINGS = new Set(["DATA", "FILES", "DB", "APP", "APP_WORKER", "PLATFORM"]);
 
 const LINK_GENERATION_RE = /^[0-9a-f]{32}$/;
 
@@ -82,7 +96,6 @@ export function parseLinkedDatabases(raw) {
     if (typeof binding !== "string" || !LINK_BINDING_RE.test(binding)) {
       throw new Error(`invalid linked binding name: ${JSON.stringify(binding)}`);
     }
-    if (RESERVED_BINDINGS.has(binding)) throw new Error(`linked binding may not shadow ${binding}`);
     if (seen.has(binding)) throw new Error(`duplicate linked binding: ${binding}`);
     seen.add(binding);
     assertDeployValue(`linked ${binding} database_name`, databaseName);
@@ -201,38 +214,25 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud, ima
     );
   }
 
-  // Each marker is matched as a whole literal (name/db/bucket, case-
-  // insensitive only to tolerate an uppercase template variant) or a
+  // Each marker is matched as a whole literal (name/db/bucket) or a
   // key-scoped literal (database_id / ACCESS_AUD, so the two otherwise-
   // identical "REPLACE" values each map to their own real value instead of
   // both receiving the same substitution). None of these patterns can ever
   // match unrelated text such as a comment, because each requires the full
   // quoted marker string (or key+value pair), not the bare word "replace".
+  // Case-sensitive, like every other templater's markers: the input is
+  // always one of the platform's own lowercase templates, and the count
+  // assertions above already refuse a reshaped file, so an uppercase
+  // tolerance here would be a policy the other four paths do not share.
   const markers = [
-    { pattern: /"inno-app-replace"/i, replacement: `"inno-app-${app}"` },
-    { pattern: /"inno-replace-db"/i, replacement: `"inno-${app}-db"` },
-    { pattern: /"inno-replace-data"/i, replacement: `"inno-${app}-data"` },
+    { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
+    { pattern: /"inno-replace-db"/, replacement: `"inno-${app}-db"` },
+    { pattern: /"inno-replace-data"/, replacement: `"inno-${app}-data"` },
     { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${databaseId}"` },
     { pattern: /("ACCESS_AUD"\s*:\s*)"REPLACE"/, replacement: `$1"${accessAud}"` },
     { pattern: /("image"\s*:\s*)"\.\/Dockerfile"/, replacement: `$1"${imageValue}"` },
   ];
-
-  let out = wranglerText;
-  for (const { pattern, replacement } of markers) {
-    if (!pattern.test(out)) {
-      throw new Error(`template marker not found (unexpected template shape): ${pattern}`);
-    }
-    out = out.replace(pattern, replacement);
-  }
-
-  // Post-condition: none of the known marker patterns may still match the
-  // output. This is the last line of defense — if a real marker literal
-  // survives (e.g. because a replacement string coincidentally re-formed
-  // one), we must never deploy a half-templated config.
-  const stillPresent = markers.filter((m) => m.pattern.test(out));
-  if (stillPresent.length > 0) {
-    throw new Error(`template markers remain after substitution: ${stillPresent.map((m) => m.pattern).join(", ")}`);
-  }
+  const out = applyMarkers(wranglerText, markers);
 
   // Cross-app data links (migration 0028). For a CONTAINER app the gateway holds
   // the D1 bindings (the container itself reaches storage over
@@ -244,9 +244,10 @@ export function templateWrangler(wranglerText, { app, databaseId, accessAud, ima
 
   // Enforce workers_dev: false (perimeter hardening) via the shared helper, so
   // the container and worker paths apply the identical rule. The *.workers.dev
-  // URL is NOT behind Cloudflare Access — closing it makes the Access-protected
-  // custom hostname the sole ingress; applied to EVERY app at deploy, including
-  // apps whose committed wrangler.jsonc predates this policy.
+  // URL is NOT behind Cloudflare Access; closing it makes the Access-protected
+  // custom hostname the sole ingress. The input is always the platform's own
+  // template, which already says false: this stays as the belt against a
+  // template edit that drops or changes the key.
   return forceProductionEnvironment(forceWorkersDevFalse(withGenerations, "wrangler.jsonc"), "wrangler.jsonc");
 }
 
@@ -306,9 +307,11 @@ function containerImageValue({ image }) {
   return image;
 }
 
-// Per-marker present -> replace -> absent, matching templateWrangler's
-// discipline: every marker must be found before substitution and gone after
-// (so a half-templated config can never deploy).
+// Per-marker present -> replace -> absent, for all five templaters: every
+// marker must be found before substitution and gone after. The post-condition
+// is the last line of defense: if a real marker literal survives (say because
+// a replacement string coincidentally re-formed one), a half-templated config
+// must never deploy.
 function applyMarkers(text, markers) {
   let out = text;
   for (const { pattern, replacement } of markers) {
@@ -361,10 +364,12 @@ function forceWorkersDevFalse(out, label) {
 // reads, for the same reason forceWorkersDevFalse is: a raw-text check can be
 // fooled by a comment that merely mentions the key.
 //
-// This REFUSES rather than corrects. workers_dev is a policy the platform
-// imposes on a config the app's repo may legitimately have written; a gateway
-// config saying "dev" is a config that did not come from where it should have,
-// and quietly rewriting it would hide that.
+// This REFUSES rather than corrects. Both guards see only the platform's own
+// templates (no app repo may carry a wrangler config, check-config 1b).
+// forceWorkersDevFalse corrects because a dropped or flipped key has exactly
+// one right value; a gateway config saying "dev", or naming the mock var,
+// is a config that did not come from where it should have, and quietly
+// rewriting it would hide that.
 function forceProductionEnvironment(out, label) {
   let config;
   try { config = JSON.parse(stripJsonComments(out)); }

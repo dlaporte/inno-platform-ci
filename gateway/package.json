@@ -2,12 +2,6 @@
   "name": "inno-app",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "test": "echo \"No tests configured — add your own (see CLAUDE.md)\" && exit 0",
-    "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
-  },
   "dependencies": {
     "@cloudflare/containers": "^0.2.4",
     "hono": "^4.13.7",
@@ -15,9 +9,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5",
-    "@types/node": "^26.1.1",
     "typescript": "^5",
-    "vitest": "~3.0",
     "wrangler": "4.132.0"
   }
 }
