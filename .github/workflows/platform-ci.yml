@@ -3,14 +3,17 @@ name: Platform CI
 # Reusable workflow: the platform's safety gates + deploy job.
 #
 # ADAPTING TO YOUR OWN ACCOUNTS? This file hardcodes this deployment's
-# identifiers — re-point them (OPERATIONS §4.6 step 6): BROKER_URL, the five
-# cross-repo `repository:` checkout refs (all <owner>/inno-platform-ci — the
-# public contract mirror), and CLOUDFLARE_ACCOUNT_ID in the deploy job. This
-# file itself lives in BOTH repos: source-of-truth here in inno-platform, and
-# published byte-for-byte into inno-platform-ci by scripts/publish-mirror.sh
-# — the copy the checkouts below actually fetch.
+# identifiers; re-point them (OPERATIONS §4.6 step 6): BROKER_URL, the six
+# cross-repo `repository:` checkout refs (all <owner>/inno-platform-ci, the
+# public contract mirror: five fetch the ci/ scripts, one the promoted
+# gateway), and the one CLOUDFLARE_ACCOUNT_ID in the deploy job's env. Counts
+# drift, so run this rather than trusting them:
+#   grep -n '^ *repository: \|^ *CLOUDFLARE_ACCOUNT_ID:' .github/workflows/*.yml
+# This file itself lives in BOTH repos: source-of-truth here in inno-platform,
+# published byte-for-byte into dlaporte/inno-platform-ci by
+# scripts/publish-mirror.sh (see OPERATIONS §7.2.2), and that mirror copy is
+# the one the checkouts below actually fetch.
 #
-# Published byte-for-byte to dlaporte/inno-platform-ci (see OPERATIONS §7.2.2).
 # This workflow is invoked (via `uses:`) by the thin caller workflow in each
 # app's USER-OWNED repo — registered via register_app (OPERATIONS §7.2.4), whose
 # `.github/workflows/deploy.yml` passes `with: app:`. (The template ships a
@@ -833,6 +836,21 @@ jobs:
     permissions:
       id-token: write   # mints a broker OIDC token
       contents: read
+    # The two NON-secret values every wrangler call in this job needs, declared
+    # once here so the push step and both deploy steps get them by
+    # construction instead of by three copies. The deploy token itself stays
+    # STEP-scoped (never job-level): test/workflow-lint.node.test.ts pins both.
+    env:
+      # The minted deploy token is narrowly scoped and cannot call
+      # /memberships to auto-discover the account, so pin the account id
+      # explicitly (non-secret, it appears in dashboard URLs). Otherwise
+      # wrangler fails with an auth error on the membership lookup.
+      CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24
+      # Pinned explicitly: wrangler adopts unset env keys from a cwd .env
+      # file. The gate rejects committed .env files (belt), and this pin makes
+      # the highest-value key unstealable even if one ever slipped through
+      # (suspenders).
+      CLOUDFLARE_API_BASE_URL: https://api.cloudflare.com/client/v4
     steps:
       - name: Checkout app repo (the caller)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -908,9 +926,23 @@ jobs:
           # bundled from there any more, and the gate (check 7) rejects any
           # author file under it. Belt to those suspenders.
           rm -rf src
-          # The function-shaped APP Worker still builds from the CHECKOUT
-          # (main: app/index.ts is author code by design), so its build inputs
-          # stay at the repo root exactly as before this change.
+          # This root copy has two consumers, and neither is optional, so do
+          # not move it under the function branch or trim the file list
+          # (package.json has no known consumer and rides along until a
+          # canary deploy says otherwise).
+          # (1) Every shape: the setup-node step below runs with `cache: npm`
+          # and no cache-dependency-path, so it looks for a lock file at the
+          # workspace root and fails the step when none is there. The app
+          # checkout cannot carry one (config-integrity check 8 forbids the
+          # root build inputs), so this package-lock.json is what keeps that
+          # step green, and the key it hashes is the gateway lock $GW installs
+          # from, which is the right one. Nothing at the root is installed any
+          # more (R02). Making the dependency explicit with
+          # cache-dependency-path is a follow-up that needs a canary deploy.
+          # (2) Function shape: the app Worker still builds from the CHECKOUT
+          # (main: app/index.ts is author code by design) and app-worker.jsonc
+          # pins no tsconfig, so esbuild's nearest-tsconfig lookup from
+          # app/index.ts falls through to this root tsconfig.json.
           cp gateway-src/gateway/package.json gateway-src/gateway/package-lock.json gateway-src/gateway/tsconfig.json .
           if [ "$SHAPE" = "function" ]; then
             [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type — promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
@@ -1104,7 +1136,6 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
-          CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24
           APP: ${{ needs.policy.outputs.app }}
         run: |
           set -e
@@ -1112,7 +1143,7 @@ jobs:
           # commit that produced the image.
           tag="inno-$APP:${GITHUB_SHA:0:12}"
           docker tag app-under-test "$tag"
-          CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4" "$GW/node_modules/.bin/wrangler" containers push "$tag"
+          "$GW/node_modules/.bin/wrangler" containers push "$tag"
           remote="registry.cloudflare.com/$CLOUDFLARE_ACCOUNT_ID/$tag"
           digest="$(docker image inspect --format '{{json .RepoDigests}}' "$remote" | tr ',' '\n' | tr -d '"[]' | grep "^registry.cloudflare.com/$CLOUDFLARE_ACCOUNT_ID/inno-$APP@sha256:" | head -n1)"
           if [ -z "$digest" ]; then
@@ -1158,7 +1189,7 @@ jobs:
         run: node inno-platform-ci/ci/template-wrangler.mjs --mcp-container-gateway "$APP" "$DATABASE_ID" "$OAUTH_RS_RESOURCE" "$GW/wrangler.jsonc"
 
       - name: Template function configs (gateway + app worker)
-        if: needs.policy.outputs.shape == 'function' && needs.policy.outputs.perimeter == 'sso'
+        if: needs.policy.outputs.function_shaped == 'true' && needs.policy.outputs.perimeter == 'sso'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -1176,7 +1207,7 @@ jobs:
       # Access application). OAUTH_RS_RESOURCE comes from the broker so the
       # value the gateway pins a token's audience against is never rebuilt in CI.
       - name: Template mcp configs (gateway + app worker)
-        if: needs.policy.outputs.shape == 'function' && needs.policy.outputs.perimeter == 'oauth-rs'
+        if: needs.policy.outputs.function_shaped == 'true' && needs.policy.outputs.perimeter == 'oauth-rs'
         env:
           APP: ${{ needs.policy.outputs.app }}
           DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
@@ -1213,20 +1244,13 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
-          # The minted deploy token is narrowly scoped and cannot call
-          # /memberships to auto-discover the account, so pin the account id
-          # explicitly (non-secret — it appears in dashboard URLs). Otherwise
-          # wrangler fails with code 9106 (auth) on the membership lookup.
-          CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24
           # The platform-configured container sleep timeout (config store,
           # app-overridable); the gateway's AppContainer reads it at
           # construction. Validated server-side (duration grammar) before the
           # broker returns it.
           SLEEP_AFTER: ${{ steps.deploy_token.outputs.sleep_after }}
-        # CLOUDFLARE_API_BASE_URL pinned explicitly: wrangler adopts unset env
-        # keys from a cwd .env file — the gate rejects committed .env files
-        # (belt), and this pin makes the highest-value key unstealable even if
-        # one ever slipped through (suspenders).
+        # CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_BASE_URL come from the job's
+        # env (see its comment).
         #
         # Invoked as "$GW/node_modules/.bin/wrangler", not `npx wrangler` and
         # not `cd "$GW" &&`: the checkout root has no node_modules/wrangler of
@@ -1235,7 +1259,8 @@ jobs:
         # unpinned, with CLOUDFLARE_API_TOKEN already in the environment — the
         # exact class R01 closed. --config is the absolute path so this runs
         # correctly regardless of cwd.
-        run: CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4" "$GW/node_modules/.bin/wrangler" deploy --config "$GW/wrangler.jsonc" --var "SLEEP_AFTER:$SLEEP_AFTER"
+        run: |
+          "$GW/node_modules/.bin/wrangler" deploy --config "$GW/wrangler.jsonc" --var "SLEEP_AFTER:$SLEEP_AFTER"
 
       # Function-shaped (the 'function' and 'mcp-function' presets): deploy the app's own Worker FIRST (so
       # the gateway's service binding resolves), then the gateway. The app Worker
@@ -1248,13 +1273,13 @@ jobs:
         if: needs.policy.outputs.function_shaped == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
-          CLOUDFLARE_ACCOUNT_ID: 6f9eae24f54d6b22948bf554351b8d24
         run: |
           set -e
           # The app Worker's deps were installed in the token-less step above
           # (see its comment). Nothing in this step may read author-owned
           # package-manager configuration: only wrangler runs here.
-          export CLOUDFLARE_API_BASE_URL="https://api.cloudflare.com/client/v4"
+          # CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_BASE_URL come from the
+          # job's env (see its comment).
           # Both deploys run via "$GW/node_modules/.bin/wrangler", never `npx
           # wrangler`: the checkout root has no node_modules/wrangler of its
           # own (R02 moved the gateway's install to $GW), and `npx wrangler`

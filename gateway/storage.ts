@@ -1,15 +1,23 @@
+import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
 // PLATFORM added for Connections v1's /_connections/{name} proxy below. It is
 // optional on Env (present only on the two oauth-rs wrangler variants — see
 // env.ts), so a sso-perimeter app simply has it undefined and the route below
-// answers 501 rather than throwing.
+// answers 501 rather than throwing. GATEWAY_INTROSPECT_KEY is the proof of
+// gateway-hood linkStillLive presents on /_links/check; optional on Env for
+// the same provisioning reason, and its absence fails that check closed.
 // Not Pick<Env, …>: DB/FILES are optional on Env because the function-shaped
 // gateway variants don't bind them, but handleStorage is reachable ONLY as
 // AppContainer's storage.internal outbound handler — i.e. only on the
 // container-shaped deploys, where both always exist. Stating that here keeps
 // the narrowing at the one place the invariant actually holds (index.ts's
 // outboundByHost registration) instead of scattering `!` through this file.
-export type StorageEnv = { DB: D1Database; FILES: R2Bucket; PLATFORM?: Fetcher };
+export type StorageEnv = {
+  DB: D1Database;
+  FILES: R2Bucket;
+  PLATFORM?: Fetcher;
+  GATEWAY_INTROSPECT_KEY?: string;
+};
 type S = StorageEnv;
 
 // Same grammar the platform enforces for a connection name (src/connections/store.ts
@@ -23,9 +31,6 @@ const CONNECTION_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
 // Hand-written twin of src/routes/links.ts's LINKS_CHECK_PATH (gateway/ builds
 // separately) — pinned by test/constant-parity.node.test.ts.
 const LINK_CHECK_PATH = "/_links/check";
-// Twin of src/routes/mcp-introspect.ts's GATEWAY_KEY_HEADER — parity-pinned
-// alongside the copy in gateway/mcp-auth.ts.
-const LINK_GATEWAY_KEY_HEADER = "x-inno-gateway-key";
 
 // Per-isolate memo of the platform's answer. A linked-storage call is a hot
 // path for a consumer app, and the platform's answer changes only when someone
@@ -64,15 +69,15 @@ async function linkStillLive(env: S, sourceApp: string): Promise<boolean | null>
   const now = Date.now();
   const hit = linkCheckCache.get(generation);
   if (hit && now - hit.at < LINK_CHECK_TTL_MS) return hit.live;
-  const key = (env as unknown as { GATEWAY_INTROSPECT_KEY?: string }).GATEWAY_INTROSPECT_KEY;
+  const key = env.GATEWAY_INTROSPECT_KEY;
   if (!key) {
     console.warn("gateway: linked storage carries a generation but no GATEWAY_INTROSPECT_KEY — refusing");
     return false;
   }
   try {
-    const res = await env.PLATFORM.fetch(`https://platform.internal${LINK_CHECK_PATH}`, {
+    const res = await env.PLATFORM.fetch(`${PLATFORM_ORIGIN}${LINK_CHECK_PATH}`, {
       method: "POST",
-      headers: { "content-type": "application/json", [LINK_GATEWAY_KEY_HEADER]: key },
+      headers: { "content-type": "application/json", [GATEWAY_KEY_HEADER]: key },
       body: JSON.stringify({ source_app: sourceApp, generation }),
     });
     if (!res.ok) {
@@ -233,7 +238,7 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       if (!env.PLATFORM) return json({ error: "connections_unavailable" }, 501);
       const name = path.slice("/_connections/".length);
       if (!CONNECTION_NAME_RE.test(name)) return json({ error: "bad_connection_name" }, 400);
-      return env.PLATFORM.fetch(`https://platform.internal${CONNECTIONS_FETCH_PATH}`, {
+      return env.PLATFORM.fetch(`${PLATFORM_ORIGIN}${CONNECTIONS_FETCH_PATH}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ assertion: request.headers.get("x-caller-assertion") ?? "", connection: name }),

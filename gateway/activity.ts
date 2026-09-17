@@ -1,7 +1,8 @@
 // Human-activity touch (spec 2026-08-18-human-activity-idle-clock): when an
 // authenticated request is real human use, tell the platform so the app's
 // idle clock advances. Wired in index.ts after each perimeter's auth.
-//
+import { PLATFORM_ORIGIN } from "./platform";
+
 // gateway/ builds separately from src/ and cannot import it — TOUCH_PATH is a
 // deliberately duplicated constant (twin: src/routes/activity.ts), pinned by
 // test/constant-parity.node.test.ts.
@@ -75,7 +76,7 @@ export async function mcpWorkRequest(req: Request): Promise<boolean> {
 // Fire-and-forget: a touch failure must never affect the user's request.
 export async function sendTouch(platform: Fetcher, payload: Record<string, string>): Promise<void> {
   try {
-    const res = await platform.fetch(`https://platform.internal${TOUCH_PATH}`, {
+    const res = await platform.fetch(`${PLATFORM_ORIGIN}${TOUCH_PATH}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
     });
     if (!res.ok) console.warn(`gateway: activity touch refused (${res.status})`);

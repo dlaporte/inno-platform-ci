@@ -4,12 +4,10 @@
 // platform-owned build input vendored into the app repo (gateway source,
 // worker build inputs, and ANY wrangler config; the platform injects all of
 // them at build time from the promoted gateway.ref), nothing of the author's
-// under src/ (the gateway is bundled from there), and no package-manager
-// configuration at any depth (npm expands ${VAR} from the environment into
-// it). See checkConfig's own
-// note on the numbering: checks 2-6 (which inspected an app-owned
-// wrangler.jsonc for auth mode and container image/limits) were retired when
-// that file stopped being app-owned.
+// under src/ (reserved for the gateway, which the deploy builds outside the
+// checkout), and no package-manager configuration at any depth (npm expands
+// ${VAR} from the environment into it). The live checks are 1, 1b, 6, 6b, 7,
+// 7b and 8; see checkConfig's own note on the numbering.
 //
 // Usage: node ci/check-config.mjs <app-dir>
 // Exits 0 if compliant, 1 (with violations printed) otherwise.
@@ -105,13 +103,13 @@ export function stripJsonComments(text) {
 }
 
 
-// Worker build-input files that are entirely template-owned: the app author
-// has no legitimate reason to modify them (the app's own code lives in the
-// CONTAINER under app/, not in the worker), and `npm ci` + `wrangler deploy`
-// both execute code sourced from these files while the deploy job holds an
-// account-wide Cloudflare token. Pinned byte-identical to the template.
-// Mirrored by the template-drift reverse-walk job in
-// .github/workflows/ci.yml — update both together.
+// Worker build-input files that are platform-owned: the deploy job copies the
+// promoted gateway's package.json, package-lock.json and tsconfig.json into
+// the checkout root at build time (they feed setup-node's cache key and the
+// function-shaped app Worker's tsconfig lookup), and wrangler runs with that
+// root as its cwd. A vendored copy would shadow them and is always stale, so
+// check 8 rejects any of them outright. They are not template files any more;
+// .github/workflows/ci.yml's template-drift reverse walk says so too.
 const PINNED_BUILD_INPUT_FILES = ["package.json", "package-lock.json", "tsconfig.json"];
 
 // wrangler discovers its config in the app root as `wrangler.json ??
@@ -127,10 +125,11 @@ const PINNED_BUILD_INPUT_FILES = ["package.json", "package-lock.json", "tsconfig
 const COMPETING_WRANGLER_RE = /^wrangler\.(json|toml|.+\.(json|jsonc|toml))$/;
 
 // Every package manager's project-level configuration, rejected at the repo
-// ROOT: wrangler and the platform's own `npm ci` run there, the build inputs
-// are pinned there, and a .pnpmfile.cjs is arbitrary JavaScript an install
-// would execute. At depth only .npmrc matters (check 6b): npm is the one
-// package manager the deploy job runs inside the author-owned app/.
+// ROOT: wrangler runs with the checkout root as its cwd, the deploy job copies
+// the gateway's build inputs there at build time (no root install happens any
+// more, R02), and a .pnpmfile.cjs is arbitrary JavaScript an install would
+// execute. At depth only .npmrc matters (check 6b): npm is the one package
+// manager the deploy job runs inside the author-owned app/.
 const ROOT_PACKAGE_MANAGER_CONFIG_RE = /^(\.npmrc|\.yarnrc|\.yarnrc\.yml|\.pnpmfile\.cjs|pnpm-workspace\.yaml|bunfig\.toml)$/;
 
 // Depth-first listing of everything below `root` as repo-relative POSIX paths.
@@ -166,9 +165,12 @@ function* walkTree(root, rel = "") {
  * copies, plus the repo-local rules (CLAUDE.md headers, no package-manager
  * config, no wrangler cache dirs).
  *
- * (Check numbering has gaps — 1, 1b, 7, 7b, 8: checks 2–6 were retired when
- * wrangler.jsonc stopped being app-owned. The survivors keep their original
- * numbers so existing references don't shift.)
+ * (Check numbering has gaps: the live checks are 1, 1b, 6, 6b, 7, 7b and 8.
+ * The original checks 2-6 inspected an app-owned wrangler.jsonc and were
+ * retired when that file stopped being app-owned; R01 then reused 6 for the
+ * root package-manager-config and .env rejection, which runs inside check
+ * 1b's scan of the app root, with 6b as its nested-.npmrc companion. The
+ * survivors keep their original numbers so existing references don't shift.)
  *
  * @param {string} appDir
  * @returns {{ok: boolean, violations: string[]}}
@@ -262,20 +264,22 @@ export function checkConfig(appDir) {
   }
 
   // --- Check 6b: a nested .npmrc ANYWHERE in the tree ---
-  // Check 6 inspects the root because that is where wrangler and the root
-  // `npm ci` run. The deploy job runs exactly one package manager inside the
-  // author-owned app/ directory: npm (`npm ci` / `npm install`, in the
-  // function-shaped install step) — nothing in CI runs yarn, pnpm or bun
-  // there. npm reads the PROJECT .npmrc of the directory it is invoked in and
-  // expands ${VAR} from the environment into it, so a nested .npmrc is an
-  // unpinned, credential-exfiltrating deploy-build input the same way the
-  // root one is. Other package managers' config at depth — app/.yarnrc.yml
-  // (yarn berry's nodeLinker), app/pnpm-workspace.yaml (a pnpm workspace),
-  // app/bunfig.toml — is legitimate inside a container build and is left
-  // alone; only their ROOT copies are rejected, by check 6 above. NOT .env at
-  // depth either: wrangler reads .env from its cwd (the root, which check 6
-  // covers) and npm never reads it, so a nested .env.example is harmless and
-  // common.
+  // Check 6 inspects the root because that is where wrangler runs (no root
+  // install happens any more: the gateway's own `npm ci` runs in a
+  // platform-owned directory outside the checkout, R02). The deploy job runs
+  // exactly one package manager inside the author-owned app/ directory: npm
+  // (`npm ci` in the token-less function-shaped install step; the `npm
+  // install` fallback is gone since R11), and nothing in CI runs yarn, pnpm
+  // or bun there. npm reads the PROJECT .npmrc of the directory it is
+  // invoked in and expands ${VAR} from the environment into it, so a nested
+  // .npmrc is an unpinned, credential-exfiltrating deploy-build input the
+  // same way the root one is. Other package managers' config at depth —
+  // app/.yarnrc.yml (yarn berry's nodeLinker), app/pnpm-workspace.yaml (a
+  // pnpm workspace), app/bunfig.toml — is legitimate inside a container
+  // build and is left alone; only their ROOT copies are rejected, by check 6
+  // above. NOT .env at depth either: wrangler reads .env from its cwd (the
+  // root, which check 6 covers) and npm never reads it, so a nested
+  // .env.example is harmless and common.
   //
   // The walk never follows symlinks (readdir types + lstat), fails closed on
   // type (a symlink NAMED .npmrc is rejected without resolving it), skips

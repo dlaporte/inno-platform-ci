@@ -29,6 +29,7 @@
 import type { Env } from "./env";
 import type { AccessIdentity } from "./access";
 import { GROUP_PREFIX } from "./access";
+import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
 // Upper bound on how long a positive introspection is reused. This is the
 // revocation lag: a grant revoked at the platform keeps working in an already-
@@ -145,15 +146,11 @@ async function cacheKeyFor(token: string, resource: string): Promise<string> {
 // pinned by test/constant-parity.node.test.ts (TOUCH_PATH-style).
 const APP_INTROSPECT_PATH = "/app-introspect";
 
-// Twin of src/routes/mcp-introspect.ts's GATEWAY_KEY_HEADER — parity-pinned by
-// test/constant-parity.node.test.ts alongside the path above.
-const GATEWAY_KEY_HEADER = "x-inno-gateway-key";
-
 async function introspectViaPlatform(
   env: Env, token: string, resource: string,
 ): Promise<IntrospectionResponse> {
   try {
-    const res = await env.PLATFORM!.fetch(`https://platform.internal${APP_INTROSPECT_PATH}`, {
+    const res = await env.PLATFORM!.fetch(`${PLATFORM_ORIGIN}${APP_INTROSPECT_PATH}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
