@@ -20,7 +20,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { isMainModule } from "./cli.mjs";
+import { isMainModule, logSafe } from "./cli.mjs";
 
 const DAY_MS = 86_400_000;
 
@@ -190,8 +190,18 @@ export async function main({ appDir, thresholdDays } = {}) {
     return 0;
   }
   const { violations, checked, skipped, unpinnedNpm } = await checkDepAge({ appDir, thresholdDays });
+  // logSafe on the name and the version, not on `ecosystem` (a literal this
+  // script chose). Both come from the app's own package-lock.json or
+  // requirements.txt, parsed here before npm or pip has validated anything: a
+  // JSON key may contain a newline, and a newline inside a workflow command
+  // ends it and forges a clean second command line in the run's log. Same
+  // class ci/deploy-finalize.mjs documents for the declaration file.
+  //
+  // console.log is correct HERE and must stay: nothing parses this script's
+  // stdout. Do not harmonise it with deploy-finalize.mjs, whose stdout IS
+  // piped into `jq` under `set -e` and whose warnings must be on stderr.
   for (const s of skipped) {
-    console.log(`::warning title=Dependency age unknown::${s.ecosystem}:${s.name}@${s.version} — no publish date from the registry; skipped`);
+    console.log(`::warning title=Dependency age unknown::${s.ecosystem}:${logSafe(s.name)}@${logSafe(s.version)} — no publish date from the registry; skipped`);
   }
   // Reaching here means an admin explicitly set safety.min_release_age_days —
   // they asked for a cooldown. Without a committed lockfile there are no exact
@@ -218,7 +228,10 @@ export async function main({ appDir, thresholdDays } = {}) {
   if (violations.length > 0) {
     console.error(`dep-age: ${violations.length} dependency version(s) younger than the ${thresholdDays}-day cooldown:`);
     for (const v of violations) {
-      console.error(`  - ${v.ecosystem}:${v.name}@${v.version} published ${v.ageDays} day(s) ago`);
+      // logSafe for the same reason as the skipped-warning above: Actions
+      // reads workflow commands off stderr too, so an author-chosen newline
+      // in a package name forges one from this line just as well.
+      console.error(`  - ${v.ecosystem}:${logSafe(v.name)}@${logSafe(v.version)} published ${v.ageDays} day(s) ago`);
     }
     console.error("Pin an older, vetted version, or ask a platform admin to lower safety.min_release_age_days for this app.");
   }

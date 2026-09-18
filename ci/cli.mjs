@@ -44,3 +44,35 @@ export function parseIntegerArg(label, raw) {
   }
   return n;
 }
+
+/**
+ * Flatten control bytes out of a value and bound its length, for anything a
+ * ci/ script interpolates into a GitHub Actions log line or, especially, into
+ * a workflow command.
+ *
+ * A workflow command (`::warning title=...::`, `::error ...::`) is terminated
+ * by a newline, so an author-controlled value carrying one forges a clean
+ * second command line in the run's log. Node's JSON.parse error message
+ * embeds a snippet of the RAW input, newlines and all, and a package name or
+ * an advisory id is read out of the app's own repository before npm or pip
+ * has validated anything. Every such interpolation goes through here first.
+ *
+ * CROSS-BUILD TWIN of `flattenControl` in `src/util.ts`. It cannot import it:
+ * ci/ ships standalone to the public mirror repo and imports nothing from
+ * src/, by standing constraint (ci/broker-post.mjs's header states the same
+ * rule for the broker helper). test/constant-parity.node.test.ts pins the two
+ * to the same behaviour. The length bound is this side's own addition,
+ * because every caller here is writing exactly one log line, whereas src/
+ * leaves the bound to each caller.
+ *
+ * The character class is written as ESCAPES, never as raw bytes: an editing
+ * tool flattened this exact class into literal control bytes on 2026-09-18,
+ * where it stayed invisible to tsc and to the whole suite. A scan of the
+ * committed bytes is the only instrument that finds that, and
+ * test/control-bytes.node.test.ts is that scan.
+ *
+ * @param {unknown} s - the value to flatten
+ * @param {number} [n] - maximum length of the result
+ * @returns {string}
+ */
+export const logSafe = (s, n = 200) => String(s).replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, n);

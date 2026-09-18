@@ -140,6 +140,11 @@ const ROOT_PACKAGE_MANAGER_CONFIG_RE = /^(\.npmrc|\.yarnrc|\.yarnrc\.yml|\.pnpmf
 // vanished between being listed and being read, a genuine race) is the only
 // error swallowed — anything else (EACCES, EIO, ...) is rethrown, so the gate
 // crashes red rather than silently passing a subtree it could not inspect.
+//
+// `isSymlink` is yielded because readdir already answered that question to
+// decide whether to recurse (below), and check 1c needs the same answer: an
+// lstat per entry in the caller asked the filesystem a second time for a fact
+// this loop already had.
 function* walkTree(root, rel = "") {
   const abs = rel ? join(root, rel) : root;
   let entries;
@@ -152,8 +157,9 @@ function* walkTree(root, rel = "") {
   for (const entry of entries) {
     if (rel === "" && entry.name === ".git") continue;
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-    yield { rel: childRel, name: entry.name };
-    if (entry.isDirectory() && !entry.isSymbolicLink() && entry.name !== "node_modules") yield* walkTree(root, childRel);
+    const isSymlink = entry.isSymbolicLink();
+    yield { rel: childRel, name: entry.name, isSymlink };
+    if (entry.isDirectory() && !isSymlink && entry.name !== "node_modules") yield* walkTree(root, childRel);
   }
 }
 
@@ -267,6 +273,14 @@ export function checkConfig(appDir) {
     }
   }
 
+  // --- Checks 1c and 6b: ONE walk of the app tree ---
+  // Both rules are per-entry and independent of each other, so they share the
+  // single depth-first walk instead of each making a full one of its own.
+  // They also shared, by copy, the same fail-closed wrapper below, whose two
+  // messages differed by a single clause: one unreadable directory used to
+  // produce two near-identical violations here for one cause, on top of check
+  // 7's own targeted one. There is now one wrapper and one message.
+  //
   // --- Check 1c: no directory symlinks anywhere in the tree ---
   // walkTree deliberately does not follow symlinks and does not descend
   // node_modules (see its own comment). Both are correct in isolation, and
@@ -284,49 +298,19 @@ export function checkConfig(appDir) {
   // A symlink to a FILE stays legal: every by-name check already lstats and
   // fails closed on type, so a file link cannot hide content from anything.
   //
-  // Read with lstat (never followed) and classified by what the link points
-  // at. A DANGLING link is rejected too: what it resolves to is decided by
-  // the checkout, not by this gate, so it must not be given the benefit of
-  // the doubt.
+  // Never followed: walkTree's readdir already reports whether an entry is a
+  // symlink (that is the same answer it uses to decide not to recurse), and
+  // the link is then classified by what it points AT with a stat. A DANGLING
+  // link is rejected too: what it resolves to is decided by the checkout, not
+  // by this gate, so it must not be given the benefit of the doubt.
   //
-  // walkTree rethrows anything but ENOENT, and this is the FIRST check that
-  // walks the whole tree, so an unreadable directory anywhere below appDir
-  // (e.g. src/ with its permission bits stripped) would otherwise escape as
-  // an uncaught exception before check 6b or check 7 get a chance to run at
-  // all. Catch it here and fail closed with a violation, same rule as check
-  // 6b's own wrapping below.
-  try {
-    for (const { rel } of walkTree(appDir)) {
-      const abs = join(appDir, rel);
-      let st;
-      try {
-        st = lstatSync(abs);
-      } catch (err) {
-        if (err.code === "ENOENT") continue;
-        throw err;
-      }
-      if (!st.isSymbolicLink()) continue;
-      let targetIsDir = null;                 // null = unresolvable (dangling)
-      try {
-        targetIsDir = statSync(abs).isDirectory();
-      } catch {
-        targetIsDir = null;
-      }
-      if (targetIsDir === false) continue;    // a link to a file is allowed
-      const target = (() => { try { return readlinkSync(abs); } catch { return "?"; } })();
-      violations.push(
-        `${rel} is a symlink to ${targetIsDir === null ? "an unresolvable path" : "a directory"} ` +
-          `(-> ${target}); directory symlinks must not be committed, because the config gate ` +
-          `inspects the tree without following them and content behind one is never checked`,
-      );
-    }
-  } catch (err) {
-    violations.push(
-      `config-integrity check could not fully inspect the app tree for directory symlinks (${err.path ?? appDir}: ` +
-        `${err.code ?? err}); a directory the gate cannot read fails closed`,
-    );
-  }
-
+  // walkTree rethrows anything but ENOENT, and this walk runs before check 7,
+  // so an unreadable directory anywhere below appDir (e.g. src/ with its
+  // permission bits stripped) would otherwise escape as an uncaught exception
+  // before check 7 gets a chance to report its own targeted message for the
+  // same directory. Catch it here and fail closed with one violation covering
+  // both rules.
+  //
   // --- Check 6b: a nested .npmrc ANYWHERE in the tree ---
   // Check 6 inspects the root because that is where wrangler runs (no root
   // install happens any more: the gateway's own `npm ci` runs in a
@@ -349,22 +333,33 @@ export function checkConfig(appDir) {
   // root, which check 6 covers) and npm never reads it, so a nested
   // .env.example is harmless and common.
   //
-  // The walk never follows symlinks (readdir types + lstat), fails closed on
-  // type (a symlink NAMED .npmrc is rejected without resolving it), skips
-  // .git, and does not descend into node_modules — nothing under a
-  // node_modules directory is examined at all, because npm resolves its
-  // project rc from the directory it is run in, never from inside
-  // node_modules.
-  //
-  // walkTree rethrows anything but ENOENT (see its own comment), so a
-  // directory this walk cannot read must not silently pass as empty — but it
-  // also must not abort checkConfig itself before check 7 gets a chance to
-  // report its own targeted message for the same directory (e.g. an
-  // unreadable src/). Catch it here and fail closed with a violation.
+  // The walk never follows symlinks (readdir types), fails closed on type (a
+  // symlink NAMED .npmrc is rejected without resolving it), skips .git, and
+  // does not descend into node_modules — nothing under a node_modules
+  // directory is examined at all, because npm resolves its project rc from
+  // the directory it is run in, never from inside node_modules.
   try {
-    for (const { rel, name } of walkTree(appDir)) {
-      if (!rel.includes("/")) continue;
-      if (name === ".npmrc") {
+    for (const { rel, name, isSymlink } of walkTree(appDir)) {
+      // check 1c: a committed directory symlink
+      if (isSymlink) {
+        const abs = join(appDir, rel);
+        let targetIsDir = null;               // null = unresolvable (dangling)
+        try {
+          targetIsDir = statSync(abs).isDirectory();
+        } catch {
+          targetIsDir = null;
+        }
+        if (targetIsDir !== false) {          // a link to a file is allowed
+          const target = (() => { try { return readlinkSync(abs); } catch { return "?"; } })();
+          violations.push(
+            `${rel} is a symlink to ${targetIsDir === null ? "an unresolvable path" : "a directory"} ` +
+              `(-> ${target}); directory symlinks must not be committed, because the config gate ` +
+              `inspects the tree without following them and content behind one is never checked`,
+          );
+        }
+      }
+      // check 6b: a nested .npmrc (the root one is check 6's, above)
+      if (name === ".npmrc" && rel.includes("/")) {
         violations.push(
           `${rel} must not be committed — npm reads the .npmrc of whichever directory it runs in ` +
             `and expands \${VAR} from the environment into it (an unpinned deploy-build input); remove it`,

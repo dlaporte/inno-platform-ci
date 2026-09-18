@@ -1,6 +1,7 @@
 // Human-activity touch (spec 2026-08-18-human-activity-idle-clock): when an
 // authenticated request is real human use, tell the platform so the app's
 // idle clock advances. Wired in index.ts after each perimeter's auth.
+import { readBoundedResultFrom } from "./bounded-body";
 import { PLATFORM_ORIGIN } from "./platform";
 
 // gateway/ builds separately from src/ and cannot import it — TOUCH_PATH is a
@@ -39,36 +40,18 @@ export function markTouched(host: string, nowMs: number): void {
 // The clone read is byte-counted and abandoned past PEEK_MAX_BYTES: the old
 // form checked the declared Content-Length and then buffered the clone whole,
 // so a chunked body of any size was peeked in full (its own comment said so).
-// Over the cap still counts as WORK — a large POST /mcp under a real user
-// token is almost certainly a tools/call payload.
+// That loop now lives once, in bounded-body.ts, because storage.ts needs the
+// same discipline and had none.
 export async function mcpWorkRequest(req: Request): Promise<boolean> {
-  const declared = Number(req.headers.get("content-length") ?? "0");
-  if (declared > PEEK_MAX_BYTES) return true;
-  const body = req.clone().body;
-  if (!body) return false;
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    const reader = body.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      total += value.byteLength;
-      if (total > PEEK_MAX_BYTES) {
-        await reader.cancel().catch(() => {});
-        return true;
-      }
-      chunks.push(value);
-    }
-  } catch {
-    return false;
-  }
-  const merged = new Uint8Array(total);
-  let off = 0;
-  for (const ch of chunks) { merged.set(ch, off); off += ch.byteLength; }
+  const read = await readBoundedResultFrom(req.clone(), PEEK_MAX_BYTES);
+  // The two give-up reasons get OPPOSITE answers here, which is why the
+  // reader reports which one it was. Over the cap still counts as WORK: a
+  // large POST /mcp under a real user token is almost certainly a tools/call
+  // payload. A body we could not read is not work (the app will reject it
+  // anyway), the same answer an unparseable one gets below.
+  if (!read.ok) return read.reason === "over-cap";
   let parsed: unknown;
-  try { parsed = JSON.parse(new TextDecoder().decode(merged)); } catch { return false; }
+  try { parsed = JSON.parse(new TextDecoder().decode(read.bytes)); } catch { return false; }
   const items = Array.isArray(parsed) ? parsed : [parsed];
   return items.some((m) => WORK_METHODS.has((m as { method?: string })?.method ?? ""));
 }

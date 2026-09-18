@@ -16,7 +16,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { brokerPost } from "./broker-post.mjs";
-import { isMainModule, parseIntegerArg } from "./cli.mjs";
+import { isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // A FAILURE-SHAPE guard, not a security bound. The platform already refuses an
 // oversized body at 64 KiB (readAppBody's DEFAULT_MAX_BODY_BYTES), but it does
@@ -28,21 +28,10 @@ import { isMainModule, parseIntegerArg } from "./cli.mjs";
 // (32 names x [64-char name + 200-char description + syntax] is about 10 KB)
 // and half the broker's body cap, so it can never refuse a valid file and can
 // never be the thing that trips the broker's bound.
-// test/doc-parity.node.test.ts pins the relationship to DECLARATION_LIMIT and
+// test/doc-parity.node.test.ts pins the relationship to APP_VARIABLE_LIMIT and
 // DESCRIPTION_MAX; this constant is NOT derived, because ci/ ships standalone
 // in the public mirror and imports nothing from src/ on purpose.
 export const MAX_DECLARATION_BYTES = 32 * 1024;
-
-// Mirrors logSafe in src/routes/deploy.ts and boundActor in src/audit.ts. A
-// third copy is forced by the mirror's zero-import rule (see
-// ci/broker-post.mjs's header). Node's JSON.parse error message embeds a
-// snippet of the RAW input, newlines and all, so without this a file that
-// opens with a newline and a forged workflow command produces that command as
-// its own line in the deploy log. That is the same log-forgery class the
-// platform side of this feature closed.
-// The character class is written as ESCAPES, never as raw bytes: see
-// test/control-bytes.node.test.ts for what happened the last time.
-const logSafe = (s, n = 200) => String(s).replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, n);
 
 /**
  * Read `app/inno-variables.json` relative to `root`, the app checkout.
@@ -85,20 +74,30 @@ export function readDeclarationFile(root = ".") {
  * POST {app, deployment_id, gateway_ref?, image_id?, variables?} to `${base}/deploy-complete`,
  * authenticated with the GitHub Actions OIDC token.
  *
- * @param {string} base - broker base URL, e.g. "https://inno-platform.example.workers.dev"
- * @param {string} token - GitHub Actions OIDC token
- * @param {string} app
- * @param {number|string} deploymentId
- * @param {string} [gatewayRef] - optional gateway reference
- * @param {string} [imageId] - the image id actually deployed (R11)
- * @param {Record<string, unknown>} [variables] - the app's declared platform variables
+ * The request fields are ONE options object, matching brokerPost (the
+ * function this calls) and for the same reason. As seven positionals with
+ * three optionals in the middle, a caller that kept passing `fetcher` in slot
+ * 7 handed a function as `variables`; JSON.stringify drops function-valued
+ * properties, so the body stayed correct while the injected fetcher was
+ * silently replaced by the global one and the "test" started making real
+ * network calls. Named fields make that a TypeError instead of a quiet
+ * escape. `fetcher` stays the last parameter, outside the object, like every
+ * sibling helper's (uploadSbom, postResults, postDepsResults, brokerPost).
+ *
+ * @param {object} req
+ * @param {string} req.base - broker base URL, e.g. "https://inno-platform.example.workers.dev"
+ * @param {string} req.token - GitHub Actions OIDC token
+ * @param {string} req.app
+ * @param {number|string} req.deploymentId
+ * @param {string} [req.gatewayRef] - optional gateway reference
+ * @param {string} [req.imageId] - the image id actually deployed (R11)
+ * @param {Record<string, unknown>} [req.variables] - the app's declared platform variables
  *   (from app/inno-variables.json), or undefined to send no field
  * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} [fetcher]
- *   - injectable for testing; defaults to global fetch. Last, like every
- *   sibling helper's (uploadSbom, postResults, postDepsResults, brokerPost).
+ *   - injectable for testing; defaults to global fetch
  * @returns {Promise<any>} the parsed JSON response body (e.g. { url })
  */
-export async function finalize(base, token, app, deploymentId, gatewayRef, imageId, variables, fetcher = fetch) {
+export async function finalize({ base, token, app, deploymentId, gatewayRef, imageId, variables }, fetcher = fetch) {
   const body = {
     app, deployment_id: deploymentId,
     ...(gatewayRef ? { gateway_ref: gatewayRef } : {}),
@@ -139,8 +138,13 @@ if (isMainModule(import.meta.url)) {
       // second, well-formed workflow-command line in this step's log.
       console.error(`::warning title=Declared variables::${logSafe(declared.error)}`);
     }
-    const result = await finalize(base, token, app, deploymentIdNum, gatewayRefArg, imageIdArg,
-      declared.ok ? declared.variables : undefined);
+    const result = await finalize({
+      base, token, app,
+      deploymentId: deploymentIdNum,
+      gatewayRef: gatewayRefArg,
+      imageId: imageIdArg,
+      variables: declared.ok ? declared.variables : undefined,
+    });
     // Human-readable line to stderr; the raw JSON result to stdout, so the
     // workflow can capture stdout and pipe it straight into `jq -r .url`
     // instead of re-parsing this log line with sed.

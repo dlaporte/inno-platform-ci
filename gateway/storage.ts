@@ -1,3 +1,4 @@
+import { readBoundedBytesFrom } from "./bounded-body";
 import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
 // PLATFORM carries Connections v1's /_connections/{name} proxy below. It is
@@ -133,6 +134,18 @@ function resolveLinkedDb(env: S, sourceApp: string): D1Database | null {
     : null;
 }
 
+// Cap for the one JSON body this file reads: the `{ sql, params? }` an app
+// sends over the service binding. 4 MiB is the largest body the platform
+// accepts anywhere (the /mcp entry streams up to the same number), which
+// makes it the one value that bounds what a single request can buffer in the
+// gateway isolate with no possibility of refusing a call that works today.
+// The realistic large case here is a bulk insert, nowhere near it. The
+// tighter caps elsewhere are for bodies of a known small shape and are not
+// the precedent for this one: the house JSON seam is 64 KiB
+// (src/routes/read-json.ts DEFAULT_MAX_BODY_BYTES) and the activity peek is
+// 256 KiB (activity.ts PEEK_MAX_BYTES).
+const MAX_SQL_BODY_BYTES = 4 * 1024 * 1024;
+
 type SqlOp = "query" | "execute";
 
 // The SQL surface, once, for the app's own database and for a linked one:
@@ -142,7 +155,7 @@ type SqlOp = "query" | "execute";
 // learning anything new), so the request and response shapes live here and
 // a change to either lands in one place, not four.
 async function runSql(db: D1Database, op: SqlOp, request: Request): Promise<Response> {
-  const body = await readJson<{ sql: string; params?: unknown[] }>(request);
+  const body = await readJson<{ sql: string; params?: unknown[] }>(request, MAX_SQL_BODY_BYTES);
   if (!body?.sql) return json({ error: "bad_request" }, 400);
   const stmt = db.prepare(body.sql).bind(...(body.params ?? []));
   if (op === "query") {
@@ -256,8 +269,15 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
   }
 }
 
-async function readJson<T>(req: Request): Promise<T | null> {
-  try { return await req.json<T>(); } catch { return null; }
+// Bounded, so a body larger than the cap is refused before it is buffered
+// rather than after. An over-cap body lands on the same null, and therefore
+// the same 400 bad_request, as an unparseable one: the caller is the app's
+// own container over a service binding, not a browser, and there is nothing
+// it can do about either answer that a distinct status would help with.
+async function readJson<T>(req: Request, maxBytes: number): Promise<T | null> {
+  const bytes = await readBoundedBytesFrom(req, maxBytes);
+  if (!bytes) return null;
+  try { return JSON.parse(new TextDecoder().decode(bytes)) as T; } catch { return null; }
 }
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });

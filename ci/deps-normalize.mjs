@@ -14,7 +14,7 @@
 
 import { readFile } from "node:fs/promises";
 import { brokerPost } from "./broker-post.mjs";
-import { isMainModule, parseIntegerArg } from "./cli.mjs";
+import { isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 const RANK = { CRITICAL: 0, HIGH: 1, MODERATE: 2, LOW: 3, INFO: 4 };
 
@@ -108,8 +108,15 @@ if (isMainModule(import.meta.url)) {
       const ignored = findings.filter((f) => ignores.includes(f.id)).map((f) => f.id);
       if (ignored.length) console.log(`ignores honored: ${ignored.join(", ")}`);
       if (survivors.length) {
+        // logSafe on the id and the package name: both are fields of `npm
+        // audit` output, which reports whatever the app's own dependency tree
+        // named, and a newline inside a workflow command ends it and forges a
+        // clean second command line in the run's log. Same class
+        // ci/deploy-finalize.mjs documents for the declaration file.
+        // console.error is the stream this line has always used; leave it
+        // there (see deploy-finalize.mjs on why streams are not fungible).
         console.error(`::error title=Dependency gate::${survivors.length} HIGH/CRITICAL advisories: ` +
-          survivors.map((f) => `${f.id}${f.pkg ? ` (${f.pkg})` : ""}`).join(", "));
+          survivors.map((f) => `${logSafe(f.id)}${f.pkg ? ` (${logSafe(f.pkg)})` : ""}`).join(", "));
         process.exitCode = 1;
       } else {
         console.log(`dependency gate clean (${findings.length} total advisories below floor or ignored)`);
