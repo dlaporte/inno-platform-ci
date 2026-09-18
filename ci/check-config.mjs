@@ -6,8 +6,8 @@
 // them at build time from the promoted gateway.ref), nothing of the author's
 // under src/ (reserved for the gateway, which the deploy builds outside the
 // checkout), and no package-manager configuration at any depth (npm expands
-// ${VAR} from the environment into it). The live checks are 1, 1b, 6, 6b, 7,
-// 7b and 8; see checkConfig's own note on the numbering.
+// ${VAR} from the environment into it). The live checks are 1, 1b, 1c, 6, 6b,
+// 7, 7b and 8; see checkConfig's own note on the numbering.
 //
 // Usage: node ci/check-config.mjs <app-dir>
 // Exits 0 if compliant, 1 (with violations printed) otherwise.
@@ -15,7 +15,7 @@
 // Zero npm dependencies: node:fs, node:path builtins plus the local (also
 // zero-dependency) ci/cli.mjs helper only.
 
-import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { isMainModule } from "./cli.mjs";
 
@@ -165,7 +165,7 @@ function* walkTree(root, rel = "") {
  * copies, plus the repo-local rules (CLAUDE.md headers, no package-manager
  * config, no wrangler cache dirs).
  *
- * (Check numbering has gaps: the live checks are 1, 1b, 6, 6b, 7, 7b and 8.
+ * (Check numbering has gaps: the live checks are 1, 1b, 1c, 6, 6b, 7, 7b and 8.
  * The original checks 2-6 inspected an app-owned wrangler.jsonc and were
  * retired when that file stopped being app-owned; R01 then reused 6 for the
  * root package-manager-config and .env rejection, which runs inside check
@@ -239,8 +239,12 @@ export function checkConfig(appDir) {
       // enable lifecycle behavior. npm also expands ${VAR} from the environment
       // into rc values, so an rc file that reaches a step holding a credential
       // exfiltrates it on the tarball fetch (reproduced 2026-09-14; the
-      // function-shaped deploy's app/ install has since moved to a token-less
-      // step). --ignore-scripts does not help. Root-level here; check 6b below
+      // function-shaped app/ install has since moved out of the deploy job
+      // entirely, into `app-deps`, which holds no id-token grant. A step was
+      // never enough: `id-token: write` has no step-level scope, so every step
+      // of a job holding it sees the OIDC request credential, which is S01,
+      // reproduced 2026-09-17). --ignore-scripts does not help. Root-level
+      // here; check 6b below
       // covers every other directory, because npm reads the rc of the directory
       // it RUNS in, not only the repo root.
       // wrangler loads .env/.env.* from cwd at CLI startup, and env keys the
@@ -263,14 +267,78 @@ export function checkConfig(appDir) {
     }
   }
 
+  // --- Check 1c: no directory symlinks anywhere in the tree ---
+  // walkTree deliberately does not follow symlinks and does not descend
+  // node_modules (see its own comment). Both are correct in isolation, and
+  // together they left a hole: `app` as a symlink into a committed
+  // node_modules subtree hid the whole app subtree from check 6b, whose
+  // nested .npmrc rule is the control that keeps an author-owned .npmrc out
+  // of the deploy job. Reproduced 2026-09-17 (review S01): checkConfig
+  // returned ok for a fixture whose app/.npmrc was reachable by npm and
+  // invisible to this gate.
+  //
+  // The rule is deliberately broader than "app must be a real directory". A
+  // name list is a control that a future layout change can outgrow silently;
+  // rejecting every directory symlink makes the walk's coverage total by
+  // construction. Directory symlinks have no legitimate use in an app repo.
+  // A symlink to a FILE stays legal: every by-name check already lstats and
+  // fails closed on type, so a file link cannot hide content from anything.
+  //
+  // Read with lstat (never followed) and classified by what the link points
+  // at. A DANGLING link is rejected too: what it resolves to is decided by
+  // the checkout, not by this gate, so it must not be given the benefit of
+  // the doubt.
+  //
+  // walkTree rethrows anything but ENOENT, and this is the FIRST check that
+  // walks the whole tree, so an unreadable directory anywhere below appDir
+  // (e.g. src/ with its permission bits stripped) would otherwise escape as
+  // an uncaught exception before check 6b or check 7 get a chance to run at
+  // all. Catch it here and fail closed with a violation, same rule as check
+  // 6b's own wrapping below.
+  try {
+    for (const { rel } of walkTree(appDir)) {
+      const abs = join(appDir, rel);
+      let st;
+      try {
+        st = lstatSync(abs);
+      } catch (err) {
+        if (err.code === "ENOENT") continue;
+        throw err;
+      }
+      if (!st.isSymbolicLink()) continue;
+      let targetIsDir = null;                 // null = unresolvable (dangling)
+      try {
+        targetIsDir = statSync(abs).isDirectory();
+      } catch {
+        targetIsDir = null;
+      }
+      if (targetIsDir === false) continue;    // a link to a file is allowed
+      const target = (() => { try { return readlinkSync(abs); } catch { return "?"; } })();
+      violations.push(
+        `${rel} is a symlink to ${targetIsDir === null ? "an unresolvable path" : "a directory"} ` +
+          `(-> ${target}); directory symlinks must not be committed, because the config gate ` +
+          `inspects the tree without following them and content behind one is never checked`,
+      );
+    }
+  } catch (err) {
+    violations.push(
+      `config-integrity check could not fully inspect the app tree for directory symlinks (${err.path ?? appDir}: ` +
+        `${err.code ?? err}); a directory the gate cannot read fails closed`,
+    );
+  }
+
   // --- Check 6b: a nested .npmrc ANYWHERE in the tree ---
   // Check 6 inspects the root because that is where wrangler runs (no root
   // install happens any more: the gateway's own `npm ci` runs in a
-  // platform-owned directory outside the checkout, R02). The deploy job runs
-  // exactly one package manager inside the author-owned app/ directory: npm
-  // (`npm ci` in the token-less function-shaped install step; the `npm
-  // install` fallback is gone since R11), and nothing in CI runs yarn, pnpm
-  // or bun there. npm reads the PROJECT .npmrc of the directory it is
+  // platform-owned directory outside the checkout, R02). CI runs exactly one
+  // package manager inside the author-owned app/ directory: npm (`npm ci` in
+  // the `app-deps` job, whose installed tree the deploy job then restores;
+  // plus `npm audit` in the `deps` gate. The `npm install` fallback is gone
+  // since R11), and nothing in CI runs yarn, pnpm or bun there. Do NOT read
+  // this rule as guarding one step: since S01 (2026-09-17) the deploy job runs
+  // no package manager in app/ at all, and this check is what keeps it that
+  // way rather than a leftover from when it did. npm reads the PROJECT .npmrc
+  // of the directory it is
   // invoked in and expands ${VAR} from the environment into it, so a nested
   // .npmrc is an unpinned, credential-exfiltrating deploy-build input the
   // same way the root one is. Other package managers' config at depth —
