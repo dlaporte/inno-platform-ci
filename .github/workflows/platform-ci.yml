@@ -1518,6 +1518,15 @@ jobs:
             core.setOutput('token', token);
 
       - name: Finalize deployment
+        # deploy-finalize.mjs also reads app/inno-variables.json from this
+        # checkout, if the app declared one, and sends it as `variables` in
+        # the same request; no argument for it here, since it reads the file
+        # itself from the checkout root ("."). Malformed JSON, an unreadable
+        # file, or one over the send bound becomes a warning LINE in this
+        # step's log (stderr, so not an Actions annotation) and the deploy is
+        # unaffected: the script sends no field and the platform keeps its
+        # previous declarations. Content that parses is the broker's to judge,
+        # and it refuses a bad set without failing the deploy.
         env:
           OIDC_TOKEN: ${{ steps.oidc_finalize.outputs.token }}
           APP: ${{ needs.policy.outputs.app }}
