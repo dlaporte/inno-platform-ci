@@ -1,4 +1,5 @@
 import { readBoundedBytesFrom } from "./bounded-body";
+import { errLine } from "./log-text";
 import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
 // PLATFORM carries Connections v1's /_connections/{name} proxy below. It is
@@ -95,7 +96,7 @@ async function linkStillLive(env: S, sourceApp: string): Promise<boolean | null>
     linkCheckCache.set(generation, { live, at: now });
     return live;
   } catch (e) {
-    console.warn(`gateway: link check failed for ${sourceApp}: ${String(e).slice(0, 120)}`);
+    console.warn(`gateway: link check failed for ${sourceApp}: ${errLine(e, 120)}`);
     return false;
   }
 }
@@ -136,7 +137,7 @@ function resolveLinkedDb(env: S, sourceApp: string): D1Database | null {
 
 // Cap for the one JSON body this file reads: the `{ sql, params? }` an app
 // sends over the service binding. 4 MiB is the largest body the platform
-// accepts anywhere (the /mcp entry streams up to the same number), which
+// BUFFERS anywhere (the /mcp entry streams up to the same number), which
 // makes it the one value that bounds what a single request can buffer in the
 // gateway isolate with no possibility of refusing a call that works today.
 // The realistic large case here is a bulk insert, nowhere near it. The
@@ -144,6 +145,11 @@ function resolveLinkedDb(env: S, sourceApp: string): D1Database | null {
 // the precedent for this one: the house JSON seam is 64 KiB
 // (src/routes/read-json.ts DEFAULT_MAX_BODY_BYTES) and the activity peek is
 // 256 KiB (activity.ts PEEK_MAX_BYTES).
+//
+// The 25 MiB file PUT (MAX_UPLOAD_BYTES above) is the deliberate exception
+// and not a counterexample: that body is handed straight to FILES.put and is
+// never held in the isolate, so its number is a per-object storage limit
+// rather than a memory one.
 const MAX_SQL_BODY_BYTES = 4 * 1024 * 1024;
 
 type SqlOp = "query" | "execute";
@@ -265,7 +271,10 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
     }
     return json({ error: "unknown_storage_route" }, 404);
   } catch (e) {
-    return json({ error: "storage_error", detail: String(e).slice(0, 200) }, 500);
+    // The one errLine whose output leaves the gateway: this `detail` is read
+    // by the app's own storage client, so the flattening is not only about
+    // keeping a log line on one line.
+    return json({ error: "storage_error", detail: errLine(e) }, 500);
   }
 }
 

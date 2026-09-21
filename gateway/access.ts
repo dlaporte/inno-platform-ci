@@ -1,4 +1,5 @@
 import { jwtVerify } from "jose";
+import { errLine } from "./log-text";
 
 export const ACCESS_JWT_HEADER = "cf-access-jwt-assertion";
 export const ACCESS_COOKIE = "CF_Authorization";
@@ -43,6 +44,6 @@ export async function verifyAccessJwt(
     const groups = rawGroups.filter((g): g is string => typeof g === "string" && g.startsWith(GROUP_PREFIX));
     return { email, groups };
   } catch (e) {
-    throw new Error(`access_invalid:${String(e).slice(0, 120)}`);
+    throw new Error(`access_invalid:${errLine(e, 120)}`);
   }
 }

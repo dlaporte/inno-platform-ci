@@ -1,4 +1,4 @@
-import { GROUP_PREFIX, type AccessIdentity } from "./access";
+import { ACCESS_COOKIE, GROUP_PREFIX, type AccessIdentity } from "./access";
 import { appFromHostname } from "./red";
 
 // Identity-bearing headers a client must never supply to the container.
@@ -18,8 +18,11 @@ const STRIP_PREFIXES = ["cf-access-"];
 // only the header once did) hands the app a live bearer for its own perimeter:
 // valid until exp (Access session_duration 24h) and re-accepted with no
 // session or revocation lookup, so app code could replay any visitor's
-// identity for a day, past a revoke_access.
-const STRIP_COOKIES = ["CF_Authorization", "CF_AppSession"];
+// identity for a day, past a revoke_access. The first name is access.ts's
+// ACCESS_COOKIE rather than a second literal: index.ts reads the cookie
+// through that constant, and a rename there that missed a hand-written copy
+// here would leave the live bearer in place with nothing failing.
+const STRIP_COOKIES = [ACCESS_COOKIE, "CF_AppSession"];
 
 // In MCP mode the caller's credential is a platform-issued OAuth bearer token in
 // `Authorization`. The gateway has already consumed it, and the app must never

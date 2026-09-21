@@ -4,6 +4,7 @@ import { createRemoteJWKSet } from "jose";
 import type { Env } from "./env";
 import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, GROUP_PREFIX, type AccessIdentity } from "./access";
 import { sanitizeAndInject } from "./identity";
+import { errLine } from "./log-text";
 import { handleStorage, type StorageEnv } from "./storage";
 import {
   authenticateMcp, bearerToken, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
@@ -259,7 +260,7 @@ export function makeApp(deps: Deps = realDeps) {
           { jwks: deps.jwks(env), aud: env.ACCESS_AUD, teamDomain: env.ACCESS_TEAM_DOMAIN },
           { allowService: isHealthProbe });
       } catch (e) {
-        console.warn(`gateway: 401 ${String(e).slice(0, 120)} (${c.req.method} ${path})`);
+        console.warn(`gateway: 401 ${errLine(e, 120)} (${c.req.method} ${path})`);
         return c.text("unauthorized", 401);
       }
       // Human-activity touch (spec 2026-08-18): any Access-verified request

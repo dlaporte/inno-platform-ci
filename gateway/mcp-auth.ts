@@ -29,6 +29,7 @@
 import type { Env } from "./env";
 import type { AccessIdentity } from "./access";
 import { GROUP_PREFIX } from "./access";
+import { errLine } from "./log-text";
 import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
 // Upper bound on how long a positive introspection is reused. This is the
@@ -174,7 +175,7 @@ async function introspectViaPlatform(
     }
     return (await res.json()) as IntrospectionResponse;
   } catch (e) {
-    console.warn(`gateway: introspection threw: ${String(e).slice(0, 120)}`);
+    console.warn(`gateway: introspection threw: ${errLine(e, 120)}`);
     return { active: false };
   }
 }

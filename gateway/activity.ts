@@ -2,6 +2,7 @@
 // authenticated request is real human use, tell the platform so the app's
 // idle clock advances. Wired in index.ts after each perimeter's auth.
 import { readBoundedResultFrom } from "./bounded-body";
+import { errLine } from "./log-text";
 import { PLATFORM_ORIGIN } from "./platform";
 
 // gateway/ builds separately from src/ and cannot import it — TOUCH_PATH is a
@@ -64,6 +65,6 @@ export async function sendTouch(platform: Fetcher, payload: Record<string, strin
     });
     if (!res.ok) console.warn(`gateway: activity touch refused (${res.status})`);
   } catch (e) {
-    console.warn(`gateway: activity touch failed: ${String(e).slice(0, 120)}`);
+    console.warn(`gateway: activity touch failed: ${errLine(e, 120)}`);
   }
 }

@@ -18,6 +18,9 @@
 // `unknown` (never zero) on every consuming surface until its next deploy —
 // the same adoption story as observability.enabled (2026-07-23) and Workers
 // Logs (§7.10).
+import { GROUP_PREFIX } from "./access";
+import { errLine } from "./log-text";
+
 export type RedEnv = { RED?: AnalyticsEngineDataset };
 
 // The classes the app's OWN error rate is computed from vs. the ones that must
@@ -69,10 +72,21 @@ export function isError(cls: StatusClass): boolean {
 // (truncating a long name, folding rare names into one bucket) would silently
 // strip a correctly routed app's groups from X-Forwarded-Groups. Any change
 // must still return the exact app name the request was routed to.
-const INNO_PREFIX = "inno-";
+//
+// The prefix is access.ts's GROUP_PREFIX rather than a second `inno-` literal
+// in this build: src/naming.ts collapses the same two uses onto one constant
+// (`OKTA_GROUP_PREFIX = INNO_PREFIX`), and the literal is pinned to the
+// platform's by test/constant-parity.node.test.ts, so importing it puts this
+// derivation behind that pin too.
+//
+// The twin is NOT total: src/naming.ts's appNameFromHostname returns null for
+// a hostname that is not `inno-<name>.<domain>`, while this one always returns
+// a name (the bare first label) because every caller here is already handling
+// a request the platform routed. The parity pin therefore covers platform
+// hosts only, and the non-platform answers differ on purpose.
 export function appFromHostname(hostname: string): string {
   const label = hostname.split(".")[0] ?? "";
-  return label.startsWith(INNO_PREFIX) ? label.slice(INNO_PREFIX.length) : label;
+  return label.startsWith(GROUP_PREFIX) ? label.slice(GROUP_PREFIX.length) : label;
 }
 
 // A low-cardinality, deliberately lossy caller bucket. It exists for ONE
@@ -107,6 +121,6 @@ export function writeRed(env: RedEnv, p: RedPoint): void {
       doubles: [p.latencyMs, isError(p.status) ? 1 : 0],
     });
   } catch (e) {
-    console.warn(`gateway: RED write failed (continuing): ${String(e).slice(0, 120)}`);
+    console.warn(`gateway: RED write failed (continuing): ${errLine(e, 120)}`);
   }
 }
