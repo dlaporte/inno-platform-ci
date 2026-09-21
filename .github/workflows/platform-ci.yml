@@ -719,24 +719,31 @@ jobs:
           echo "container-validate: exposes 8080"
 
       # Contract R2 made real at build time: the container must come up and
-      # answer GET /healthz -> 200. Generous ~90s window — 18 tries with a 5s
-      # sleep between; a port that ACCEPTS but hangs stretches it to ~160s via
-      # curl's 4s per-attempt timeout. (Slow app boots are
-      # legitimate; a healthz that needs storage is not — the endpoint must be
-      # storage-independent, per the application contract). The platform's
-      # runtime health probe binds to the same endpoint after deploy.
+      # answer GET /healthz with exactly 200, the same test the runtime
+      # health probe applies (src/health.ts, probeOnce); a 204, 301, or 302
+      # is refused here because the runtime probe never counts any of them
+      # as healthy (it reads a 302 as a blocked probe), so the gate must not
+      # pass what the probe would not. Generous ~90s window — 18 tries with
+      # a 5s sleep between; a port that ACCEPTS but hangs stretches it to
+      # ~160s via curl's 4s per-attempt timeout. (Slow app boots are
+      # legitimate; a healthz that needs storage is not — the endpoint must
+      # be storage-independent, per the application contract). The
+      # platform's runtime health probe binds to the same endpoint after
+      # deploy.
       - name: Smoke test /healthz
         if: needs.policy.outputs.function_shaped != 'true'
         run: |
           set -e
           docker run -d --name smoke -p 8080:8080 app-under-test
           ok=""
+          last=""
           for i in $(seq 1 18); do
-            if curl -sf -o /dev/null --max-time 4 http://localhost:8080/healthz; then ok=1; break; fi
+            last="$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://localhost:8080/healthz || true)"
+            if [ "$last" = "200" ]; then ok=1; break; fi
             sleep 5
           done
           if [ -z "$ok" ]; then
-            echo "container-validate: /healthz did not answer 200 within 18 tries (~90s) — refusing" >&2
+            echo "container-validate: /healthz did not answer 200 within 18 tries (~90s), last status: ${last:-none} — refusing" >&2
             echo "--- container logs ---" >&2
             docker logs smoke >&2 || true
             docker rm -f smoke || true
