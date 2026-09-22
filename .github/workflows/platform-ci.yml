@@ -921,6 +921,16 @@ jobs:
       # audited: the workflow said so in a warning and shipped anyway (R11).
       # A hard failure is the honest version, because the gate's verdict has to
       # describe the artifact.
+      #
+      # `--omit=dev` since v0.14.21, for that same reason (OPEN 33): the deps
+      # gate audits with `--omit=dev`, so every devDependency this step used to
+      # install rode into the deployed tree without any gate looking at it. The
+      # installed tree is now the audited tree. What that costs is production
+      # code that imports a devDependency: the package is simply absent at
+      # bundle time, so the deploy job's app-Worker wrangler run stops with
+      # esbuild's `Could not resolve "<specifier>"`, and that step runs
+      # ci/explain-unresolved.mjs on the log to say which package it was and
+      # what to do about it.
       - name: Install and stage the app Worker's dependencies
         id: install
         if: needs.policy.outputs.function_shaped == 'true'
@@ -935,7 +945,7 @@ jobs:
             echo "::error title=Missing app/package-lock.json::commit app/package-lock.json — the platform deploys the versions the dependency gates audited, and will not resolve your ranges fresh at deploy time"
             exit 1
           fi
-          (cd app && npm ci --ignore-scripts)
+          (cd app && npm ci --ignore-scripts --omit=dev)
           # npm creates no node_modules AT ALL for a lockfile that resolves to
           # zero dependencies (npm 11.19.1, whether app/package.json omits
           # `dependencies` or declares it empty), so the tar below would fail
@@ -1491,7 +1501,14 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
         run: |
-          set -e
+          set -eo pipefail
+          # `pipefail` is set explicitly rather than assumed: a `run:` block
+          # with no `shell:` key executes as `bash -e {0}`, where a pipeline
+          # reports only its LAST command's status. Without it the `| tee`
+          # below would hand back tee's 0 for a wrangler that failed, and a
+          # run with no Worker deployed would go on to finalize as green.
+          # (backup-d1.yml writes `set -euo pipefail` for the same reason.)
+          #
           # The app Worker's deps were installed in the app-deps job and
           # unpacked by the restore step above (see its comment, and app-deps'
           # own). Nothing in this step may read author-owned
@@ -1509,7 +1526,27 @@ jobs:
           # the checkout — main: app/index.ts is author code by design, so
           # --config stays the relative, checkout-root path; only the
           # wrangler binary itself comes from $GW.
-          "$GW/node_modules/.bin/wrangler" deploy --config app-worker.jsonc
+          #
+          # Teed to $RUNNER_TEMP because wrangler's own output is the ONLY
+          # evidence of which import failed: esbuild prints `Could not resolve
+          # "<specifier>"` and nothing downstream carries the specifier. Since
+          # v0.14.21 the app-deps install is `--omit=dev` (OPEN 33), so the
+          # likeliest cause of that line is production code importing a
+          # devDependency, and the author cannot read this workflow to work
+          # that out. explain-unresolved.mjs reads the log back and names the
+          # package and the fix. It is invoked out of the mirror checkout the
+          # way every sibling script in this workflow is (template-wrangler
+          # and deploy-finalize above), because this workflow executes in the
+          # APP's repo, which carries no ci/ of its own.
+          #
+          # The `if !` wrapper is what keeps that failure inspectable: a bare
+          # pipeline would end the step under errexit before anything could
+          # read the log, and `|| true` would lose the failure altogether, so
+          # the explanation is printed and `exit 1` puts the failure back.
+          if ! "$GW/node_modules/.bin/wrangler" deploy --config app-worker.jsonc 2>&1 | tee "$RUNNER_TEMP/wrangler-app.log"; then
+            node inno-platform-ci/ci/explain-unresolved.mjs "$RUNNER_TEMP/wrangler-app.log" app/package.json
+            exit 1
+          fi
           # Then the gateway, from the platform-owned build directory (R02).
           # No `cd`: --config is the absolute path instead.
           "$GW/node_modules/.bin/wrangler" deploy --config "$GW/wrangler.jsonc"

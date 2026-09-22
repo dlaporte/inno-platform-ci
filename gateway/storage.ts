@@ -101,9 +101,22 @@ async function linkStillLive(env: S, sourceApp: string): Promise<boolean | null>
   }
 }
 
-// Per-object upload cap (25 MiB). Enforced only when the client sends a
-// content-length header — a chunked PUT with no length streams to R2, where
-// R2's own object-size limits apply as the backstop.
+// Per-object upload cap (25 MiB), a DECLARED-length cap: a body must declare
+// its length. Production R2's stream put() needs a known length; given a
+// stream whose length is not known up front it throws exactly "Provided
+// readable stream must have a known length (request/response body or
+// readable half of FixedLengthStream)" (cloudflare/workers-sdk issue 6425,
+// cloudflare/miniflare issue 506), a fact the R2 documentation and issue
+// history already establish as of 2026-09-21; the experiment planned in
+// docs/superpowers/plans/2026-09-21-open-31-33-v0.14.21.md is confirmation of
+// it, not the basis for it. A chunked PUT carries no content-length, so
+// before this fix it reached FILES.put and died there, answered as 500
+// storage_error; no app has ever completed a lengthless upload through this
+// gateway. The PUT arm below now refuses one explicitly, with 411, decided
+// from the header alone before any R2 call. That "from the header alone" is
+// deliberate: Miniflare's R2 may accept an unknown-length stream where
+// production R2 does not (miniflare issue 506 is about exactly that gap), so
+// the 411 must never be decided by what a local put happens to do.
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
 // Must match src/links.ts linkBindingFor — the gateway builds separately from
@@ -240,7 +253,8 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       const key = decodeURIComponent(fileMatch[1]);
       if (m === "PUT") {
         const len = request.headers.get("content-length");
-        if (len && Number(len) > MAX_UPLOAD_BYTES) return json({ error: "too_large" }, 413);
+        if (!len) return json({ error: "length_required" }, 411);
+        if (Number(len) > MAX_UPLOAD_BYTES) return json({ error: "too_large" }, 413);
         await env.FILES.put(key, request.body);
         return json({ key });
       }
