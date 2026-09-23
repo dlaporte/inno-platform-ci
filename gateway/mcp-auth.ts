@@ -266,6 +266,9 @@ export function protectedResourceMetadata(env: Env): Response {
     authorization_servers: [env.MCP_AUTH_SERVER],
     // Header only — see bearerToken above.
     bearer_methods_supported: ["header"],
+    // Twin of src/index.ts's scopesSupported (the platform AS's own list);
+    // gateway/ cannot import from src/, so test/constant-parity.node.test.ts
+    // pins the two equal.
     scopes_supported: ["openid", "profile", "email"],
   }, {
     // Public, cacheable metadata; clients re-fetch it on each fresh auth.

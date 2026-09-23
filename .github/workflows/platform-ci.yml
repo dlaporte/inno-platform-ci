@@ -1342,8 +1342,12 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         env:
           EXPECTED: ${{ steps.deploy_token.outputs.image_id }}
+        # pipefail for the same reason as the save step: without it the
+        # `gunzip -c | docker load` pipe below reports docker load's status
+        # alone, and a truncated archive surfaced only as "Image mismatch".
         run: |
           set -e
+          set -o pipefail
           if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
             echo "::error title=No scanned image recorded::the container job did not record an image id with the broker; re-run the release after a green safety preflight"
             exit 1
