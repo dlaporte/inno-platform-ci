@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { getCookie } from "hono/cookie";
 import { Container, getContainer } from "@cloudflare/containers";
 import { createRemoteJWKSet } from "jose";
 import type { Env } from "./env";
@@ -22,9 +23,13 @@ export { ContainerProxy } from "@cloudflare/containers";
 // deploy time (`wrangler deploy --var SLEEP_AFTER:...` in platform-ci,
 // sourced from the config store's container.sleep_after — app-overridable);
 // the grammar guard mirrors the platform's server-side validation so a
-// malformed var can never wedge container startup. Exported as a function so
-// the guard is EXECUTABLE in tests — workerd's native DurableObject base
-// rejects stub state objects, so the constructor path itself can't be.
+// malformed var can never wedge container startup. That validation and this
+// default both live in src/config.ts's container.sleep_after entry; gateway/
+// builds separately and cannot import it, so the grammar and the "10m" are
+// hand-written twins that test/constant-parity.node.test.ts holds to the
+// platform's own. Exported as a function so the guard is EXECUTABLE in tests:
+// workerd's native DurableObject base rejects stub state objects, so the
+// constructor path itself can't be.
 export function resolveSleepAfter(v: string | undefined, fallback = "10m"): string {
   if (v && /^[0-9]{1,4}(s|m|h)$/.test(v)) return v;
   // Say so rather than silently keeping the default: an owner who sets
@@ -105,11 +110,6 @@ export const realDeps: Deps = {
   // here; the `!` is safe because the container branch is chosen whenever it's absent.
   forwardToWorker: (env, req) => env.APP_WORKER!.fetch(req),
 };
-
-function readCookie(req: Request, name: string): string | undefined {
-  const raw = req.headers.get("cookie") ?? "";
-  return raw.split(";").map((s) => s.trim()).find((c) => c.startsWith(`${name}=`))?.slice(name.length + 1);
-}
 
 // HSTS for app hostnames lives HERE, not at an edge setting: APP-SECURITY
 // tells authors transport headers are handled in front of the app, and the
@@ -237,7 +237,10 @@ export function makeApp(deps: Deps = realDeps) {
       }
     } else if (env.ENVIRONMENT === "dev" && env.DEV_MOCK_IDENTITY === "enabled") {
       identity = {
-        email: c.req.header("X-Mock-User") ?? "dev@davidlaporte.org",
+        // A reserved placeholder (RFC 2606's .invalid), never a deliverable
+        // address: whatever this branch synthesizes is echoed to the app and
+        // can end up in its logs as though a real person had signed in.
+        email: c.req.header("X-Mock-User") ?? "dev@example.invalid",
         // Same inno- filter production applies (access.ts), so dev can't inject
         // a non-inno group the real path would strip.
         groups: (c.req.header("X-Mock-Groups") ?? "").split(",").map((s) => s.trim()).filter((g) => g.startsWith(GROUP_PREFIX)),
@@ -250,7 +253,10 @@ export function makeApp(deps: Deps = realDeps) {
         console.error("gateway: Access mode without ACCESS_AUD/ACCESS_TEAM_DOMAIN — refusing all requests");
         return c.text("unauthorized", 401);
       }
-      const token = c.req.header(ACCESS_JWT_HEADER) ?? readCookie(c.req.raw, ACCESS_COOKIE);
+      // hono's own cookie reader rather than a hand-rolled split: the header
+      // is already parsed for this request, and a name that is a prefix of
+      // another cookie's name cannot match by accident.
+      const token = c.req.header(ACCESS_JWT_HEADER) ?? getCookie(c, ACCESS_COOKIE);
       if (!token) { console.warn(`gateway: 401 no Access token (${c.req.method} ${path})`); return c.text("unauthorized", 401); }
       // The platform's health probe authenticates with an Access SERVICE
       // token, a valid JWT with no user identity, accepted for exactly the

@@ -29,7 +29,7 @@
 import type { Env } from "./env";
 import type { AccessIdentity } from "./access";
 import { GROUP_PREFIX } from "./access";
-import { errLine } from "./log-text";
+import { errLine, hex } from "./log-text";
 import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
 // Upper bound on how long a positive introspection is reused. This is the
@@ -134,7 +134,7 @@ export function bearerToken(req: Request): string | null {
 // two apps' entries distinct even though the cache is now per-isolate.
 async function cacheKeyFor(token: string, resource: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([resource, token])));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hex(digest);
 }
 
 // Ask the platform whether this token is live and who it belongs to. Fails
@@ -164,7 +164,11 @@ async function introspectViaPlatform(
         // Omitted entirely when unprovisioned; the platform then withholds
         // the caller assertion unless its admin switch is explicitly false
         // (the cutover override), so a keyless gateway loses Connections
-        // until it is redeployed with the key.
+        // until it is redeployed with the key. It loses the idle clock with
+        // it: index.ts's touch fires only when the identity carries an
+        // assertion, so an MCP app in real use stops advancing its clock and
+        // the lifecycle engine warns and then stops it. One redeploy restores
+        // both.
         ...(gatewayKey ? { [GATEWAY_KEY_HEADER]: gatewayKey } : {}),
       },
       body: JSON.stringify({ token, resource }),

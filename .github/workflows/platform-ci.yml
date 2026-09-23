@@ -229,6 +229,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: app
+          # Defense in depth, on every app checkout in this workflow: no step
+          # here runs `git` at all, so the credential actions/checkout would
+          # otherwise leave in .git/config is one nothing can use, sitting in a
+          # tree the gates read and (in the container and deploy jobs) docker
+          # builds from.
+          persist-credentials: false
 
       - name: Checkout inno-platform (ci/ scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -264,6 +270,14 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         with:
           fetch-depth: 0
+          # Same rule as every other app checkout here, and safe for the
+          # scan: at the SHA pinned below, gitleaks-action executes only the
+          # `gitleaks` binary (detect --redact -v --exit-code=2, with
+          # --log-opts) over the history this checkout has ALREADY fetched,
+          # and reaches the GitHub API with its own token. It runs no git
+          # fetch, pull, push, clone or ls-remote, so there is nothing in this
+          # job that would use a credential left in .git/config.
+          persist-credentials: false
 
       - name: gitleaks
         if: steps.gate.outputs.enabled == 'true'
@@ -300,6 +314,12 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.enabled == 'true'
+        with:
+          # Defense in depth: actions/checkout writes the run's GITHUB_TOKEN
+          # into .git/config by default, and this job runs a scanner over an
+          # author-controlled tree. Nothing here runs `git`, so nothing here
+          # needs the persisted credential.
+          persist-credentials: false
 
       - name: semgrep (OWASP Top Ten ruleset)
         if: steps.gate.outputs.enabled == 'true'
@@ -368,6 +388,11 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.enabled == 'true'
+        with:
+          # Same defense in depth as the sast job's checkout: this job audits an
+          # author-controlled dependency tree and never runs a second git
+          # operation, so it keeps no credential in .git/config.
+          persist-credentials: false
 
       - name: Checkout inno-platform (ci/ scripts)
         if: steps.gate.outputs.enabled == 'true'
@@ -460,6 +485,15 @@ jobs:
     # it only proves provenance to the broker's /deploy-sbom endpoint.)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This checkout root IS the `docker build` context below, so anything
+          # in it is reachable by an author-written Dockerfile's COPY and can
+          # end up in the image the smoke run executes. actions/checkout would
+          # otherwise leave the run's GITHUB_TOKEN in .git/config there. It is
+          # the author's own repo at contents: read, so this is defense in
+          # depth rather than a fix, and this job runs no git operation that
+          # would need the credential.
+          persist-credentials: false
 
       # No `cache: npm` here: this job never runs `npm ci`/`npm install` (the
       # docker build below is a wholly separate build context, and the only
@@ -571,7 +605,21 @@ jobs:
       - name: Record the scanned image id
         id: image
         if: needs.policy.outputs.function_shaped != 'true'
-        run: echo "id=$(docker image inspect --format '{{.Id}}' app-under-test)" >> "$GITHUB_OUTPUT"
+        # Captured into a variable first: `echo "id=$(...)"` returns echo's own
+        # 0 when the substitution fails, which would stage the SBOM with an
+        # empty id and surface one job later as "the container job did not
+        # record an image id with the broker; re-run the release after a green
+        # safety preflight", which is a wrong diagnosis delivered after a
+        # deploy token has already been minted. Failing here names the step
+        # that actually went wrong.
+        run: |
+          set -e
+          id="$(docker image inspect --format '{{.Id}}' app-under-test)"
+          if [ -z "$id" ]; then
+            echo "::error title=No image id::docker image inspect returned nothing for app-under-test; the scanned image is not on this runner"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
 
       - name: Checkout inno-platform (ci/ scripts)
         if: needs.policy.outputs.function_shaped != 'true'
@@ -723,9 +771,10 @@ jobs:
       # health probe applies (src/health.ts, probeOnce); a 204, 301, or 302
       # is refused here because the runtime probe never counts any of them
       # as healthy (it reads a 302 as a blocked probe), so the gate must not
-      # pass what the probe would not. Generous ~90s window — 18 tries with
-      # a 5s sleep between; a port that ACCEPTS but hangs stretches it to
-      # ~160s via curl's 4s per-attempt timeout. (Slow app boots are
+      # pass what the probe would not. Generous window of about 90s, 18 tries
+      # with a 5s sleep between; a port that ACCEPTS but hangs stretches it to
+      # about 162s via curl's 4s per-attempt timeout, the pair of budgets the
+      # refusal message states and APP-CONTRACT R2 quotes. (Slow app boots are
       # legitimate; a healthz that needs storage is not — the endpoint must
       # be storage-independent, per the application contract). The
       # platform's runtime health probe binds to the same endpoint after
@@ -737,13 +786,23 @@ jobs:
           docker run -d --name smoke -p 8080:8080 app-under-test
           ok=""
           last=""
+          exited=""
           for i in $(seq 1 18); do
             last="$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://localhost:8080/healthz || true)"
             if [ "$last" = "200" ]; then ok=1; break; fi
+            # A container that has already exited is never going to answer, so
+            # a crash on start costs one try and its logs instead of the whole
+            # window. `|| echo false` keeps a vanished container from ending
+            # the step under errexit before the logs below are printed.
+            if [ "$(docker inspect -f '{{.State.Running}}' smoke 2>/dev/null || echo false)" != "true" ]; then exited=1; break; fi
             sleep 5
           done
           if [ -z "$ok" ]; then
-            echo "container-validate: /healthz did not answer 200 within 18 tries (~90s), last status: ${last:-none} — refusing" >&2
+            if [ -n "$exited" ]; then
+              echo "container-validate: the container exited before /healthz answered 200, last status: ${last:-none}; refusing" >&2
+            else
+              echo "container-validate: /healthz did not answer 200 within 18 tries (about 90s when the port refuses, about 162s when it accepts and hangs), last status: ${last:-none}; refusing" >&2
+            fi
             echo "--- container logs ---" >&2
             docker logs smoke >&2 || true
             docker rm -f smoke || true
@@ -756,7 +815,13 @@ jobs:
       # retention-days: 1 — this is a build intermediate, not a record.
       - name: Save the scanned image for the deploy job
         if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
-        run: docker save app-under-test | gzip -1 > image.tar.gz
+        # The default run shell is `bash -e {0}`, which does NOT set pipefail,
+        # so a failed `docker save` would exit with gzip's 0 and upload a
+        # truncated archive. The deploy job then loads it and reports "Image
+        # mismatch" after it has already minted a deploy token.
+        run: |
+          set -o pipefail
+          docker save app-under-test | gzip -1 > image.tar.gz
 
       # overwrite: true for the same reason the app-deps job's upload needs it
       # (below): artifacts are scoped to the RUN, not the attempt, so with the
@@ -786,6 +851,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: app-repo
+          # Same defense in depth as the sast, deps and container checkouts:
+          # this job only reads the app's manifests and keeps no credential.
+          persist-credentials: false
 
       - name: Checkout inno-platform (ci/ scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -817,6 +885,10 @@ jobs:
       built: ${{ steps.check.outputs.built }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Same rule as every other app checkout here; this job reads one
+          # marker file and runs nothing else.
+          persist-credentials: false
       - id: check
         run: |
           if [ -f app/.needs-build ]; then
@@ -1042,6 +1114,14 @@ jobs:
     steps:
       - name: Checkout app repo (the caller)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This root is the wrangler docker build context, exactly as the
+          # mirror checkout below says, so the same reasoning applies to the
+          # clone that CONTAINS it: no step in this job runs `git`, and the
+          # credential actions/checkout would leave in .git/config would sit
+          # inside an author-controlled build in the one job that also holds
+          # the deploy token.
+          persist-credentials: false
 
       - name: Checkout inno-platform (ci/ scripts)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1187,10 +1267,18 @@ jobs:
           set -e
           # NOT `curl -f`: -f discards the response body on a non-2xx, which
           # would swallow the broker's deliberately actionable messages (e.g.
-          # 409 app_stopped: "start it from the panel, then push"). Capture the
-          # status via -w and surface the body verbatim on failure instead. The
-          # token stays in a shell var (never written to disk).
-          resp="$(curl -sS -X POST "$BROKER_URL/deploy-token" \
+          # 409 app_stopped: "start it from the platform panel (or with the
+          # start_app tool), then push again"). Capture the status via -w and
+          # surface the body verbatim on failure instead. The token stays in a
+          # shell var (never written to disk).
+          #
+          # --max-time 30 and NO --retry, unlike the policy fetch above: this
+          # request is not a read. Each call inserts a deployment row, flips
+          # the app to "deploying" and mints an account-wide 15-minute
+          # Cloudflare token, so a curl retry on a 5xx or a 429 would mint a
+          # second one and strand the first row. 30s is twice the policy
+          # fetch's bound because this call does that work before it answers.
+          resp="$(curl -sS --max-time 30 -X POST "$BROKER_URL/deploy-token" \
             -H "Authorization: Bearer $OIDC_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"app\":\"$APP\"}" \

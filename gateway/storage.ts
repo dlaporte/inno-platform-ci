@@ -46,7 +46,7 @@ const LINK_CHECK_PATH = "/_links/check";
 const LINK_CHECK_TTL_MS = 60_000;
 const linkCheckCache = new Map<string, { live: boolean; at: number }>();
 
-export function linkGenerationVar(sourceApp: string): string {
+function linkGenerationVar(sourceApp: string): string {
   return `LINK_GEN_${sourceApp.toUpperCase().replace(/-/g, "_")}`;
 }
 
@@ -117,7 +117,9 @@ async function linkStillLive(env: S, sourceApp: string): Promise<boolean | null>
 // deliberate: Miniflare's R2 may accept an unknown-length stream where
 // production R2 does not (miniflare issue 506 is about exactly that gap), so
 // the 411 must never be decided by what a local put happens to do.
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+// Exported so the docs parity suite can read the number it documents rather
+// than restating it; nothing in the gateway build imports it.
+export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
 // Must match src/links.ts linkBindingFor — the gateway builds separately from
 // the platform Worker, so the derivation is restated rather than imported. A
@@ -163,7 +165,20 @@ function resolveLinkedDb(env: S, sourceApp: string): D1Database | null {
 // and not a counterexample: that body is handed straight to FILES.put and is
 // never held in the isolate, so its number is a per-object storage limit
 // rather than a memory one.
-const MAX_SQL_BODY_BYTES = 4 * 1024 * 1024;
+// Exported for the same reason as MAX_UPLOAD_BYTES above.
+export const MAX_SQL_BODY_BYTES = 4 * 1024 * 1024;
+
+// R2 caps list() at 1000 keys and sets `truncated` with a cursor, so a single
+// call silently returns a PARTIAL listing that an app author reads as "these
+// are all my files". The files GET pages with this bound, sized like the
+// platform's own R2 sweeps (support-bundle/exports run 10 pages), each list()
+// being one subrequest against the container-outbound invocation budget:
+// 10 x 1000 keys covers any sane app bucket. If the cap is ever hit, the
+// response SAYS so (`truncated: true`) rather than passing a partial listing
+// off as complete; an app needing more than 10k keys listed should track its
+// keys in D1, not walk the bucket. Exported for the docs parity suite, like
+// the two caps above.
+export const MAX_LIST_PAGES = 10;
 
 type SqlOp = "query" | "execute";
 
@@ -226,16 +241,8 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       return await runSql(linkedDb, op as SqlOp, request);
     }
     if (path === "/_storage/files" && m === "GET") {
-      // R2 caps list() at 1000 keys and sets `truncated` with a cursor — a
-      // single call silently returns a PARTIAL listing that an app author
-      // reads as "these are all my files". Page with a bound sized like the
-      // platform's own R2 sweeps (support-bundle/exports run 10 pages), each
-      // list() being one subrequest against the container-outbound invocation
-      // budget — 10 × 1000 keys covers any sane app bucket. If the cap is
-      // ever hit, the response SAYS so (`truncated: true`) rather than
-      // passing a partial listing off as complete; an app needing more than
-      // 10k keys listed should track its keys in D1, not walk the bucket.
-      const MAX_LIST_PAGES = 10;
+      // Paged, never one call: see MAX_LIST_PAGES above for why, and for what
+      // `truncated` means when the bound is reached.
       const keys: string[] = [];
       let cursor: string | undefined;
       let truncated = false;
@@ -277,7 +284,13 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
       if (!env.PLATFORM) return json({ error: "connections_unavailable" }, 501);
       const name = path.slice("/_connections/".length);
       if (!CONNECTION_NAME_RE.test(name)) return json({ error: "bad_connection_name" }, 400);
-      return env.PLATFORM.fetch(`${PLATFORM_ORIGIN}${CONNECTIONS_FETCH_PATH}`, {
+      // AWAITED, not returned as a promise, for the same reason runSql is
+      // (see its call site above): a binding call that REJECTS is then caught
+      // by this function's catch and answered as storage_error 500, which is
+      // this file's contract with the container. Returned unawaited the
+      // rejection escaped handleStorage entirely and the app saw a
+      // runtime-level failure with no body it could read.
+      return await env.PLATFORM.fetch(`${PLATFORM_ORIGIN}${CONNECTIONS_FETCH_PATH}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ assertion: request.headers.get("x-caller-assertion") ?? "", connection: name }),

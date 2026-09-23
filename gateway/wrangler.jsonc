@@ -40,15 +40,14 @@
   // the gateway verifies every Access JWT's issuer against it. When adapting
   // this platform to your own accounts, set it to your <team>.cloudflareaccess.com
   // (OPERATIONS §4.6 step 6) — left stale, apps deploy but every request 401s.
-  "vars": { "ACCESS_TEAM_DOMAIN": "davidlaporte.cloudflareaccess.com", "ACCESS_AUD": "REPLACE", "ENVIRONMENT": "production" },
-  // INERT, and kept only as the record of intent. `vars` is not a field wrangler
-  // accepts inside `dev`: wrangler warns "Unexpected fields found in dev field"
-  // and discards the whole block, so NEITHER var below reaches any runtime,
-  // local or deployed. That is why gateway/index.ts's X-Mock-User branch (R37,
-  // gated on DEV_MOCK_IDENTITY) is currently unreachable everywhere, which is
-  // the safe direction and deliberately not "fixed" here. To supply a var to a
-  // local `wrangler dev`, use a gitignored `.dev.vars` file (OPERATIONS §4.5);
-  // never move either name into the deployed "vars" above, which
-  // ci/template-wrangler.mjs refuses outright.
-  "dev": { "vars": { "ENVIRONMENT": "dev", "DEV_MOCK_IDENTITY": "enabled" } }
+  "vars": { "ACCESS_TEAM_DOMAIN": "davidlaporte.cloudflareaccess.com", "ACCESS_AUD": "REPLACE", "ENVIRONMENT": "production" }
+  // No `dev` block here, in any of the four gateway variants. `vars` is not a
+  // field wrangler accepts inside `dev`: it warns "Unexpected fields found in
+  // dev field" and discards the whole thing, so the block two of these files
+  // used to carry reached no runtime at all, local or deployed. That is why
+  // gateway/index.ts's X-Mock-User branch (R37, gated on DEV_MOCK_IDENTITY) is
+  // unreachable everywhere, which is the safe direction and deliberately not
+  // "fixed". To supply a var to a local `wrangler dev`, use a gitignored
+  // `.dev.vars` file (OPERATIONS §4.5); never add either name to the deployed
+  // "vars" above, which ci/template-wrangler.mjs refuses outright.
 }

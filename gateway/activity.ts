@@ -13,6 +13,13 @@ export const TOUCH_PATH = "/_activity/touch";
 // JSON-RPC methods that are real work. Protocol chatter (initialize, ping,
 // */list, notifications/*) is deliberately absent: a connected-but-unused MCP
 // client must not keep its app alive.
+//
+// This Set is the CODE; its prose twin is src/lifecycle/deadlines.ts's
+// keepsAliveClause (and keepsAliveNeutral beside it), which is what an owner
+// is actually told on app_status, in the panel and in the idle-warning email.
+// gateway/ builds separately from src/, so neither can import the other: a
+// method added or removed here has to be said there in the same breath, or the
+// platform promises owners something this file does not do.
 const WORK_METHODS = new Set(["tools/call", "resources/read", "prompts/get", "completion/complete"]);
 
 // Peeking means buffering a clone of the body; past this size skip the parse

@@ -33,7 +33,9 @@
 //   node ci/template-wrangler.mjs --mcp-gateway <app> <mcpResource> [path]               wrangler.mcp.jsonc
 //   node ci/template-wrangler.mjs --worker-app <app> <databaseId> [path]                 app-worker.jsonc
 // [path] defaults to wrangler.jsonc. Container-shaped deploys also read
-// INNO_IMAGE and INNO_LINKED_DATABASES from the environment (see the CLI block).
+// INNO_IMAGE from the environment. INNO_LINKED_DATABASES is read by those AND
+// by --worker-app, the function-shaped half that holds the linked bindings;
+// the two gateway modes ignore it (see the CLI block).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { stripJsonComments } from "./check-config.mjs";
@@ -154,10 +156,13 @@ function appendLinkedDatabases(text, links, label) {
 // D1 binding, so the link keeps working, just without the liveness gate —
 // the same state every container data link was in before R09 shipped.
 //
-// Anchored at line start so it cannot match the nested `"dev": { "vars": ... }`
-// block that two of the templates carry. The top-level object in every
-// template contains no `}` of its own, which is what makes the textual splice
-// safe; the exactly-one assertion fails loud if that stops being true.
+// Anchored at line start, which is what "top-level" means textually in these
+// templates: a `"vars"` that opens its own line, never one nested inside
+// another object on the same line (a `"dev": { "vars": ... }` block used to be
+// exactly that, in two of the four variants, until it was deleted as inert).
+// The top-level object in every template contains no `}` of its own, which is
+// what makes the textual splice safe; the exactly-one assertion fails loud if
+// either of those stops being true.
 const TOP_LEVEL_VARS_RE = /^([ \t]*"vars"\s*:\s*\{)([^}]*)(\})/m;
 
 function appendLinkGenerationVars(text, links, label) {
@@ -531,9 +536,16 @@ if (isMainModule(import.meta.url)) {
   // deploy — containerImageValue refuses outright when this is empty; there
   // is no Dockerfile-path fallback any more (I-4 fix round).
   const image = process.env.INNO_IMAGE;
-  if (linkedDatabases.length > 0) {
-    console.log(`linking ${linkedDatabases.length} cross-app database(s): ${linkedDatabases.map((l) => l.binding).join(", ")}`);
-  }
+  // Announced by the modes that actually consume the links, not at parse time:
+  // a function-shaped deploy templates the gateway AND the app Worker from the
+  // same environment, and only the app Worker binds the linked databases, so
+  // announcing once per invocation printed the line twice for one deploy, once
+  // for a config that linked nothing.
+  const announceLinks = () => {
+    if (linkedDatabases.length > 0) {
+      console.log(`linking ${linkedDatabases.length} cross-app database(s): ${linkedDatabases.map((l) => l.binding).join(", ")}`);
+    }
+  };
   if (mode === "--worker-gateway") {
     const [app, accessAud, path = "wrangler.jsonc"] = rest;
     if (!app || !accessAud) { console.error("Usage: node ci/template-wrangler.mjs --worker-gateway <app> <accessAud> [path]"); process.exit(1); }
@@ -547,11 +559,13 @@ if (isMainModule(import.meta.url)) {
   } else if (mode === "--mcp-container-gateway") {
     const [app, databaseId, resource, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId || !resource) { console.error("Usage: node ci/template-wrangler.mjs --mcp-container-gateway <app> <databaseId> <resource> [path]"); process.exit(1); }
+    announceLinks();
     writeFileSync(path, templateMcpContainerGateway(readFileSync(path, "utf8"), { app, databaseId, resource, image, linkedDatabases }));
     console.log(`templated mcp-container gateway ${path} for app "${app}"`);
   } else if (mode === "--worker-app") {
     const [app, databaseId, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId) { console.error("Usage: node ci/template-wrangler.mjs --worker-app <app> <databaseId> [path]"); process.exit(1); }
+    announceLinks();
     writeFileSync(path, templateWorkerApp(readFileSync(path, "utf8"), { app, databaseId, linkedDatabases }));
     console.log(`templated app worker ${path} for app "${app}"`);
   } else {
@@ -560,6 +574,7 @@ if (isMainModule(import.meta.url)) {
       console.error("Usage: node ci/template-wrangler.mjs <app> <databaseId> <accessAud> [wranglerPath=wrangler.jsonc]");
       process.exit(1);
     }
+    announceLinks();
     const templated = templateWrangler(readFileSync(wranglerPath, "utf8"), { app, databaseId, accessAud, image, linkedDatabases });
     writeFileSync(wranglerPath, templated);
     console.log(`templated ${wranglerPath} for app "${app}"`);

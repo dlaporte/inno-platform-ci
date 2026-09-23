@@ -6,6 +6,9 @@ export const ACCESS_COOKIE = "CF_Authorization";
 // The platform group prefix. Only `inno-` groups are carried into the
 // container (prod filter here + the dev X-Mock-Groups filter in index.ts) —
 // one constant so the two paths can't drift.
+// Cross-build twin of src/naming.ts's OKTA_GROUP_PREFIX (gateway/ builds
+// separately and imports nothing from src/); naming.ts names this file back,
+// and test/constant-parity.node.test.ts holds the two literals together.
 export const GROUP_PREFIX = "inno-";
 
 export interface AccessIdentity {
@@ -19,6 +22,14 @@ export interface AccessIdentity {
   callerAssertion?: string;
 }
 
+// Cross-build twin of src/routes/activity.ts's makeRealVerifier: the same
+// Access JWT, the same issuer/audience/RS256 pins, hand-written on either side
+// of the gateway build boundary because gateway/ imports nothing from src/.
+// This is the one twin in the pair that is LOGIC rather than a constant, so it
+// is pinned by BEHAVIOR: test/access-verifier-parity.test.ts feeds one signed
+// token matrix to both verifiers and demands the same accept/reject answer. A
+// claims change landing on one side only makes every gateway touch fail
+// verification silently, which freezes last_seen_at on an app in real use.
 export async function verifyAccessJwt(
   token: string,
   opts: { jwks: Parameters<typeof jwtVerify>[1]; aud: string; teamDomain: string },

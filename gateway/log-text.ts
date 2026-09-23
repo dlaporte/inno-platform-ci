@@ -1,7 +1,8 @@
-// The gateway's one way to turn a caught exception into log text.
-// Twin: src/util.ts (errText, flattenControl, errLine). gateway/ compiles and
-// ships as its own Worker and imports nothing from src/, so the two copies are
-// held to the same OUTPUT rather than the same source text, by
+// The gateway's one way to turn a caught exception into log text, and (at the
+// end of the file) its one bytes-to-hex helper.
+// Twin: src/util.ts (errText, flattenControl, errLine, toHex). gateway/
+// compiles and ships as its own Worker and imports nothing from src/, so the
+// two copies are held to the same OUTPUT rather than the same source text, by
 // test/constant-parity.node.test.ts. Same discipline as gateway/bounded-body.ts
 // and the groupsVisibleToApp twins.
 //
@@ -43,4 +44,22 @@ function errText(e: unknown, max: number): string {
  */
 export function errLine(e: unknown, n = 200): string {
   return flattenControl(errText(e, n));
+}
+
+/**
+ * Bytes as lowercase hex. Twin of src/util.ts's `toHex`, held to the same
+ * OUTPUT like everything else in this file, and living here for the same
+ * reason errLine does: this file is the gateway's copy of src/util.ts's small
+ * helpers, so the second one joins the first rather than opening a third home.
+ *
+ * Two call sites wrote this loop out by hand: mcp-auth.ts's introspection
+ * cache key (a whole SHA-256) and red.ts's caller bucket (its first four
+ * bytes). Both feed values that are compared or stored, so the two spellings
+ * had to stay byte-identical by hand; now they cannot differ. Takes a view or
+ * a raw buffer, exactly like the twin, because a `crypto.subtle.digest` result
+ * is the latter.
+ */
+export function hex(bytes: Uint8Array | ArrayBuffer): string {
+  const u = ArrayBuffer.isView(bytes) ? bytes : new Uint8Array(bytes);
+  return [...u].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

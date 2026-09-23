@@ -28,7 +28,7 @@ jobs:
       app: <your-app-name>
 ```
 
-Three things about that file are load-bearing:
+Four things about that file are load-bearing:
 
 - **`@main` is the only accepted ref.** The deploy broker compares the OIDC
   token's signed `job_workflow_ref` claim against this exact string; a SHA, a
@@ -38,6 +38,10 @@ Three things about that file are load-bearing:
   name; strip the trigger and every respin fails with a 422.
 - **`with: app:`** names your registered app. Unset, the workflow falls back to
   deriving it from the repo name.
+- **`branches: [main]` above is only an example.** Registration generates your
+  `deploy.yml` with the repo's own default branch, so a `master` repo gets
+  `branches: [master]`. Copy this sample onto such a repo verbatim and pushes
+  to its default branch run no preflight at all.
 
 Pushing to `main` runs the safety gates only; pushing a `v*` tag deploys.
 

@@ -19,7 +19,7 @@
 // the same adoption story as observability.enabled (2026-07-23) and Workers
 // Logs (§7.10).
 import { GROUP_PREFIX } from "./access";
-import { errLine } from "./log-text";
+import { errLine, hex } from "./log-text";
 
 export type RedEnv = { RED?: AnalyticsEngineDataset };
 
@@ -98,7 +98,7 @@ export function appFromHostname(hostname: string): string {
 export async function userBucket(app: string, email: string): Promise<string> {
   const data = new TextEncoder().encode(`${app}\0${email}`);
   const digest = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(digest).slice(0, 4)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hex(new Uint8Array(digest).slice(0, 4));
 }
 
 export interface RedPoint {

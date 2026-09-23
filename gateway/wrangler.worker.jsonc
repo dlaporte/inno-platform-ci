@@ -33,10 +33,10 @@
   // ACCESS_TEAM_DOMAIN is a STATIC deployment constant (see wrangler.jsonc);
   // ACCESS_AUD is templated per app. No D1/R2 here — storage belongs to the app
   // Worker, which holds its own scoped bindings.
-  "vars": { "ACCESS_TEAM_DOMAIN": "davidlaporte.cloudflareaccess.com", "ACCESS_AUD": "REPLACE", "ENVIRONMENT": "production" },
-  // INERT, exactly as in wrangler.jsonc: wrangler discards a `vars` key inside
-  // `dev`, so neither var below reaches any runtime and the X-Mock-User branch
-  // (R37) is unreachable everywhere. Use a gitignored `.dev.vars` file for a
-  // local-only var (OPERATIONS §4.5). See wrangler.jsonc for the full note.
-  "dev": { "vars": { "ENVIRONMENT": "dev", "DEV_MOCK_IDENTITY": "enabled" } }
+  "vars": { "ACCESS_TEAM_DOMAIN": "davidlaporte.cloudflareaccess.com", "ACCESS_AUD": "REPLACE", "ENVIRONMENT": "production" }
+  // No `dev` block, exactly as in wrangler.jsonc: wrangler discards a `vars`
+  // key inside `dev`, so the one this file used to carry reached no runtime
+  // and the X-Mock-User branch (R37) is unreachable everywhere. Use a
+  // gitignored `.dev.vars` file for a local-only var (OPERATIONS §4.5). See
+  // wrangler.jsonc for the full note.
 }
