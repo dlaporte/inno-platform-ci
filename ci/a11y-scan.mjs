@@ -4,8 +4,8 @@
 //
 // The container job's smoke test already runs the exact image that will
 // deploy, on the runner, with no Cloudflare Access in front of it. This script
-// points a headless Chromium at that container, sends the synthetic identity
-// headers the gateway would stamp (R3) to the app's own origin only, runs
+// points a headless Chromium at that container, sends the headers the gateway
+// would stamp (R3; see identityHeaders) to the app's own origin only, runs
 // axe-core on each route, and reports:
 //   - axe violations under the WCAG 2.0/2.1/2.2 A + AA tags, by impact;
 //   - which routes were scanned and which could not be (coverage);
@@ -64,11 +64,15 @@ const AXE_TIMEOUT_MS = 60_000;
 // GitHub renders at most 10 annotations of each kind (error, warning) per
 // step and drops the rest silently, in print order: a longer list used to
 // lose the response-header advisories and its own overflow pointer, both
-// printed last. The workflow step that runs this script adds up to two lines
-// of its own (a route-file warning before the scan, the exit-status warning
-// or the enforce error after it), so this script keeps to 8 of each kind and
-// points at the step summary with a ::notice, a kind the findings never use.
-export const ANNOTATIONS_PER_KIND = 8;
+// printed last. Beside this budget, one run can print four more warnings:
+// the workflow step's route-file warning before the scan, this script's own
+// crash line (at the bottom of this file), and after the scan the step's
+// summary-symlink warning and its exit-status warning, whose enforce error
+// replaces it (so one more error at most). This script therefore keeps to 6
+// of each kind, and points at the step summary with a ::notice, a kind the
+// findings never use. test/a11y-workflow.node.test.ts runs the step on every
+// path and fails if a new line breaks the sum.
+export const ANNOTATIONS_PER_KIND = 6;
 // The whole scan's wall-clock budget, well inside the hard `timeout` the
 // workflow puts on the scanner's docker run (budget, /healthz wait and 60 s
 // of slack), so a slow app is reported ("time budget") rather than killed.
@@ -146,6 +150,49 @@ export function parseIgnores(raw) {
  */
 export function parseMode(raw) {
   return raw === "enforce" || raw === "off" ? raw : "report";
+}
+
+/**
+ * The headers the gateway owns under R3, as the scan sends them: a synthetic
+ * member of the app's users group, and the forwarded host and proto of
+ * --base. Those two are what is true on the runner (production sends the
+ * app's hostname and https); APP-CONTRACT tells apps to build links from
+ * them, and an https proto here would send an app's own redirects off the
+ * scanned origin. Never throws, so scan() can keep its promise of a result.
+ *
+ * @param {{base: string, app?: string}} args
+ * @returns {Array<{name: string, value: string}>}
+ */
+export function identityHeaders({ base, app }) {
+  let host = "";
+  let proto = "";
+  try {
+    const u = new URL(base);
+    host = u.host;
+    proto = u.protocol.replace(/:$/, "");
+  } catch { /* no usable --base: the scan then fails as a whole, platform-side */ }
+  return [
+    { name: "X-Forwarded-User", value: SCAN_USER },
+    { name: "X-Forwarded-Email", value: SCAN_USER },
+    { name: "X-Forwarded-Groups", value: app ? `inno-${app}-users` : "" },
+    { name: "X-Forwarded-Host", value: host },
+    { name: "X-Forwarded-Proto", value: proto },
+  ];
+}
+
+/**
+ * A same-origin request's headers with the identity headers set: any copy
+ * the page sent of one of them (any case) is dropped first, so the app sees
+ * exactly what the gateway would stamp, never what page script supplied.
+ *
+ * @param {Record<string, unknown>|undefined} headers - the request's headers
+ * @param {Array<{name: string, value: string}>} identity
+ * @returns {Array<{name: string, value: string}>}
+ */
+export function withIdentity(headers, identity) {
+  const ours = new Set(identity.map((h) => h.name.toLowerCase()));
+  const kept = Object.entries(headers ?? {}).filter(([name]) => !ours.has(name.toLowerCase()));
+  return [...kept.map(([name, value]) => ({ name, value: String(value) })), ...identity];
 }
 
 /**
@@ -264,8 +311,9 @@ export function cell(s, n = 120) {
   // Everything but plain letters, digits, space and a few inert punctuation
   // marks becomes a numeric character reference, which GitHub renders as the
   // literal character: no table break (|), HTML, link, image, emphasis,
-  // code span or autolink can come out of app-controlled text.
-  return logSafe(s, n).replace(/[^A-Za-z0-9 .,;=?\/-]/g, (c) => `&#${c.codePointAt(0)};`);
+  // code span or autolink can come out of app-controlled text. "." is
+  // encoded too, since GitHub autolinks a bare www.example.com/x.
+  return logSafe(s, n).replace(/[^A-Za-z0-9 ,;=?\/-]/g, (c) => `&#${c.codePointAt(0)};`);
 }
 
 /** Text for inside a markdown code span in a table (entities do not decode there). */
@@ -604,7 +652,24 @@ const RENDERED_EXPR = `(() => {
 const AXE_RUN_EXPR = `axe.run(document, { runOnly: { type: "tag", values: ${JSON.stringify(AXE_TAGS)} }, resultTypes: ["violations"] })` +
   `.then(r => JSON.stringify({ v: r.testEngine.version, violations: r.violations.map(x => ({ id: x.id, impact: x.impact, help: x.help, helpUrl: x.helpUrl, nodes: x.nodes.length, targets: x.nodes.slice(0, 3).map(n => [].concat(n.target).join(" ")) })) }))`;
 
-async function scanRoute(cdp, base, route, axeSource, identity, deadline) {
+const RENDERER_CRASHED = "the page's renderer crashed (the scanner's memory or /tmp limit)";
+
+/**
+ * Scan one route in its own browser target. A renderer crash
+ * (Inspector.targetCrashed) is the scanner's failure, whatever the dead page
+ * looked like by then: its own memory and /tmp limits are the likely cause,
+ * and left alone it reads as a page that never loaded, rendered nothing or
+ * left the origin, all of which enforce holds against the app.
+ *
+ * @returns {Promise<{route: string, status: string, reason?: string, [k: string]: unknown}>}
+ */
+export async function scanRoute(cdp, base, route, axeSource, identity, deadline) {
+  const watch = { crashed: false };
+  const r = await visitRoute(cdp, base, route, axeSource, identity, deadline, watch);
+  return watch.crashed && r.status !== "scanned" ? { route, status: "scanner-error", reason: RENDERER_CRASHED } : r;
+}
+
+async function visitRoute(cdp, base, route, axeSource, identity, deadline, watch) {
   const url = new URL(route, base).href;
   const origin = new URL(base).origin;
   const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
@@ -621,11 +686,10 @@ async function scanRoute(cdp, base, route, axeSource, identity, deadline) {
       case "Fetch.requestPaused": {
         // Identity headers go to the app's own origin ONLY (never to a CDN
         // or any third party the page loads).
-        const hdrs = Object.entries(p.request.headers ?? {}).map(([name, value]) => ({ name, value: String(value) }));
         let sameOrigin = false;
         try { sameOrigin = new URL(p.request.url).origin === origin; } catch { /* opaque url */ }
         const params = { requestId: p.requestId };
-        if (sameOrigin) params.headers = [...hdrs.filter((h) => !/^x-forwarded-(user|email|groups)$/i.test(h.name)), ...identity];
+        if (sameOrigin) params.headers = withIdentity(p.request.headers, identity);
         cdp.send("Fetch.continueRequest", params, sessionId).catch(() => {});
         break;
       }
@@ -649,6 +713,9 @@ async function scanRoute(cdp, base, route, axeSource, identity, deadline) {
       case "Page.loadEventFired":
         loaded = true;
         break;
+      case "Inspector.targetCrashed":
+        watch.crashed = true;
+        break;
       default:
     }
   });
@@ -660,6 +727,9 @@ async function scanRoute(cdp, base, route, axeSource, identity, deadline) {
     cdp.send("Runtime.evaluate", { expression, contextId, returnByValue: true, ...params }, sessionId, left(timeoutMs));
   try {
     await cdp.send("Page.enable", {}, sessionId, left(30_000));
+    // Delivers Inspector.targetCrashed. Not essential to a scan, so a browser
+    // that refuses it scans on without crash detection.
+    await cdp.send("Inspector.enable", {}, sessionId, left(30_000)).catch(() => {});
     const tree = await cdp.send("Page.getFrameTree", {}, sessionId, left(30_000));
     mainFrame = tree.frameTree.frame.id;
     await cdp.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Request" }] }, sessionId, left(30_000));
@@ -680,6 +750,9 @@ async function scanRoute(cdp, base, route, axeSource, identity, deadline) {
     const loadBy = Date.now() + navBudget;
     let idleBy = 0;
     for (;;) {
+      // A dead renderer never fires load: stop now rather than wait out the
+      // load budget (scanRoute reports why).
+      if (watch.crashed) return { route, status: "scanner-error", reason: RENDERER_CRASHED };
       if (Date.now() > deadline) return { route, status: "budget", reason: "the scan's time budget ran out" };
       if (!loaded) {
         idleBy = 0;
@@ -763,11 +836,7 @@ async function waitHealthz(base, seconds) {
  */
 export async function scan({ base, routes, axeSource, app, chrome, budgetMs = SCAN_BUDGET_MS }) {
   const deadline = Date.now() + budgetMs;
-  const identity = [
-    { name: "X-Forwarded-User", value: SCAN_USER },
-    { name: "X-Forwarded-Email", value: SCAN_USER },
-    { name: "X-Forwarded-Groups", value: app ? `inno-${app}-users` : "" },
-  ];
+  const identity = identityHeaders({ base, app });
   const binary = chrome || findChrome();
   if (!binary) return { pages: [], infra: true, error: "no Chromium found in the scanner image" };
   const { proc, profile } = launchChrome(binary);
