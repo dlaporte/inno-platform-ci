@@ -571,116 +571,6 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         run: docker build -t app-under-test .
 
-      - name: Trivy image scan (fail on HIGH/CRITICAL)
-        if: needs.policy.outputs.function_shaped != 'true' && steps.gate.outputs.enabled == 'true'
-        # Run trivy directly via its official image rather than the
-        # setup-trivy action — deterministic, and we authenticate the
-        # vuln-DB pull with github.token to avoid anonymous ghcr rate limits
-        # (the common cause of trivy-action CI flakes). --ignore-unfixed so
-        # only actionable (patch-available) HIGH/CRITICAL fail the gate.
-        env:
-          TRIVY_TOKEN: ${{ github.token }}
-        run: |
-          # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot change
-          # gate/sweep behavior with no repo diff. Bump platform-ci.yml and
-          # safety-sweep.yml together — the gate and the sweep must never disagree.
-          # NOTE: keep comments ABOVE `docker run`, never between its
-          # backslash-continued lines — a `#` there silently truncates the command
-          # (the image argument is dropped) and bash -n cannot see it.
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
-            -v "$PWD/.trivyignore.platform:/.trivyignore.platform:ro" \
-            -e GITHUB_TOKEN="$TRIVY_TOKEN" \
-            aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
-              --severity HIGH,CRITICAL \
-              --ignore-unfixed \
-              --ignorefile /.trivyignore.platform \
-              --exit-code 1 \
-              --no-progress \
-              app-under-test
-
-      # SBOM of the image that is about to deploy — the safety sweep's input.
-      # Uploaded DIRECTLY to the broker from this job (no workflow artifact:
-      # app-owned jobs in the caller share the run's artifact namespace) and
-      # staged server-side under this run's VERIFIED run_id claim;
-      # /deploy-complete promotes it to the live pointer. Best-effort: a failed
-      # upload warns and the build proceeds (the sweep keeps the previous SBOM).
-      - name: Generate SBOM (CycloneDX)
-        if: needs.policy.outputs.function_shaped != 'true'
-        env:
-          TRIVY_TOKEN: ${{ github.token }}
-        run: |
-          # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot change
-          # gate/sweep behavior with no repo diff. Bump platform-ci.yml and
-          # safety-sweep.yml together — the gate and the sweep must never disagree.
-          # NOTE: keep comments ABOVE `docker run`, never between its
-          # backslash-continued lines — a `#` there silently truncates the command
-          # (the image argument is dropped) and bash -n cannot see it.
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
-            -v "$PWD:/out" \
-            -e GITHUB_TOKEN="$TRIVY_TOKEN" \
-            aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
-              --format cyclonedx \
-              --output /out/sbom.json \
-              --no-progress \
-              app-under-test
-
-      # The identity of the image the gates actually scanned. Reported to the
-      # broker with the SBOM below, under this run's VERIFIED OIDC run_id
-      # claim, from this TOKEN-LESS job. The image itself travels to the deploy
-      # job as a workflow artifact, and app-owned jobs in the caller share the
-      # run's artifact namespace — so the artifact alone proves nothing and
-      # this recorded id is what the deploy job checks it against.
-      - name: Record the scanned image id
-        id: image
-        if: needs.policy.outputs.function_shaped != 'true'
-        # Captured into a variable first: `echo "id=$(...)"` returns echo's own
-        # 0 when the substitution fails, which would stage the SBOM with an
-        # empty id and surface one job later as "the container job did not
-        # record an image id with the broker; re-run the release after a green
-        # safety preflight", which is a wrong diagnosis delivered after a
-        # deploy token has already been minted. Failing here names the step
-        # that actually went wrong.
-        run: |
-          set -e
-          id="$(docker image inspect --format '{{.Id}}' app-under-test)"
-          if [ -z "$id" ]; then
-            echo "::error title=No image id::docker image inspect returned nothing for app-under-test; the scanned image is not on this runner"
-            exit 1
-          fi
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout inno-platform (ci/ scripts)
-        if: needs.policy.outputs.function_shaped != 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: dlaporte/inno-platform-ci
-          ref: ${{ env.PLATFORM_REF }}
-          path: inno-platform-ci
-
-      - name: Get OIDC token (audience=inno-platform-sbom)
-        id: oidc_sbom
-        if: needs.policy.outputs.function_shaped != 'true'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
-        with:
-          script: |
-            const token = await core.getIDToken('inno-platform-sbom');
-            core.setSecret(token);
-            core.setOutput('token', token);
-
-      - name: Upload SBOM to broker (best-effort)
-        if: needs.policy.outputs.function_shaped != 'true'
-        env:
-          OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
-          APP: ${{ needs.policy.outputs.app }}
-          IMAGE_ID: ${{ steps.image.outputs.id }}
-        run: |
-          node inno-platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$OIDC_TOKEN" "$IMAGE_ID" \
-            || echo "::warning::SBOM upload failed — the safety sweep will keep using the previous deployment's SBOM"
-
       - name: Assert non-root user + EXPOSE 8080
         if: needs.policy.outputs.function_shaped != 'true'
         run: |
@@ -845,9 +735,119 @@ jobs:
           echo "container-validate: /healthz healthy"
           docker rm -f smoke
 
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        if: needs.policy.outputs.function_shaped != 'true' && steps.gate.outputs.enabled == 'true'
+        # Run trivy directly via its official image rather than the
+        # setup-trivy action; it is deterministic, and we authenticate the
+        # vuln-DB pull with github.token to avoid anonymous ghcr rate limits
+        # (the common cause of trivy-action CI flakes). --ignore-unfixed so
+        # only actionable (patch-available) HIGH/CRITICAL fail the gate.
+        env:
+          TRIVY_TOKEN: ${{ github.token }}
+        run: |
+          # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot change
+          # gate/sweep behavior with no repo diff. Bump platform-ci.yml and
+          # safety-sweep.yml together; the gate and the sweep must never disagree.
+          # NOTE: keep comments ABOVE `docker run`, never between its
+          # backslash-continued lines; a `#` there silently truncates the command
+          # (the image argument is dropped) and bash -n cannot see it.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            -v "$PWD/.trivyignore.platform:/.trivyignore.platform:ro" \
+            -e GITHUB_TOKEN="$TRIVY_TOKEN" \
+            aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --ignorefile /.trivyignore.platform \
+              --exit-code 1 \
+              --no-progress \
+              app-under-test
+
+      # SBOM of the image that is about to deploy: the safety sweep's input.
+      # Uploaded DIRECTLY to the broker from this job (no workflow artifact:
+      # app-owned jobs in the caller share the run's artifact namespace) and
+      # staged server-side under this run's VERIFIED run_id claim;
+      # /deploy-complete promotes it to the live pointer. Best-effort: a failed
+      # upload warns and the build proceeds (the sweep keeps the previous SBOM).
+      - name: Generate SBOM (CycloneDX)
+        if: needs.policy.outputs.function_shaped != 'true'
+        env:
+          TRIVY_TOKEN: ${{ github.token }}
+        run: |
+          # aquasec/trivy v0.63.0, digest-pinned so a republished tag cannot change
+          # gate/sweep behavior with no repo diff. Bump platform-ci.yml and
+          # safety-sweep.yml together; the gate and the sweep must never disagree.
+          # NOTE: keep comments ABOVE `docker run`, never between its
+          # backslash-continued lines; a `#` there silently truncates the command
+          # (the image argument is dropped) and bash -n cannot see it.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            -v "$PWD:/out" \
+            -e GITHUB_TOKEN="$TRIVY_TOKEN" \
+            aquasec/trivy@sha256:6fb0646988fcd2fdf7bf123f7174945ebc2c9c72d1fa1567c8d7daeeb70f8037 image \
+              --format cyclonedx \
+              --output /out/sbom.json \
+              --no-progress \
+              app-under-test
+
+      # The identity of the image the gates actually scanned. Reported to the
+      # broker with the SBOM below, under this run's VERIFIED OIDC run_id
+      # claim, from this TOKEN-LESS job. The image itself travels to the deploy
+      # job as a workflow artifact, and app-owned jobs in the caller share the
+      # run's artifact namespace, so the artifact alone proves nothing and
+      # this recorded id is what the deploy job checks it against.
+      - name: Record the scanned image id
+        id: image
+        if: needs.policy.outputs.function_shaped != 'true'
+        # Captured into a variable first: `echo "id=$(...)"` returns echo's own
+        # 0 when the substitution fails, which would stage the SBOM with an
+        # empty id and surface one job later as "the container job did not
+        # record an image id with the broker; re-run the release after a green
+        # safety preflight", which is a wrong diagnosis delivered after a
+        # deploy token has already been minted. Failing here names the step
+        # that actually went wrong.
+        run: |
+          set -e
+          id="$(docker image inspect --format '{{.Id}}' app-under-test)"
+          if [ -z "$id" ]; then
+            echo "::error title=No image id::docker image inspect returned nothing for app-under-test; the scanned image is not on this runner"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout inno-platform (ci/ scripts)
+        if: needs.policy.outputs.function_shaped != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform-ci
+          ref: ${{ env.PLATFORM_REF }}
+          path: inno-platform-ci
+
+      - name: Get OIDC token (audience=inno-platform-sbom)
+        id: oidc_sbom
+        if: needs.policy.outputs.function_shaped != 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const token = await core.getIDToken('inno-platform-sbom');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Upload SBOM to broker (best-effort)
+        if: needs.policy.outputs.function_shaped != 'true'
+        env:
+          OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
+          APP: ${{ needs.policy.outputs.app }}
+          IMAGE_ID: ${{ steps.image.outputs.id }}
+        run: |
+          node inno-platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$OIDC_TOKEN" "$IMAGE_ID" \
+            || echo "::warning::SBOM upload failed: the safety sweep will keep using the previous deployment's SBOM"
+
       # Contract 22 (R8, §3; docs/APP-ACCESSIBILITY.md): an automated
       # accessibility scan plus an advisory response-header check of the SAME
-      # image the smoke test just ran, for browser-facing apps (container
+      # image the smoke test ran earlier, for browser-facing apps (container
       # shape, sso perimeter; an oauth-rs app serves no browser UI). A REPORT
       # step whose verdict is policy-defined (header of this file):
       #   - it fails the job in exactly one case: the mode is enforce, the
