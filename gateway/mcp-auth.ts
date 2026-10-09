@@ -164,11 +164,8 @@ async function introspectViaPlatform(
         // Omitted entirely when unprovisioned; the platform then withholds
         // the caller assertion unless its admin switch is explicitly false
         // (the cutover override), so a keyless gateway loses Connections
-        // until it is redeployed with the key. It loses the idle clock with
-        // it: index.ts's touch fires only when the identity carries an
-        // assertion, so an MCP app in real use stops advancing its clock and
-        // the lifecycle engine warns and then stops it. One redeploy restores
-        // both.
+        // until it is redeployed with the key. Its idle clock keeps running:
+        // index.ts's touch carries the token, not the assertion.
         ...(gatewayKey ? { [GATEWAY_KEY_HEADER]: gatewayKey } : {}),
       },
       body: JSON.stringify({ token, resource }),

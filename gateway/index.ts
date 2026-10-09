@@ -201,11 +201,13 @@ export function makeApp(deps: Deps = realDeps) {
       if (c.req.method === "GET" && isProtectedResourceRequest(env, path)) {
         return protectedResourceMetadata(env);
       }
-      const auth = await authenticateMcp(env, c.req.raw, env.OAUTH_RS_RESOURCE ?? "");
+      const resource = env.OAUTH_RS_RESOURCE ?? "";
+      const bearer = bearerToken(c.req.raw);
+      const auth = await authenticateMcp(env, c.req.raw, resource);
       if (!auth) {
         // Distinguish "presented a bad/expired token" (→ error=invalid_token, so
         // the client refreshes) from "presented none" (→ start authorization).
-        const hadToken = bearerToken(c.req.raw) !== null;
+        const hadToken = bearer !== null;
         console.warn(`gateway: 401 ${hadToken ? "invalid" : "no"} bearer (${c.req.method} ${path})`);
         return unauthorizedChallenge(env, hadToken);
       }
@@ -229,10 +231,15 @@ export function makeApp(deps: Deps = realDeps) {
       // user advances the idle clock. Debounce-gated BEFORE the body peek so
       // the clone/parse cost is paid at most once per window; protocol
       // chatter, probes, and tokenless noise never qualify.
-      if (env.PLATFORM && identity.callerAssertion && c.req.method === "POST" && path === "/mcp") {
+      // Keyed on the email, the way the sso branch below is, and carrying the
+      // caller's own token for the platform to re-introspect (OPEN #35). It
+      // used to carry the caller assertion, which the platform withholds from
+      // a gateway without the key, so a keyless gateway froze its app's clock.
+      // The service credential has no email, so it never touches.
+      if (env.PLATFORM && identity.email && bearer && c.req.method === "POST" && path === "/mcp") {
         if (shouldTouch(host, Date.now()) && (await mcpWorkRequest(c.req.raw))) {
           markTouched(host, Date.now());
-          queueTouch(c, env.PLATFORM, { assertion: identity.callerAssertion });
+          queueTouch(c, env.PLATFORM, { resource, token: bearer });
         }
       }
     } else if (env.ENVIRONMENT === "dev" && env.DEV_MOCK_IDENTITY === "enabled") {

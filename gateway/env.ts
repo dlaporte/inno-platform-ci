@@ -57,12 +57,9 @@ export type Env = {
   // The platform requires this header once its own key is provisioned, unless
   // its admin switch (connections.gateway_key_required) is explicitly false.
   // A gateway deployed before the key existed has none to send and must be
-  // redeployed to receive it.
-  // Connections is not all a keyless gateway loses: the oauth-rs idle-clock
-  // touch (index.ts) fires only when the identity carries a caller assertion,
-  // which is exactly what the platform withholds here, so an MCP app in real
-  // use stops advancing its clock and the lifecycle engine warns and then
-  // stops it. One redeploy restores both.
+  // redeployed to receive it. The oauth-rs idle-clock touch does not need it:
+  // index.ts sends the caller's own token, which the platform re-introspects
+  // (OPEN #35).
   GATEWAY_INTROSPECT_KEY?: string;
   // RED signal (NoOp Phase 2, gateway/red.ts). Bound on all four gateway
   // variants, and OPTIONAL for a reason that is load-bearing rather than
