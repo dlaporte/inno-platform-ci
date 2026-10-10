@@ -28,7 +28,7 @@
 
 import type { Env } from "./env";
 import type { AccessIdentity } from "./access";
-import { GROUP_PREFIX } from "./access";
+import { instanceGroups } from "./instance";
 import { errLine, hex } from "./log-text";
 import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
@@ -80,7 +80,7 @@ function cacheSet(key: string, body: IntrospectionResponse, ttlSeconds: number, 
 
 // RFC 9728 §3.1: the metadata document lives under this prefix on the RESOURCE's
 // own origin, with the resource's path component INSERTED after it. Our resource
-// is `https://inno-{app}.{domain}/mcp`, so the spec-correct URL is
+// is `https://<hostPrefix><app>.<domain>/mcp`, so the spec-correct URL is
 // `/.well-known/oauth-protected-resource/mcp`. Clients differ on this in
 // practice, so `isProtectedResourceRequest` accepts the bare prefix too and the
 // challenge advertises the spec-correct form.
@@ -182,9 +182,10 @@ async function introspectViaPlatform(
 }
 
 // Resolve a bearer token to an identity, using (and populating) the per-isolate
-// cache. Returns null for any invalid/expired/foreign token.
+// cache. Returns null for any invalid/expired/foreign token. `groupPrefix` is
+// the gateway's GROUP_PREFIX var, which index.ts has already checked.
 export async function authenticateMcp(
-  env: Env, req: Request, resource: string,
+  env: Env, req: Request, resource: string, groupPrefix: string,
 ): Promise<McpAuthResult | null> {
   const token = bearerToken(req);
   if (!token) return null;
@@ -231,14 +232,13 @@ export async function authenticateMcp(
     console.warn("gateway: rejecting active introspection with no email and no service flag");
     return null;
   }
-  // Re-filter groups to the inno- prefix, matching verifyAccessJwt (access.ts)
-  // and the dev path — one invariant, now three producers. The gateway is
-  // version-pinned per app (gateway_ref) while the platform ships from main, so
-  // "the platform already filters" is a cross-version assumption, not a local
-  // guarantee; enforce it here too.
-  const groups = (Array.isArray(body.groups) ? body.groups : [])
-    .filter((g): g is string => typeof g === "string" && g.startsWith(GROUP_PREFIX));
-  const identity: AccessIdentity = { email, groups };
+  // Re-filter groups to this instance's group prefix, matching
+  // verifyAccessJwt (access.ts) and the dev path: one invariant, three
+  // producers, one filter (instance.ts instanceGroups). The gateway is
+  // version-pinned per app (gateway_ref) while the platform ships from main,
+  // so "the platform already filters" is a cross-version assumption, not a
+  // local guarantee; enforce it here too.
+  const identity: AccessIdentity = { email, groups: instanceGroups(groupPrefix, body.groups) };
   if (body.caller_assertion) identity.callerAssertion = body.caller_assertion;
   return { identity, service: body.service === true };
 }

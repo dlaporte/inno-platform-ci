@@ -15,6 +15,12 @@ export type Env = {
   // against `undefined`.
   ACCESS_AUD?: string; ACCESS_TEAM_DOMAIN?: string;
   ENVIRONMENT: string;
+  // The instance's host and group prefixes (naming.hostPrefix,
+  // naming.groupPrefix), rendered into all four gateway configs. Read only
+  // through instance.ts's readPrefixes. OPTIONAL in the type because a config
+  // without them is a deploy-time error the gateway must catch and refuse
+  // (index.ts answers 500), never one the compiler may assume away.
+  HOST_PREFIX?: string; GROUP_PREFIX?: string;
   // The dev mock-identity switch (R37): index.ts's X-Mock-User branch requires
   // it to equal "enabled". NOTHING SUPPLIES IT TODAY, in any runtime. The
   // gateway configs name it inside their `dev` block, but `vars` is not a field
@@ -39,7 +45,7 @@ export type Env = {
   // Server instead of an Access-terminating proxy. OAUTH_RS_MODE is the switch;
   // ACCESS_AUD is absent on these apps because they have no Access application.
   OAUTH_RS_MODE?: string;
-  // This app's RFC 8707/9728 resource identifier — `https://inno-{app}.{domain}/mcp`,
+  // This app's RFC 8707/9728 resource identifier, `https://<hostPrefix><app>.<domain>/mcp`,
   // templated by CI from the deploy broker's `oauth_rs_resource`. Compared by EXACT
   // match against a token's audience, so it must not be rebuilt ad hoc.
   OAUTH_RS_RESOURCE?: string;

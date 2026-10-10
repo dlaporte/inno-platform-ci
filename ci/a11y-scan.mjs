@@ -38,7 +38,14 @@
 //   node ci/a11y-scan.mjs --base <url> --axe <axe.min.js> [--app <name>]
 //     [--mode report|enforce] [--ignore "<rule ids, space-separated>"]
 //     [--routes <inno-a11y.json>] [--summary <file>] [--json <file>]
-//     [--chrome <binary>] [--wait-healthz <seconds>]
+//     [--chrome <binary>] [--wait-healthz <seconds>] [--instance <instance.json>]
+//
+// The synthetic user's group is built from the instance's group prefix, read
+// from --instance <path>, else INNO_INSTANCE_JSON (the JSON itself, not a
+// path), else the ci/instance.json beside this script (ci/cli.mjs
+// loadInstanceData). Tenant CI runs the scanner under `docker run`, which
+// passes it no environment, and mounts ci/ into its container whole, so the
+// default is the one it uses.
 //
 // Zero npm dependencies (node builtins + local cli.mjs), like every ci/ script:
 // it drives Chromium over the DevTools protocol on --remote-debugging-pipe, so
@@ -50,7 +57,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isMainModule, logSafe } from "./cli.mjs";
+import { isMainModule, loadInstanceData, logSafe } from "./cli.mjs";
 
 export const AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 export const BLOCKING_IMPACTS = ["critical", "serious"];
@@ -154,16 +161,20 @@ export function parseMode(raw) {
 
 /**
  * The headers the gateway owns under R3, as the scan sends them: a synthetic
- * member of the app's users group, and the forwarded host and proto of
- * --base. Those two are what is true on the runner (production sends the
- * app's hostname and https); APP-CONTRACT tells apps to build links from
- * them, and an https proto here would send an app's own redirects off the
- * scanned origin. Never throws, so scan() can keep its promise of a result.
+ * member of the app's users group (<groupPrefix><app>-users, the gateway's
+ * and src/naming.ts oktaGroupName's formula), and the forwarded host and
+ * proto of --base. Those two are what is true on the runner (production
+ * sends the app's hostname and https); APP-CONTRACT tells apps to build
+ * links from them, and an https proto here would send an app's own
+ * redirects off the scanned origin. Never throws, so scan() can keep its
+ * promise of a result. main() never scans without a group prefix (it reports
+ * unreadable instance data as "did not run"), so no group is sent only when
+ * no app is named.
  *
- * @param {{base: string, app?: string}} args
+ * @param {{base: string, app?: string, groupPrefix?: string}} args
  * @returns {Array<{name: string, value: string}>}
  */
-export function identityHeaders({ base, app }) {
+export function identityHeaders({ base, app, groupPrefix }) {
   let host = "";
   let proto = "";
   try {
@@ -174,7 +185,7 @@ export function identityHeaders({ base, app }) {
   return [
     { name: "X-Forwarded-User", value: SCAN_USER },
     { name: "X-Forwarded-Email", value: SCAN_USER },
-    { name: "X-Forwarded-Groups", value: app ? `inno-${app}-users` : "" },
+    { name: "X-Forwarded-Groups", value: app && groupPrefix ? `${groupPrefix}${app}-users` : "" },
     { name: "X-Forwarded-Host", value: host },
     { name: "X-Forwarded-Proto", value: proto },
   ];
@@ -834,9 +845,9 @@ async function waitHealthz(base, seconds) {
  * Drive the browser over every route. Never throws: a failure to start is a
  * result with no scanned pages and an error string.
  */
-export async function scan({ base, routes, axeSource, app, chrome, budgetMs = SCAN_BUDGET_MS }) {
+export async function scan({ base, routes, axeSource, app, groupPrefix, chrome, budgetMs = SCAN_BUDGET_MS }) {
   const deadline = Date.now() + budgetMs;
-  const identity = identityHeaders({ base, app });
+  const identity = identityHeaders({ base, app, groupPrefix });
   const binary = chrome || findChrome();
   if (!binary) return { pages: [], infra: true, error: "no Chromium found in the scanner image" };
   const { proc, profile } = launchChrome(binary);
@@ -867,11 +878,11 @@ export async function scan({ base, routes, axeSource, app, chrome, budgetMs = SC
 
 const USAGE = "Usage: node ci/a11y-scan.mjs --base <url> --axe <axe.min.js> [--app <name>] " +
   "[--mode report|enforce] [--ignore \"<rule ids, space-separated>\"] [--routes <inno-a11y.json>] " +
-  "[--summary <file>] [--json <file>] [--chrome <binary>] [--wait-healthz <seconds>]";
+  "[--summary <file>] [--json <file>] [--chrome <binary>] [--wait-healthz <seconds>] [--instance <instance.json>]";
 // Every flag in USAGE. Anything else is refused rather than skipped: a typo
 // such as --wait-heathz would otherwise drop the setting it meant without a
 // word, and an unquoted --ignore list would lose all but its first rule id.
-const FLAGS = new Set(["base", "axe", "app", "mode", "ignore", "routes", "summary", "json", "chrome", "wait-healthz"]);
+const FLAGS = new Set(["base", "axe", "app", "mode", "ignore", "routes", "summary", "json", "chrome", "wait-healthz", "instance"]);
 
 /**
  * Parse `--flag value` pairs (a flag followed by another flag, or by
@@ -913,11 +924,26 @@ export async function main(argv = process.argv.slice(2)) {
   if (args.routes && existsSync(args.routes)) routesText = readFileSync(args.routes, "utf8");
   const { routes, warning: routesWarning } = parseRoutes(routesText);
   let result;
-  let axeSource = null;
+  let groupPrefix = null;
   try {
-    axeSource = readFileSync(args.axe, "utf8");
-  } catch {
-    result = { pages: [], infra: true, error: "axe-core was not available to the scanner" };
+    groupPrefix = loadInstanceData({ path: args.instance || undefined }).groupPrefix;
+  } catch (e) {
+    // The platform's file, never the app's fault: reported, never blocking.
+    // loadInstanceData says "<source>: <reason>", and the source can be a
+    // long path, so the reason goes first and a cut at the bound drops the
+    // tail of the path, never the reason.
+    const msg = String(e instanceof Error ? e.message : e);
+    const at = msg.indexOf(": ");
+    const line = at < 0 ? msg : `${msg.slice(at + 2)} (${msg.slice(0, at)})`;
+    result = { pages: [], infra: true, error: `the instance data could not be read: ${logSafe(line, 160)}` };
+  }
+  let axeSource = null;
+  if (!result) {
+    try {
+      axeSource = readFileSync(args.axe, "utf8");
+    } catch {
+      result = { pages: [], infra: true, error: "axe-core was not available to the scanner" };
+    }
   }
   if (!result && !args.base) result = { pages: [], infra: true, error: "no --base url" };
   if (!result && args["wait-healthz"] && !(await waitHealthz(args.base, Number(args["wait-healthz"]) || 90))) {
@@ -925,7 +951,7 @@ export async function main(argv = process.argv.slice(2)) {
     // the scan environment's problem, reported but never blocking.
     result = { pages: [], infra: true, error: "the app did not answer /healthz 200 for the scan" };
   }
-  if (!result) result = await scan({ base: args.base, routes, axeSource, app: args.app, chrome: args.chrome });
+  if (!result) result = await scan({ base: args.base, routes, axeSource, app: args.app, groupPrefix, chrome: args.chrome });
   const outcome = evaluate(result, mode, ignores);
   const first = result.pages.find((p) => p.headers && p.status === "scanned") ?? result.pages.find((p) => p.headers);
   const headers = first ? headerFindings(first.headers) : [];

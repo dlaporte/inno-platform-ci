@@ -1,0 +1,9 @@
+{
+  "hostPrefix": "inno-",
+  "resourcePrefix": "inno-",
+  "groupPrefix": "inno-",
+  "platformName": "inno-platform",
+  "platformHost": "inno-platform",
+  "adminGroup": "inno-platform-admins",
+  "diagBucket": "inno-platform-diagnostics"
+}

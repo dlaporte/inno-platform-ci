@@ -6,7 +6,7 @@
 // just before `wrangler deploy` runs. The input is always one of those
 // templates: no app repo may carry a wrangler config of its own
 // (ci/check-config.mjs check 1b), and the platform no longer generates
-// inno-{app} repos.
+// app repos of its own.
 //
 // This is a config-mutating script for a security-sensitive file, so it is
 // deliberately conservative:
@@ -18,9 +18,9 @@
 //     is deliberately scoped to the exact marker literals — not a blanket
 //     "replace" word-search — so it can never false-positive on an app name
 //     that happens to contain the substring "replace" (e.g. app "toreplace"
-//     is a valid slug, and "inno-app-toreplace" legitimately contains
-//     "replace"). If a real marker survives, we fail loud rather than ever
-//     deploy a half-templated config.
+//     is a valid slug, and "<resourcePrefix>app-toreplace" legitimately
+//     contains "replace"). If a real marker survives, we fail loud rather
+//     than ever deploy a half-templated config.
 //   - It never REWRITES ENVIRONMENT or any other field. It does ASSERT that a
 //     gateway config's deployed vars say ENVIRONMENT "production" and do not
 //     carry DEV_MOCK_IDENTITY, which is a refusal, not a substitution (R37).
@@ -36,20 +36,76 @@
 // INNO_IMAGE from the environment. INNO_LINKED_DATABASES is read by those AND
 // by --worker-app, the function-shaped half that holds the linked bindings;
 // the two gateway modes ignore it (see the CLI block).
+// Every form also takes `--instance <path>`, anywhere in the line: the
+// instance's names. Without it the script reads INNO_INSTANCE_JSON (the JSON
+// itself, not a path), then the ci/instance.json beside it, which is what
+// tenant CI uses (ci/cli.mjs loadInstanceData).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { stripJsonComments } from "./jsonc.mjs";
-import { isMainModule } from "./cli.mjs";
+import { checkInstanceData, isMainModule, loadInstanceData } from "./cli.mjs";
 
 const APP_NAME_RE = /^[a-z][a-z0-9-]{2,28}$/;
 
-// Names that collide with the template markers themselves (an app literally
-// named "replace" would make "inno-app-replace" a real value, not a marker,
-// and templating would then throw "markers remain" forever). Kept in sync
-// with src/registry.ts's RESERVED — a test asserts the two lists are equal —
-// but enforced here independently because this script does not consult the
-// registry. Exported for that parity test.
-export const RESERVED_APP_NAMES = ["platform", "template", "app", "replace", "inno-platform"];
+// The names an app's resources take, from the instance's resource prefix:
+// src/naming.ts's builders, restated (ci/ cannot import src/), with
+// test/instance-formula-parity.node.test.ts holding each to its builder. The
+// templater writes four of them; the container application's and the Access
+// application's names are here for reservedAppNames alone.
+const BUILDERS = {
+  workerName: (i, app) => `${i.resourcePrefix}app-${app}`,
+  workerAppName: (i, app) => `${i.resourcePrefix}app-${app}-app`,
+  containerAppName: (i, app) => `${i.resourcePrefix}app-${app}-appcontainer`,
+  d1Name: (i, app) => `${i.resourcePrefix}${app}-db`,
+  r2Name: (i, app) => `${i.resourcePrefix}${app}-data`,
+  accessAppName: (i, app) => `${i.resourcePrefix}${app}`,
+};
+
+// Every app name for which one of the builders would return `target`, found
+// by asking each builder where the name goes (src/registry.ts's
+// appNamesBuilding, restated).
+function appNamesBuilding(instance, target, builders) {
+  const marker = "\u0000";
+  const found = [];
+  for (const build of builders) {
+    const [before, after] = build(instance, marker).split(marker);
+    if (target.startsWith(before) && target.endsWith(after) && target.length > before.length + after.length) {
+      found.push(target.slice(before.length, target.length - after.length));
+    }
+  }
+  return found;
+}
+
+/**
+ * The names no app may take on this instance: src/registry.ts's reservedNames,
+ * restated by the same rule and in the same order, so register_app and the
+ * deploy refuse the same names (test/instance-formula-parity.node.test.ts
+ * holds the two equal). The fixed words collide with the templater's markers
+ * (an app named "replace" would make "inno-app-replace" a real value, and
+ * templating would then throw "markers remain" forever) or with the
+ * platform's vocabulary; the rest come from the instance: its platform name
+ * and host label, the app whose hostname would be the platform's, the app
+ * whose members or open group would be the admin group, and the apps whose
+ * resources would be the platform's own or its diagnostics bucket. Enforced
+ * here independently because this script does not consult the registry.
+ *
+ * @param {unknown} instance - the instance data (ci/instance.json's shape)
+ * @returns {string[]}
+ */
+export function reservedAppNames(instance) {
+  const i = checkInstanceData(instance);
+  const names = ["platform", "template", "app", "replace", i.platformName, i.platformHost];
+  if (i.platformHost.startsWith(i.hostPrefix)) names.push(i.platformHost.slice(i.hostPrefix.length));
+  const adminTail = i.adminGroup.slice(i.groupPrefix.length);
+  for (const suffix of ["-users", "-open"]) {
+    if (adminTail.endsWith(suffix)) names.push(adminTail.slice(0, -suffix.length));
+  }
+  const b = BUILDERS;
+  names.push(...appNamesBuilding(i, i.platformName, [b.workerName, b.workerAppName, b.containerAppName, b.d1Name, b.r2Name, b.accessAppName]));
+  // The bucket is no Access application, so that builder is not asked.
+  names.push(...appNamesBuilding(i, i.diagBucket, [b.workerName, b.workerAppName, b.containerAppName, b.d1Name, b.r2Name]));
+  return [...new Set(names)].filter((n) => n !== "");
+}
 
 // A double-quote, backslash, or control character in a value interpolated raw
 // into the JSONC string could break out of the JSON string literal. `$` is
@@ -194,13 +250,16 @@ function appendLinkGenerationVars(text, links, label) {
 //              substitution: { re, n, message(found) }. A scoped count goes
 //              before the total so a corrupted marker still reports "found 0"
 //              against its own key rather than being masked by the total
-//   markers    (app, v) => [{ pattern, replacement }], applied in order, each
+//   markers    (n, v) => [{ pattern, replacement }], applied in order, each
 //              matched as a whole literal or a key-scoped literal (so the
 //              otherwise-identical "REPLACE" values each map to their own real
 //              value). None can match a comment, because each needs the full
 //              quoted marker string, not the bare word "replace". Case-
 //              sensitive: the input is always one of the platform's own
-//              lowercase templates and the counts refuse a reshaped file
+//              lowercase templates and the counts refuse a reshaped file.
+//              The markers are fixed strings on every instance, so this
+//              templater still finds them in a gateway config from an older
+//              gateway.ref; `n` is the app's names on THIS instance (appNames)
 //   links      "d1" appends linked D1 bindings; "d1+vars" also bakes the
 //              LINK_GEN_ vars (container gateways only: a function-shaped
 //              consumer holds its linked binding on the app Worker, so there
@@ -228,10 +287,10 @@ const CONTAINER_SPEC = {
   // off, the template shape has changed in a way this script does not
   // understand: fail loud rather than guess which occurrence maps to which.
   counts: [REPLACE_COUNT(2, "database_id, ACCESS_AUD", "wrangler.jsonc")],
-  markers: (app, v) => [
-    { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
-    { pattern: /"inno-replace-db"/, replacement: `"inno-${app}-db"` },
-    { pattern: /"inno-replace-data"/, replacement: `"inno-${app}-data"` },
+  markers: (n, v) => [
+    { pattern: /"inno-app-replace"/, replacement: `"${n.worker}"` },
+    { pattern: /"inno-replace-db"/, replacement: `"${n.d1}"` },
+    { pattern: /"inno-replace-data"/, replacement: `"${n.r2}"` },
     { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${v.databaseId}"` },
     { pattern: /("ACCESS_AUD"\s*:\s*)"REPLACE"/, replacement: `$1"${v.accessAud}"` },
     { pattern: /("image"\s*:\s*)"\.\/Dockerfile"/, replacement: `$1"${v.imageValue}"` },
@@ -244,9 +303,9 @@ const WORKER_GATEWAY_SPEC = {
   label: "worker gateway config",
   values: ["accessAud"],
   counts: [REPLACE_COUNT(1, "ACCESS_AUD", "the worker gateway config")],
-  markers: (app, v) => [
-    { pattern: /"inno-app-replace-app"/, replacement: `"inno-app-${app}-app"` },
-    { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
+  markers: (n, v) => [
+    { pattern: /"inno-app-replace-app"/, replacement: `"${n.workerApp}"` },
+    { pattern: /"inno-app-replace"/, replacement: `"${n.worker}"` },
     { pattern: /("ACCESS_AUD"\s*:\s*)"REPLACE"/, replacement: `$1"${v.accessAud}"` },
   ],
   links: null,
@@ -257,9 +316,9 @@ const MCP_GATEWAY_SPEC = {
   label: "mcp gateway config",
   values: ["mcpResource"],
   counts: [REPLACE_COUNT(1, "OAUTH_RS_RESOURCE", "the mcp gateway config")],
-  markers: (app, v) => [
-    { pattern: /"inno-app-replace-app"/, replacement: `"inno-app-${app}-app"` },
-    { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
+  markers: (n, v) => [
+    { pattern: /"inno-app-replace-app"/, replacement: `"${n.workerApp}"` },
+    { pattern: /"inno-app-replace"/, replacement: `"${n.worker}"` },
     { pattern: /("OAUTH_RS_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${v.mcpResource}"` },
   ],
   links: null,
@@ -279,11 +338,11 @@ const MCP_CONTAINER_GATEWAY_SPEC = {
     // neither scoped check would notice.
     REPLACE_COUNT(2, "database_id, OAUTH_RS_RESOURCE", "the mcp-container gateway config"),
   ],
-  markers: (app, v) => [
-    { pattern: /"inno-app-replace"/, replacement: `"inno-app-${app}"` },
-    { pattern: /"inno-replace-db"/, replacement: `"inno-${app}-db"` },
+  markers: (n, v) => [
+    { pattern: /"inno-app-replace"/, replacement: `"${n.worker}"` },
+    { pattern: /"inno-replace-db"/, replacement: `"${n.d1}"` },
     { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${v.databaseId}"` },
-    { pattern: /"inno-replace-data"/, replacement: `"inno-${app}-data"` },
+    { pattern: /"inno-replace-data"/, replacement: `"${n.r2}"` },
     { pattern: /("OAUTH_RS_RESOURCE"\s*:\s*)"REPLACE"/, replacement: `$1"${v.resource}"` },
     { pattern: /("image"\s*:\s*)"\.\/Dockerfile"/, replacement: `$1"${v.imageValue}"` },
   ],
@@ -295,10 +354,10 @@ const WORKER_APP_SPEC = {
   label: "app worker config",
   values: ["databaseId"],
   counts: [REPLACE_COUNT(1, "database_id", "the app worker config")],
-  markers: (app, v) => [
-    { pattern: /"inno-app-replace-app"/, replacement: `"inno-app-${app}-app"` },
-    { pattern: /"inno-replace-db"/, replacement: `"inno-${app}-db"` },
-    { pattern: /"inno-replace-data"/, replacement: `"inno-${app}-data"` },
+  markers: (n, v) => [
+    { pattern: /"inno-app-replace-app"/, replacement: `"${n.workerApp}"` },
+    { pattern: /"inno-replace-db"/, replacement: `"${n.d1}"` },
+    { pattern: /"inno-replace-data"/, replacement: `"${n.r2}"` },
     { pattern: /("database_id"\s*:\s*)"REPLACE"/, replacement: `$1"${v.databaseId}"` },
   ],
   links: "d1",
@@ -306,9 +365,12 @@ const WORKER_APP_SPEC = {
 };
 
 function runSpec(spec, text, params) {
+  // The instance's names first: nothing is templated without them, and the
+  // reserved app names depend on them.
+  const instance = checkInstanceData(params.instance, "the templater's instance data");
   // Shared validation, so every templater enforces identical app-name and
   // deploy-value rules (jq missing-field literals, unsafe characters).
-  assertAppName(params.app);
+  assertAppName(params.app, instance);
   const v = {};
   for (const key of spec.values) {
     assertDeployValue(key, params[key]);
@@ -321,7 +383,7 @@ function runSpec(spec, text, params) {
     if (found !== n) throw new Error(message(found));
   }
 
-  let out = applyMarkers(text, spec.markers(params.app, v));
+  let out = applyMarkers(text, spec.markers(appNames(instance, params.app), v));
   if (spec.links) {
     const links = params.linkedDatabases === undefined ? [] : params.linkedDatabases;
     out = appendLinkedDatabases(out, links, spec.label);
@@ -336,9 +398,9 @@ function runSpec(spec, text, params) {
  *
  * Markers substituted (each targeted precisely as a whole literal — never a
  * blind "replace" -> value string replace):
- *   - "inno-app-replace"   (worker name)      -> "inno-app-{app}"
- *   - "inno-replace-db"    (D1 database_name) -> "inno-{app}-db"
- *   - "inno-replace-data"  (R2 bucket_name)   -> "inno-{app}-data"
+ *   - "inno-app-replace"   (worker name)      -> "<resourcePrefix>app-{app}"
+ *   - "inno-replace-db"    (D1 database_name) -> "<resourcePrefix>{app}-db"
+ *   - "inno-replace-data"  (R2 bucket_name)   -> "<resourcePrefix>{app}-data"
  *   - `"database_id": "REPLACE"`               -> `"database_id": "{databaseId}"`
  *   - `"ACCESS_AUD": "REPLACE"`                 -> `"ACCESS_AUD": "{accessAud}"`
  *
@@ -346,8 +408,12 @@ function runSpec(spec, text, params) {
  * `d1_databases` after substitution — for a container app the gateway holds
  * those bindings and serves them over /_storage/linked/{app}/sql/*.
  *
+ * Every templater also takes `instance`, the instance's names
+ * (ci/instance.json's shape, ci/cli.mjs checkInstanceData), and refuses to
+ * run without it.
+ *
  * @param {string} wranglerText
- * @param {{app: string, databaseId: string, accessAud: string, image?: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string, generation: string | null}[]}} params
+ * @param {{app: string, databaseId: string, accessAud: string, image?: string, instance: object, linkedDatabases?: {binding: string, databaseName: string, databaseId: string, generation: string | null}[]}} params
  * @returns {string} the substituted JSONC text
  */
 export function templateWrangler(wranglerText, params = {}) {
@@ -362,11 +428,21 @@ export function templateWrangler(wranglerText, params = {}) {
 // exactly-2-REPLACE contract is load-bearing). The helpers below are shared by
 // every spec so all paths agree on the rules.
 
-function assertAppName(app) {
+function assertAppName(app, instance) {
   if (typeof app !== "string" || !APP_NAME_RE.test(app)) {
     throw new Error(`invalid app name: ${JSON.stringify(app)} (must match ${APP_NAME_RE})`);
   }
-  if (RESERVED_APP_NAMES.includes(app)) throw new Error(`reserved app name: ${app}`);
+  if (reservedAppNames(instance).includes(app)) throw new Error(`reserved app name: ${app}`);
+}
+
+// The four names this templater writes for an app on an instance.
+function appNames(instance, app) {
+  return {
+    worker: BUILDERS.workerName(instance, app),
+    workerApp: BUILDERS.workerAppName(instance, app),
+    d1: BUILDERS.d1Name(instance, app),
+    r2: BUILDERS.r2Name(instance, app),
+  };
 }
 
 // Same JQ_MISSING + unsafe-character guards templateWrangler applies to its
@@ -524,7 +600,7 @@ export function templateMcpGateway(text, params = {}) {
  * wrangler.mcp.jsonc, this variant carries d1_databases too).
  *
  * @param {string} text
- * @param {{app: string, databaseId: string, resource: string, image?: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string, generation: string | null}[]}} params
+ * @param {{app: string, databaseId: string, resource: string, image?: string, instance: object, linkedDatabases?: {binding: string, databaseName: string, databaseId: string, generation: string | null}[]}} params
  * @returns {string} the substituted JSONC text
  */
 export function templateMcpContainerGateway(text, params = {}) {
@@ -537,7 +613,7 @@ export function templateMcpContainerGateway(text, params = {}) {
  * Exactly one "REPLACE" (database_id) — no ACCESS_AUD (the gateway owns Access).
  *
  * @param {string} text
- * @param {{app: string, databaseId: string, linkedDatabases?: {binding: string, databaseName: string, databaseId: string}[]}} params
+ * @param {{app: string, databaseId: string, instance: object, linkedDatabases?: {binding: string, databaseName: string, databaseId: string}[]}} params
  * @returns {string} the substituted JSONC text
  */
 export function templateWorkerApp(text, params = {}) {
@@ -545,7 +621,24 @@ export function templateWorkerApp(text, params = {}) {
 }
 
 if (isMainModule(import.meta.url)) {
-  const [mode, ...rest] = process.argv.slice(2);
+  // `--instance <path>` may sit anywhere in the line, so it is taken out
+  // before the positional forms below read theirs.
+  const argv = process.argv.slice(2);
+  const at = argv.indexOf("--instance");
+  let instancePath;
+  if (at !== -1) {
+    instancePath = argv[at + 1];
+    if (!instancePath || instancePath.startsWith("--")) {
+      console.error("Usage: --instance <path to an instance.json>");
+      process.exit(1);
+    }
+    argv.splice(at, 2);
+  }
+  // Read before anything is templated: a deploy with no instance data, or
+  // with data that breaks its rules, stops here, loudly, with every config
+  // untouched.
+  const instance = loadInstanceData({ path: instancePath });
+  const [mode, ...rest] = argv;
   // Linked databases arrive as JSON in the environment rather than argv: the
   // payload is a nested structure and every shell-quoting mistake here would be
   // a config-corruption bug. Empty/absent is the common case.
@@ -568,24 +661,24 @@ if (isMainModule(import.meta.url)) {
   if (mode === "--worker-gateway") {
     const [app, accessAud, path = "wrangler.jsonc"] = rest;
     if (!app || !accessAud) { console.error("Usage: node ci/template-wrangler.mjs --worker-gateway <app> <accessAud> [path]"); process.exit(1); }
-    writeFileSync(path, templateWorkerGateway(readFileSync(path, "utf8"), { app, accessAud }));
+    writeFileSync(path, templateWorkerGateway(readFileSync(path, "utf8"), { app, accessAud, instance }));
     console.log(`templated worker gateway ${path} for app "${app}"`);
   } else if (mode === "--mcp-gateway") {
     const [app, mcpResource, path = "wrangler.jsonc"] = rest;
     if (!app || !mcpResource) { console.error("Usage: node ci/template-wrangler.mjs --mcp-gateway <app> <mcpResource> [path]"); process.exit(1); }
-    writeFileSync(path, templateMcpGateway(readFileSync(path, "utf8"), { app, mcpResource }));
+    writeFileSync(path, templateMcpGateway(readFileSync(path, "utf8"), { app, mcpResource, instance }));
     console.log(`templated mcp gateway ${path} for app "${app}"`);
   } else if (mode === "--mcp-container-gateway") {
     const [app, databaseId, resource, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId || !resource) { console.error("Usage: node ci/template-wrangler.mjs --mcp-container-gateway <app> <databaseId> <resource> [path]"); process.exit(1); }
     announceLinks();
-    writeFileSync(path, templateMcpContainerGateway(readFileSync(path, "utf8"), { app, databaseId, resource, image, linkedDatabases }));
+    writeFileSync(path, templateMcpContainerGateway(readFileSync(path, "utf8"), { app, databaseId, resource, image, linkedDatabases, instance }));
     console.log(`templated mcp-container gateway ${path} for app "${app}"`);
   } else if (mode === "--worker-app") {
     const [app, databaseId, path = "wrangler.jsonc"] = rest;
     if (!app || !databaseId) { console.error("Usage: node ci/template-wrangler.mjs --worker-app <app> <databaseId> [path]"); process.exit(1); }
     announceLinks();
-    writeFileSync(path, templateWorkerApp(readFileSync(path, "utf8"), { app, databaseId, linkedDatabases }));
+    writeFileSync(path, templateWorkerApp(readFileSync(path, "utf8"), { app, databaseId, linkedDatabases, instance }));
     console.log(`templated app worker ${path} for app "${app}"`);
   } else {
     const [app, databaseId, accessAud, wranglerPath = "wrangler.jsonc"] = [mode, ...rest];
@@ -594,7 +687,7 @@ if (isMainModule(import.meta.url)) {
       process.exit(1);
     }
     announceLinks();
-    const templated = templateWrangler(readFileSync(wranglerPath, "utf8"), { app, databaseId, accessAud, image, linkedDatabases });
+    const templated = templateWrangler(readFileSync(wranglerPath, "utf8"), { app, databaseId, accessAud, image, linkedDatabases, instance });
     writeFileSync(wranglerPath, templated);
     console.log(`templated ${wranglerPath} for app "${app}"`);
   }
