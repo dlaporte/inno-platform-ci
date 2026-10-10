@@ -5,9 +5,9 @@ name: Platform CI
 # RENDERED, never edited by hand: scripts/instance.mjs writes this file from
 # the platform repo's templates/platform-ci.template.yml and its instance
 # manifest (instance/instance.jsonc), so every instance value below is the
-# manifest's: BROKER_URL, the deploy job's Cloudflare account id, the six
+# manifest's: BROKER_URL, the deploy job's Cloudflare account id, the seven
 # cross-repo `repository:` checkouts of this instance's contract mirror
-# (dlaporte/inno-platform-ci: five fetch the ci/ scripts, one the
+# (dlaporte/inno-platform-ci: six fetch the ci/ scripts, one the
 # promoted gateway), and the app name prefixes. To change one, edit the
 # manifest and run `node scripts/instance.mjs render` (OPERATIONS §2.1).
 # This file itself lives in BOTH repos: rendered in inno-platform,
@@ -90,9 +90,9 @@ env:
 
 jobs:
   # Fetch the app's effective gate policy (toggles + ignore IDs) from the
-  # broker. Granular string outputs, not one JSON blob: the sast job runs in
-  # the semgrep container (Alpine, no jq guaranteed), so gate jobs must consume
-  # policy with plain sh string tests; all jq stays here.
+  # broker. Granular string outputs, not one JSON blob: each gate job tests its
+  # own toggle and ignore list as plain strings, so the policy is parsed in one
+  # place and all of its jq stays here.
   policy:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -320,14 +320,12 @@ jobs:
           # gitleaks-action exits non-zero on any finding by default, and that
           # failure is the gate. Do not add continue-on-error here.
 
+  # No job container: Semgrep installs from PyPI (ci/semgrep.lock says why),
+  # so the job runs on the runner itself and pulls nothing from Docker Hub.
   sast:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [policy]
-    container:
-      # Exact-pinned like the Trivy image: an unpinned tag (implicit :latest)
-      # lets the SAST gate's ruleset/engine drift between runs with no repo diff.
-      image: semgrep/semgrep@sha256:c98f8829eea377274ee4b10656458b078b88232469b2ff913f091c2317347c9d # v1.170.0
     steps:
       - name: Gate switch
         id: gate
@@ -339,6 +337,45 @@ jobs:
             echo "### :warning: semgrep gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+
+      # The lock comes from the mirror, which is checked out, installed from
+      # and removed again BEFORE the app checkout, so the scan root below holds
+      # exactly the app repo. Checked out after the app, into the app's own
+      # tree, the mirror would either be scanned (findings on platform code
+      # that no author can fix) or, removed before the scan, take an author
+      # directory of the same name with it, unscanned.
+      - name: Checkout inno-platform (ci/ scripts)
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform-ci
+          ref: ${{ env.PLATFORM_REF }}
+          path: inno-platform-ci
+          # The mirror is public, so nothing here needs a credential, and this
+          # job deletes the directory before checkout's post step could clean
+          # up the token file it would otherwise leave in RUNNER_TEMP.
+          persist-credentials: false
+
+      # A venv, not the system site-packages: Semgrep's dependency tree then
+      # cannot meet a Debian-installed package of another version, and its
+      # console script is the one the scan step finds on PATH. The version
+      # check holds the engine to the lock's own semgrep== line (its one home):
+      # a gate that ran some other engine would pass or fail for reasons
+      # nobody reviewed.
+      - name: Install Semgrep (hash-pinned, ci/semgrep.lock)
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          want="$(sed -n 's/^semgrep==\([^ ]*\).*/\1/p' inno-platform-ci/ci/semgrep.lock)"
+          python3 -m venv "$RUNNER_TEMP/semgrep"
+          "$RUNNER_TEMP/semgrep/bin/python" -m pip install --quiet --only-binary=:all: --require-hashes -r inno-platform-ci/ci/semgrep.lock
+          got="$("$RUNNER_TEMP/semgrep/bin/semgrep" --version)"
+          echo "semgrep $got installed (ci/semgrep.lock pins ${want:-no version})"
+          if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            echo "::error title=Semgrep version::installed semgrep $got, but ci/semgrep.lock pins ${want:-no version}; refusing to scan with an engine the lock does not name"
+            exit 1
+          fi
+          echo "$RUNNER_TEMP/semgrep/bin" >> "$GITHUB_PATH"
+          rm -rf inno-platform-ci
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.enabled == 'true'
@@ -359,8 +396,8 @@ jobs:
         # gateway is injected at deploy time from the promoted gateway.ref), so
         # scanning it would only yield findings on the platform's own patterns.
         # Admin-set rule ignores arrive as repeatable --exclude-rule flags;
-        # the set --/positional-args pattern is POSIX-sh safe in this
-        # container, and the IDs are grammar-pinned server-side.
+        # the set --/positional-args pattern keeps each one a separate
+        # argument, and the IDs are grammar-pinned server-side.
         #
         # --exclude=/src (NOT --exclude=src, review C-2): semgrep matches
         # --exclude with gitignore semantics, where a slash-free pattern
@@ -453,10 +490,11 @@ jobs:
           IGNORES: ${{ needs.policy.outputs.ignores_deps }}
         run: |
           if [ -f app/requirements.txt ]; then
-            # Hash-pinned install set (R25): gitleaks, semgrep and trivy are all
-            # SHA/digest-pinned, and pip-audit was the lone scanner installed
-            # from PyPI unpinned, so its ruleset and engine could drift between
-            # two runs of the same commit with no repo diff.
+            # Hash-pinned install set (R25): gitleaks is pinned by SHA, trivy by
+            # digest and semgrep by ci/semgrep.lock's hashes, and pip-audit was
+            # the lone scanner installed from PyPI unpinned, so its ruleset and
+            # engine could drift between two runs of the same commit with no
+            # repo diff.
             python3 -m pip install --quiet --require-hashes -r inno-platform-ci/ci/pip-audit.lock
             set --
             for id in $IGNORES; do set -- "$@" --ignore-vuln "$id"; done
@@ -568,6 +606,88 @@ jobs:
       # SUCCEEDS with the image steps skipped) so the deploy job's
       # `needs: [container]` is satisfied; a skipped whole job would instead skip
       # the deploy.
+      #
+      # Docker Hub answers an anonymous pull with HTTP 429 once its rate limit
+      # is spent, and every GitHub runner behind one address shares that limit
+      # (OPEN 49: a canary's base-image pull failed on it). This job pulls Docker
+      # Hub images in two places: the author's FROM images in the build, and the
+      # digest-pinned Trivy image below. mirror.gcr.io is Google's cache of
+      # Docker Hub, and the daemon falls back to Docker Hub itself for anything
+      # the mirror cannot serve, so the mirror can only remove failures. A
+      # digest-pinned pull is still checked against its digest, whichever host
+      # serves it. `docker build` here is buildx's default builder, whose
+      # `docker` driver is the daemon's own BuildKit and reads the same
+      # setting; the step logs the driver, so a runner image that changes it
+      # shows up in the log. Restarting the daemon is safe here: no container
+      # has started in this job yet.
+      #
+      # Never a gate: a file that is not a JSON object is left as it is, a
+      # daemon that will not restart with the mirror gets its original file
+      # back, and a missing mirror warns. Each of those builds exactly as this
+      # job did before. Only a daemon that stays down fails here, where the
+      # cause is visible, rather than in the build.
+      - name: Pull Docker Hub images through mirror.gcr.io
+        if: needs.policy.outputs.function_shaped != 'true'
+        run: |
+          conf=/etc/docker/daemon.json
+          mirror=https://mirror.gcr.io
+          work="$(mktemp -d)"
+          had_conf=false
+          if sudo test -f "$conf"; then
+            had_conf=true
+            sudo cat "$conf" > "$work/before.json"
+          else
+            echo '{}' > "$work/before.json"
+          fi
+          # Merge, never overwrite: the runner image keeps its own settings in
+          # this file (its cgroup parent, for one).
+          if ! jq --arg m "$mirror" '.["registry-mirrors"] = ([$m] + ((.["registry-mirrors"] // []) - [$m]))' "$work/before.json" > "$work/after.json" 2>/dev/null \
+            || ! jq -e 'type == "object"' "$work/after.json" >/dev/null 2>&1; then
+            echo "::warning title=Registry mirror::$conf is not a JSON object this step can merge into; left as it is, so Docker Hub images are pulled directly"
+            exit 0
+          fi
+          sudo mkdir -p "$(dirname "$conf")"
+          sudo cp "$work/after.json" "$conf"
+          # docker.service has TimeoutStartSec=0, so a restart that hangs would
+          # hold the step for the job's whole timeout: each one is bounded.
+          if ! sudo timeout 120 systemctl restart docker; then
+            if [ "$had_conf" = true ]; then sudo cp "$work/before.json" "$conf"; else sudo rm -f "$conf"; fi
+            # A unit that failed to start is rate-limited from restarting again.
+            sudo systemctl reset-failed docker || true
+            sudo timeout 120 systemctl restart docker || true
+            if ! docker info >/dev/null 2>&1; then
+              echo "::error title=Docker daemon::the Docker daemon did not come back after its configuration was restored; nothing in this job can build or scan the image"
+              exit 1
+            fi
+            echo "::warning title=Registry mirror::the Docker daemon would not restart with $mirror as a registry mirror; restored its configuration, so Docker Hub images are pulled directly"
+            exit 0
+          fi
+          # The runner image keeps a Docker Hub credential in the CLI's config. The
+          # daemon forwards it to the mirror, which refuses it ("authentication
+          # failed"), and the pull falls back to Docker Hub. Without that one entry
+          # the mirror pulls are anonymous, which the mirror serves; a fallback pull
+          # is then anonymous too, as the build's base-image pulls already were.
+          cli_conf="$HOME/.docker/config.json"
+          if [ -f "$cli_conf" ]; then
+            if jq 'if (.auths? | type) == "object" then .auths |= with_entries(select(.key | test("(^|//)(index[.])?docker[.]io(/|$)") | not)) else . end' "$cli_conf" > "$work/cli.json" 2>/dev/null; then
+              cp "$work/cli.json" "$cli_conf"
+              echo "dropped the Docker Hub entry from $cli_conf, so pulls through the mirror are anonymous"
+            else
+              echo "::warning title=Registry mirror::$cli_conf is not JSON this step can edit; the mirror refuses the Docker Hub credential it holds, so Docker Hub images are pulled directly"
+            fi
+          fi
+          mirrors="$(docker info --format '{{json .RegistryConfig.Mirrors}}' 2>/dev/null || true)"
+          echo "docker daemon registry mirrors: ${mirrors:-none}"
+          case "$mirrors" in
+            *"$mirror"*) ;;
+            *) echo "::warning title=Registry mirror::the Docker daemon does not list $mirror after the restart, so Docker Hub images are pulled directly" ;;
+          esac
+          driver="$(docker buildx inspect 2>/dev/null | sed -n 's/^Driver: *//p' | head -n 1)"
+          echo "docker build builder: ${driver:-the classic builder}"
+          if [ -n "$driver" ] && [ "$driver" != docker ]; then
+            echo "::warning title=Registry mirror::docker build uses the $driver buildx driver, which does not read the daemon's registry mirrors, so base images are pulled directly"
+          fi
+
       - name: docker build (isolated; no deploy token present)
         if: needs.policy.outputs.function_shaped != 'true'
         run: docker build -t app-under-test .
