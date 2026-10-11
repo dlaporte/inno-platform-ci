@@ -73,7 +73,7 @@ on:
       app:
         description: >-
           Platform app name. Required for registered (github-app) repos; defaults
-          to the repository name with any inno- prefix removed.
+          to the repository name with the instance's host prefix, if it has one, removed.
         required: false
         type: string
         default: ""
@@ -126,7 +126,7 @@ jobs:
       # `app` is caller-asserted; safe only because the broker binds the signed
       # repository_id claim to the app record and refuses mismatches
       # (app_mismatch / deploy_denied:repo_id).
-      - name: Derive app name (input, or repo name minus inno- prefix)
+      - name: Derive app name (input, or repo name without the instance's host prefix)
         id: app
         env:
           REPO_NAME: ${{ github.event.repository.name }}

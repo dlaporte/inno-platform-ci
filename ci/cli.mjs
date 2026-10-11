@@ -110,13 +110,18 @@ export const logSafe = (s, n = 200) => String(s).replace(/[\u0000-\u001f\u007f]+
 // Worker's and the gateway's, verdict for verdict.
 const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
 const INSTANCE_RULES = {
-  hostPrefix: /^[a-z0-9][a-z0-9-]*-$/,
+  // Only the host prefix may be empty (apps at <app>.<domain>); a missing key
+  // is still refused, since "" is a string and undefined is not.
+  hostPrefix: /^(?:[a-z0-9][a-z0-9-]*-)?$/,
   resourcePrefix: /^[a-z0-9][a-z0-9-]*-$/,
   groupPrefix: /^[a-z0-9][a-z0-9-]*-$/,
   platformName: new RegExp(`^${LABEL}$`),
   platformHost: new RegExp(`^${LABEL}$`),
   adminGroup: /^[a-z0-9][a-z0-9-]*[a-z0-9]$/,
   diagBucket: /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/,
+  // The email sender's host label, or "" when it has none (an unprefixed
+  // instance reserves it as an app name; see reservedAppNames).
+  emailHostLabel: new RegExp(`^(?:${LABEL})?$`),
 };
 
 /**
@@ -124,7 +129,7 @@ const INSTANCE_RULES = {
  */
 
 /**
- * Check instance data and return its seven names, frozen, without any other
+ * Check instance data and return its eight values, frozen, without any other
  * key. Throws naming the source and the first key that is missing or
  * breaks its rule.
  *

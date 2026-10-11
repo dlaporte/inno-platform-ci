@@ -5,5 +5,6 @@
   "platformName": "inno-platform",
   "platformHost": "inno-platform",
   "adminGroup": "inno-platform-admins",
-  "diagBucket": "inno-platform-diagnostics"
+  "diagBucket": "inno-platform-diagnostics",
+  "emailHostLabel": "mail"
 }

@@ -77,6 +77,15 @@ function appNamesBuilding(instance, target, builders) {
 }
 
 /**
+ * Labels the zone keeps for its own hosts, which an unprefixed instance's
+ * apps would land on (src/registry.ts ZONE_HOST_LABELS, restated here because
+ * ci/ imports nothing from src/; the parity test holds them equal).
+ */
+export const ZONE_HOST_LABELS = [
+  "www", "mail", "login", "sso", "auth", "api", "smtp", "imap", "pop", "ftp", "mx", "ns1", "ns2", "autodiscover", "webmail", "status",
+];
+
+/**
  * The names no app may take on this instance: src/registry.ts's reservedNames,
  * restated by the same rule and in the same order, so register_app and the
  * deploy refuse the same names (test/instance-formula-parity.node.test.ts
@@ -104,6 +113,7 @@ export function reservedAppNames(instance) {
   names.push(...appNamesBuilding(i, i.platformName, [b.workerName, b.workerAppName, b.containerAppName, b.d1Name, b.r2Name, b.accessAppName]));
   // The bucket is no Access application, so that builder is not asked.
   names.push(...appNamesBuilding(i, i.diagBucket, [b.workerName, b.workerAppName, b.containerAppName, b.d1Name, b.r2Name]));
+  if (i.hostPrefix === "") names.push(...ZONE_HOST_LABELS, i.emailHostLabel);
   return [...new Set(names)].filter((n) => n !== "");
 }
 

@@ -14,10 +14,12 @@ import type { Env } from "./env";
 export type Prefixes = Readonly<{ hostPrefix: string; groupPrefix: string }>;
 
 // The manifest's prefix rule (scripts/lib/manifest.mjs `prefix`): the app
-// name alphabet, never empty, ending in "-" so a name appended to it stays
-// readable. Only checked here, never repaired: a config that breaks it did
+// name alphabet, ending in "-" so a name appended to it stays readable. The
+// host prefix alone may be empty (apps at <app>.<domain>); the group prefix
+// never is. Only checked here, never repaired: a config that breaks it did
 // not come from a render.
 const PREFIX_RE = /^[a-z0-9][a-z0-9-]*-$/;
+const HOST_PREFIX_RE = /^(?:[a-z0-9][a-z0-9-]*-)?$/;
 
 /**
  * The two prefixes, or the reason this config cannot give them. Never a
@@ -29,7 +31,7 @@ export function readPrefixes(env: Pick<Env, "HOST_PREFIX" | "GROUP_PREFIX">):
   { ok: true; prefixes: Prefixes } | { ok: false; error: string } {
   for (const name of ["HOST_PREFIX", "GROUP_PREFIX"] as const) {
     const v: unknown = env[name];
-    if (typeof v !== "string" || !PREFIX_RE.test(v)) {
+    if (typeof v !== "string" || !(name === "HOST_PREFIX" ? HOST_PREFIX_RE : PREFIX_RE).test(v)) {
       const seen = v === undefined ? "is missing" : `is ${JSON.stringify(String(v).slice(0, 40))}, not a name prefix (a-z, 0-9 and "-", ending in "-")`;
       return { ok: false, error: `${name} ${seen}; it is rendered into this gateway's config from the instance manifest` };
     }
