@@ -161,10 +161,12 @@ async function introspectViaPlatform(
         // caller_assertion — a credential that opens /_connections/fetch —
         // only for a caller holding this, because /app-introspect is publicly
         // reachable and the service binding is routing, not authentication.
-        // Omitted entirely when unprovisioned; the platform then withholds
+        // Omitted entirely when unprovisioned; a keyed platform then withholds
         // the caller assertion unless its admin switch is explicitly false
         // (the cutover override), so a keyless gateway loses Connections
-        // until it is redeployed with the key. Its idle clock keeps running:
+        // until it is redeployed with the key. A platform with no key of its
+        // own issues no caller assertion to any gateway, keyed or not
+        // (OPEN 51). Its idle clock keeps running:
         // index.ts's touch carries the token, not the assertion.
         ...(gatewayKey ? { [GATEWAY_KEY_HEADER]: gatewayKey } : {}),
       },

@@ -13,8 +13,8 @@
 # pinned below, so a bump is this one edit.
 #
 # Resolved for the runner, not for the machine that runs the resolve: the SAST
-# job installs this into a venv made by ubuntu-latest's system python3 (Ubuntu
-# 24.04, Python 3.12, x86_64), and a lock resolved for another Python can omit
+# job installs this into a venv made by the runner's system python3
+# (ubuntu-26.04, Python 3.14, x86_64), and a lock resolved for another Python can omit
 # a requirement that Python needs (the typing_extensions failure recorded in
 # ci/pip-audit.lock). --exclude-newer holds every pinned release to at least
 # two weeks old on the day of the resolve, so a release yanked for being

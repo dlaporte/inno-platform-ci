@@ -62,6 +62,8 @@ export type Env = {
   // config (the app's CI can read its own config, and must not read this).
   // The platform requires this header once its own key is provisioned, unless
   // its admin switch (connections.gateway_key_required) is explicitly false.
+  // A platform with no key of its own issues no caller assertion at all, to a
+  // gateway with a key or without one, whatever the switch says (OPEN 51).
   // A gateway deployed before the key existed has none to send and must be
   // redeployed to receive it. The oauth-rs idle-clock touch does not need it:
   // index.ts sends the caller's own token, which the platform re-introspects
