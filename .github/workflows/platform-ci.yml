@@ -17,9 +17,10 @@ name: Platform CI
 #
 # This workflow is invoked (via `uses:`) by the thin caller workflow in each
 # app's USER-OWNED repo, registered via register_app (OPERATIONS §7.2.4), whose
-# `.github/workflows/deploy.yml` passes `with: app:`. (The template ships a
-# starter deploy.yml, but the repo and its name belong to the user; the platform
-# no longer generates `inno-{app}` repos.) No caller workflow is trusted: its
+# `.github/workflows/deploy.yml` passes `with: app:`. (register_app returns that
+# deploy.yml and the plugin writes it; the template ships none. The repo and
+# its name belong to the user; the platform no longer generates
+# `inno-{app}` repos.) No caller workflow is trusted: its
 # contents can be edited by the app author. All enforcement lives here, in the
 # uneditable reusable workflow:
 #
