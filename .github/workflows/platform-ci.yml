@@ -2068,7 +2068,7 @@ jobs:
           IMAGE_ID: ${{ steps.verify_image.outputs.id }}
         run: |
           set -e
-          result="$(node inno-platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$GATEWAY_REF" "$IMAGE_ID")"
+          result="$(node inno-platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$GATEWAY_REF" "$IMAGE_ID" "$GITHUB_WORKSPACE/gateway-src/gateway/capability.json")"
           echo "$result"
           # Guard the shape, not just the exit status: a well-formed JSON body
           # that isn't the broker's would otherwise write "Deployed: null" into

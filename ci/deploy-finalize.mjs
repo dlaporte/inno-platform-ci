@@ -3,7 +3,7 @@
 // deploy` succeeds, so the broker can attach the app's DNS/domain and mark
 // the deployment (and app) as live.
 //
-// Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef] [imageId]
+// Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef] [imageId] [capabilityFile]
 // `token` is the GitHub Actions OIDC token (verified server-side).
 // `gatewayRef` records which promoted gateway build was injected into this
 // deploy. `imageId` (R11) is the image id the deploy job actually loaded and
@@ -71,7 +71,25 @@ export function readDeclarationFile(root = ".") {
 }
 
 /**
- * POST {app, deployment_id, gateway_ref?, image_id?, variables?} to `${base}/deploy-complete`,
+ * The gateway's capability number, read from the gateway source the job
+ * checked out at gateway.ref (never this mirror's own copy: ci/ runs at main,
+ * the gateway at an older ref). A missing file, bad JSON or anything but a
+ * non-negative integer is 0, so an older gateway never fails a deploy.
+ * @param {string|undefined} file - path to that checkout's capability.json
+ * @returns {number}
+ */
+export function readGatewayCapability(file) {
+  try {
+    if (!file) return 0;
+    const n = JSON.parse(readFileSync(file, "utf8"))?.capability;
+    return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * POST {app, deployment_id, gateway_ref?, gateway_capability, image_id?, variables?} to `${base}/deploy-complete`,
  * authenticated with the GitHub Actions OIDC token.
  *
  * The request fields are ONE options object, matching brokerPost (the
@@ -90,6 +108,7 @@ export function readDeclarationFile(root = ".") {
  * @param {string} req.app
  * @param {number|string} req.deploymentId
  * @param {string} [req.gatewayRef] - optional gateway reference
+ * @param {number} [req.gatewayCapability] - the gateway's capability number; no field when absent
  * @param {string} [req.imageId] - the image id actually deployed (R11)
  * @param {Record<string, unknown>} [req.variables] - the app's declared platform variables
  *   (from app/inno-variables.json), or undefined to send no field
@@ -97,10 +116,13 @@ export function readDeclarationFile(root = ".") {
  *   - injectable for testing; defaults to global fetch
  * @returns {Promise<any>} the parsed JSON response body (e.g. { url })
  */
-export async function finalize({ base, token, app, deploymentId, gatewayRef, imageId, variables }, fetcher = fetch) {
+export async function finalize({ base, token, app, deploymentId, gatewayRef, gatewayCapability, imageId, variables }, fetcher = fetch) {
   const body = {
     app, deployment_id: deploymentId,
     ...(gatewayRef ? { gateway_ref: gatewayRef } : {}),
+    // The CLI always passes a number (0 for a missing file); a direct caller
+    // that passes none sends no field, which the platform also reads as 0.
+    ...(gatewayCapability !== undefined ? { gateway_capability: Number.isSafeInteger(gatewayCapability) && gatewayCapability >= 0 ? gatewayCapability : 0 } : {}),
     ...(imageId ? { image_id: imageId } : {}),
     ...(variables !== undefined ? { variables } : {}),
   };
@@ -112,9 +134,9 @@ export async function finalize({ base, token, app, deploymentId, gatewayRef, ima
 
 if (isMainModule(import.meta.url)) {
   try {
-    const [base, app, deploymentId, token, gatewayRefArg, imageIdArg] = process.argv.slice(2);
+    const [base, app, deploymentId, token, gatewayRefArg, imageIdArg, capabilityFileArg] = process.argv.slice(2);
     if (!base || !app || !deploymentId || !token) {
-      throw new Error("Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef] [imageId]");
+      throw new Error("Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef] [imageId] [capabilityFile]");
     }
     // The broker's /deploy-token response is where this came from (via
     // `jq -r .deployment_id`); parseIntegerArg says what a malformed one
@@ -143,6 +165,7 @@ if (isMainModule(import.meta.url)) {
       deploymentId: deploymentIdNum,
       gatewayRef: gatewayRefArg,
       imageId: imageIdArg,
+      gatewayCapability: readGatewayCapability(capabilityFileArg),
       variables: declared.ok ? declared.variables : undefined,
     });
     // Human-readable line to stderr; the raw JSON result to stdout, so the
