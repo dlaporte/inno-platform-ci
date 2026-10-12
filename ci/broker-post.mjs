@@ -33,6 +33,7 @@
  * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} [fetcher]
  *   - injectable for testing; defaults to global fetch
  * @returns {Promise<any>} the parsed JSON response body
+ * @throws {Error & { status: number, body: string }} on a non-2xx answer
  */
 export async function brokerPost({ base, path, label, token, body }, fetcher = fetch) {
   const res = await fetcher(`${base}${path}`, {
@@ -47,7 +48,12 @@ export async function brokerPost({ base, path, label, token, body }, fetcher = f
   // status + body instead of a raw JSON parse error.
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`${label} failed (${res.status}): ${text.slice(0, 200)}`);
+    // The status and the whole body ride on the error beside the message, so a
+    // caller can decide on the broker's answer (deploy-finalize.mjs retries a
+    // 409 app_busy and nothing else) without parsing the message.
+    throw Object.assign(new Error(`${label} failed (${res.status}): ${text.slice(0, 200)}`), {
+      status: res.status, body: text,
+    });
   }
   return JSON.parse(text);
 }

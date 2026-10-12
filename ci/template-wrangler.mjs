@@ -103,7 +103,7 @@ export const ZONE_HOST_LABELS = [
  */
 export function reservedAppNames(instance) {
   const i = checkInstanceData(instance);
-  const names = ["platform", "template", "app", "replace", i.platformName, i.platformHost];
+  const names = ["platform", "template", "app", "replace", "staging", i.platformName, i.platformHost];
   if (i.platformHost.startsWith(i.hostPrefix)) names.push(i.platformHost.slice(i.hostPrefix.length));
   const adminTail = i.adminGroup.slice(i.groupPrefix.length);
   for (const suffix of ["-users", "-open"]) {

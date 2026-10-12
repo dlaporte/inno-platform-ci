@@ -114,9 +114,10 @@ export function readGatewayCapability(file) {
  *   (from app/inno-variables.json), or undefined to send no field
  * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} [fetcher]
  *   - injectable for testing; defaults to global fetch
+ * @param {(ms: number) => Promise<void>} [wait] - the pause between busy retries; injectable for testing
  * @returns {Promise<any>} the parsed JSON response body (e.g. { url })
  */
-export async function finalize({ base, token, app, deploymentId, gatewayRef, gatewayCapability, imageId, variables }, fetcher = fetch) {
+export async function finalize({ base, token, app, deploymentId, gatewayRef, gatewayCapability, imageId, variables }, fetcher = fetch, wait = pause) {
   const body = {
     app, deployment_id: deploymentId,
     ...(gatewayRef ? { gateway_ref: gatewayRef } : {}),
@@ -126,11 +127,47 @@ export async function finalize({ base, token, app, deploymentId, gatewayRef, gat
     ...(imageId ? { image_id: imageId } : {}),
     ...(variables !== undefined ? { variables } : {}),
   };
-  return brokerPost(
-    { base, path: "/deploy-complete", label: "deploy-complete", token, body },
-    fetcher,
-  );
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await brokerPost(
+        { base, path: "/deploy-complete", label: "deploy-complete", token, body },
+        fetcher,
+      );
+    } catch (err) {
+      if (!isBusyRefusal(err) || attempt >= BUSY_RETRY_DELAYS_MS.length) throw err;
+      const ms = BUSY_RETRY_DELAYS_MS[attempt];
+      // stderr, never stdout: the workflow pipes stdout into `jq -r .url`.
+      console.error(`deploy-complete: the broker answered 409 app_busy (another change to this app is in flight); ` +
+        `retrying in ${ms / 1000}s (attempt ${attempt + 1} of ${BUSY_RETRY_DELAYS_MS.length + 1})`);
+      await wait(ms);
+    }
+  }
 }
+
+// /deploy-complete answers 409 app_busy while another change to the app holds
+// its lease: a grant, a link, an open or close of the app or of an app linked
+// to it (src/routes/deploy.ts takes the lease before it reads or writes
+// anything). Failing there would fail a deploy wrangler has already made,
+// leaving the app `deploying` until the job is re-run, so that one answer is
+// retried: the broker wrote nothing, and the same request is safe to send
+// again. Four attempts, 5s, 15s, then 30s apart: 50s of waiting covers a
+// holder doing one slow identity-provider read under the lease (a grant to a
+// consumer, or a close that includes this app), and stays well inside the
+// fresh OIDC token's life. Every other answer, a 409 for a stopped app or a
+// stale deployment included, fails at once as before.
+export const BUSY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
+
+/** True for the broker's lease refusal: HTTP 409 with the JSON error app_busy. */
+export function isBusyRefusal(err) {
+  if (err?.status !== 409 || typeof err.body !== "string") return false;
+  try {
+    return JSON.parse(err.body)?.error === "app_busy";
+  } catch {
+    return false;
+  }
+}
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 if (isMainModule(import.meta.url)) {
   try {

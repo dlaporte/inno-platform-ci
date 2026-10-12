@@ -1664,13 +1664,34 @@ jobs:
           # Cloudflare token, so a curl retry on a 5xx or a 429 would mint a
           # second one and strand the first row. 30s is twice the policy
           # fetch's bound because this call does that work before it answers.
-          resp="$(curl -sS --max-time 30 -X POST "$BROKER_URL/deploy-token" \
-            -H "Authorization: Bearer $OIDC_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"app\":\"$APP\"}" \
-            -w '\n%{http_code}')"
-          http_code="$(printf '%s\n' "$resp" | tail -n1)"
-          resp="$(printf '%s\n' "$resp" | sed '$d')"
+          #
+          # The one exception is the loop below: a 409 whose error is app_busy
+          # (another change to this app, or to an app linked to it, holds the
+          # app's lease) is retried, four attempts in all, 5s, 15s, then 30s
+          # apart, so 50s of waiting covers a holder doing one slow
+          # identity-provider read.
+          # The broker answers it before it inserts the row or flips the
+          # status (both run under the lease) and revokes the token it minted
+          # for the refused call, so a retry strands nothing. Every other
+          # answer, a 409 for a stopped app or a link refusal included, still
+          # fails at once.
+          for attempt in 1 2 3 4; do
+            resp="$(curl -sS --max-time 30 -X POST "$BROKER_URL/deploy-token" \
+              -H "Authorization: Bearer $OIDC_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"app\":\"$APP\"}" \
+              -w '\n%{http_code}')"
+            http_code="$(printf '%s\n' "$resp" | tail -n1)"
+            resp="$(printf '%s\n' "$resp" | sed '$d')"
+            refusal="$(printf '%s\n' "$resp" | jq -r '.error // empty' 2>/dev/null || true)"
+            if [ "$http_code" = "409" ] && [ "$refusal" = "app_busy" ] && [ "$attempt" -lt 4 ]; then
+              wait_s=$(( attempt == 1 ? 5 : attempt == 2 ? 15 : 30 ))
+              echo "deploy-token: the broker answered 409 app_busy (another change to this app is in flight); retrying in ${wait_s}s (attempt $attempt of 4)" >&2
+              sleep "$wait_s"
+              continue
+            fi
+            break
+          done
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "deploy-token request failed (HTTP $http_code):" >&2
             printf '%s\n' "$resp" | jq -r '.message // .error // .' 2>/dev/null >&2 || printf '%s\n' "$resp" >&2
