@@ -1675,11 +1675,23 @@ jobs:
           # for the refused call, so a retry strands nothing. Every other
           # answer, a 409 for a stopped app or a link refusal included, still
           # fails at once.
+          #
+          # The request carries the gateway's capability number (v0.16.4),
+          # read by deploy-finalize.mjs's own reader from the file Finalize
+          # passes below, in the gateway source checked out at gateway.ref.
+          # The broker refuses a browser app whose members the platform holds
+          # when that gateway is below capability 1 (409 gateway_too_old,
+          # before it mints or writes anything; its message names the admin's
+          # fix). A missing or unreadable file reads as 0, which no okta-mode
+          # or MCP app is ever refused for. Built once, so every attempt below
+          # sends the same body.
+          gateway_capability="$(node inno-platform-ci/ci/deploy-finalize.mjs --capability "$GITHUB_WORKSPACE/gateway-src/gateway/capability.json")"
+          body="$(jq -cn --arg app "$APP" --argjson cap "$gateway_capability" '{app: $app, gateway_capability: $cap}')"
           for attempt in 1 2 3 4; do
             resp="$(curl -sS --max-time 30 -X POST "$BROKER_URL/deploy-token" \
               -H "Authorization: Bearer $OIDC_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "{\"app\":\"$APP\"}" \
+              -d "$body" \
               -w '\n%{http_code}')"
             http_code="$(printf '%s\n' "$resp" | tail -n1)"
             resp="$(printf '%s\n' "$resp" | sed '$d')"
@@ -1694,7 +1706,10 @@ jobs:
           done
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
             echo "deploy-token request failed (HTTP $http_code):" >&2
-            printf '%s\n' "$resp" | jq -r '.message // .error // .' 2>/dev/null >&2 || printf '%s\n' "$resp" >&2
+            # stdout to stderr BEFORE jq's own stderr goes to /dev/null: the
+            # other order pointed stdout at /dev/null too, so a JSON refusal
+            # printed nothing and its message (the fix) never reached the log.
+            printf '%s\n' "$resp" | jq -r '.message // .error // .' >&2 2>/dev/null || printf '%s\n' "$resp" >&2
             exit 1
           fi
 

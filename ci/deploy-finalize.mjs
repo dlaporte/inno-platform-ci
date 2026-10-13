@@ -4,6 +4,7 @@
 // the deployment (and app) as live.
 //
 // Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [gatewayRef] [imageId] [capabilityFile]
+//        node ci/deploy-finalize.mjs --capability <capabilityFile>
 // `token` is the GitHub Actions OIDC token (verified server-side).
 // `gatewayRef` records which promoted gateway build was injected into this
 // deploy. `imageId` (R11) is the image id the deploy job actually loaded and
@@ -12,6 +13,12 @@
 // from the app checkout, if the app declared one, and sends it as
 // `variables` so the broker can update the app's declared platform variables
 // at the same time it marks the deployment live.
+//
+// The `--capability` form prints the gateway's capability number (see
+// readGatewayCapability) and does nothing else. The deploy-token step sends
+// that number to /deploy-token before anything is deployed (v0.16.4), and
+// reading it here, with the reader this script's finalize uses, keeps the two
+// requests from disagreeing about one checkout.
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -169,7 +176,10 @@ export function isBusyRefusal(err) {
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-if (isMainModule(import.meta.url)) {
+if (isMainModule(import.meta.url) && process.argv[2] === "--capability") {
+  // The number alone on stdout: the deploy-token step captures it whole.
+  console.log(readGatewayCapability(process.argv[3]));
+} else if (isMainModule(import.meta.url)) {
   try {
     const [base, app, deploymentId, token, gatewayRefArg, imageIdArg, capabilityFileArg] = process.argv.slice(2);
     if (!base || !app || !deploymentId || !token) {

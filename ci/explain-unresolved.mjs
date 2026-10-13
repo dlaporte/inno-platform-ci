@@ -104,12 +104,20 @@ for (const m of log.matchAll(UNRESOLVED)) {
   // Saying anything here would send the author after the wrong cause.
   if (Object.prototype.hasOwnProperty.call(prod, pkg)) continue;
   if (Object.prototype.hasOwnProperty.call(dev, pkg)) {
+    // The move keeps the specifier and the locked version (OPEN 61). With npm
+    // 11, `npm install <pkg> && npm uninstall --save-dev <pkg>` removes the
+    // package from package.json altogether, and `npm install --save-prod`
+    // re-resolves it and rewrites an exact pin as a range. The subshell leaves
+    // the author's shell at the repo root, where the commit runs. pkg is safe
+    // inside single quotes: NPM_NAME admits no quote.
     console.log(
       `::error title=devDependency imported at runtime::"${pkg}" is declared under devDependencies in `
       + "app/package.json but your production code imports it. Since platform v0.14.21 the deploy installs "
-      + `production dependencies only (npm ci --omit=dev), so it is not present at bundle time. Move it: cd app `
-      + `&& npm install ${pkg} && npm uninstall --save-dev ${pkg}, commit app/package.json and `
-      + "app/package-lock.json, then tag again. The dependency gate will audit it from then on.",
+      + "production dependencies only (npm ci --omit=dev), so it is not present at bundle time. Move it: "
+      + `(cd app && p='${pkg}' && spec="$(npm pkg get "devDependencies[$p]" | tr -d '"')" && test "$spec" != "{}" `
+      + `&& npm pkg set "dependencies[$p]=$spec" && npm pkg delete "devDependencies[$p]" && npm install `
+      + "--package-lock-only), commit app/package.json and app/package-lock.json, then tag again. The dependency "
+      + "gate will audit it from then on.",
     );
   } else {
     console.log(
