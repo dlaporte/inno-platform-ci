@@ -69,9 +69,13 @@ function setProxyAuthority(headers: Headers, req: Request): void {
 // The ONLY groups an app may be told about (R29). An app's authorization is
 // its own members group or its open twin; everything else in a person's list
 // of this instance's groups is information about the rest of the platform,
-// including whether they are a platform admin. The Okta claim cannot be
-// narrowed per app on this org tier (OPERATIONS section 9(a)), so the Access
-// JWT arrives with all of them and this is where the narrowing has to happen.
+// including whether they are a platform admin. On the browser path the groups
+// are the platform's /_access/check answer (capability 1, access-check.ts),
+// which already names only these two; the MCP path's come from introspection
+// and the dev path's from a header. This narrowing applies to all three
+// anyway, here where no branch can skip it, because the gateway is pinned per
+// app (gateway.ref) while the platform ships from main: "the platform already
+// narrowed" is a cross-version assumption, not a local guarantee.
 // Exact names, not a prefix match, and fixed order: members, then open.
 // `groupPrefix` is the gateway's GROUP_PREFIX var (instance.ts readPrefixes).
 export function groupsVisibleToApp(groupPrefix: string, app: string, groups: readonly string[]): string[] {

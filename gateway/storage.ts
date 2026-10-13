@@ -7,8 +7,11 @@ import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 // 2026-08-18; see env.ts), so the 501 below covers only a gateway deployed
 // from a config that predates that binding. An sso-perimeter app therefore
 // reaches the platform seam, but carries no caller assertion (the Access path
-// mints none; only introspection does), so the platform refuses it with 400
-// bad_request rather than this file answering 501. GATEWAY_INTROSPECT_KEY is
+// mints none; only introspection does), so the platform refuses it rather
+// than this file answering 501: with 503 connections_disabled when the
+// platform holds no GATEWAY_INTROSPECT_KEY or no CALLER_ASSERTION_KEY (it
+// mints no assertion for anyone then), and with 400 bad_request when it holds
+// both (src/routes/connections.ts). GATEWAY_INTROSPECT_KEY is
 // the proof of gateway-hood linkStillLive presents on /_links/check; optional
 // on Env because a gateway deployed before the key existed has none, and its
 // absence fails that check closed.
@@ -40,9 +43,11 @@ const LINK_CHECK_PATH = "/_links/check";
 
 // Per-isolate memo of the platform's answer. A linked-storage call is a hot
 // path for a consumer app, and the platform's answer changes only when someone
-// revokes a link — 60 s matches the platform's own admin-roster and
-// account-status caches and bounds the revocation lag to the same window every
-// other control on this platform uses.
+// revokes a link. 60 s bounds the revocation lag to the window the platform's
+// admin-roster cache (src/mcp/authz.ts) and this gateway's introspection
+// ceiling (mcp-auth.ts) also use. It is a chosen number, not a shared one:
+// nothing holds the three together, and the platform's account-status hold is
+// a setting of its own (auth.status_check_minutes, 1 to 60 minutes).
 const LINK_CHECK_TTL_MS = 60_000;
 const linkCheckCache = new Map<string, { live: boolean; at: number }>();
 
@@ -133,10 +138,15 @@ export function linkBindingFor(sourceApp: string): string {
  * Resolve `/_storage/linked/{app}/...` to the D1 binding the platform injected
  * for that link, or null when no such link is deployed.
  *
- * The presence of the binding IS the authorization: it exists only because the
+ * The binding is the DEPLOY-TIME authorization: it exists only because the
  * platform templated it into this gateway's config at deploy time, having
  * checked same-owner and membership containment. The container cannot conjure a
- * binding, so a request naming an unlinked app finds nothing.
+ * binding, so a request naming an unlinked app finds nothing. It is not the
+ * whole authorization: since R09 a gateway that also carries the link's
+ * LINK_GEN_<SOURCE> generation asks /_links/check before using it
+ * (linkStillLive above), so a revoked link stops working before the consumer
+ * redeploys. Only a gateway deployed before R09, with no generation, still
+ * treats the binding as the whole answer.
  */
 function resolveLinkedDb(env: S, sourceApp: string): D1Database | null {
   if (!APP_NAME_RE.test(sourceApp)) return null;

@@ -544,10 +544,11 @@ function forceWorkersDevFalse(out, label) {
 // Every deployed gateway runs in production mode, and nothing but this says so
 // (R37). gateway/index.ts carries a dev branch that synthesizes an identity
 // from an X-Mock-User request header; it is gated on DEV_MOCK_IDENTITY, which
-// nothing supplies in any runtime today (the gateway configs name it inside a
-// `dev` block, and wrangler discards a `vars` key there), and this is the
-// second lock: a config whose DEPLOYED vars say anything but production, or
-// that names the mock-identity var at all, is refused rather than templated.
+// nothing supplies in any runtime today (the gateway configs used to name it
+// inside a `dev` block, where wrangler discards a `vars` key, and none does
+// now), and this is the second lock: a config whose DEPLOYED vars say anything
+// but production, or that names the mock-identity var at all, is refused
+// rather than templated.
 //
 // Decided from the comment-stripped PARSE, exactly what `wrangler deploy`
 // reads, for the same reason forceWorkersDevFalse is: a raw-text check can be

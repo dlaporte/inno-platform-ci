@@ -23,10 +23,11 @@ export type Env = {
   HOST_PREFIX?: string; GROUP_PREFIX?: string;
   // The dev mock-identity switch (R37): index.ts's X-Mock-User branch requires
   // it to equal "enabled". NOTHING SUPPLIES IT TODAY, in any runtime. The
-  // gateway configs name it inside their `dev` block, but `vars` is not a field
-  // wrangler accepts there (wrangler 4.x warns "Unexpected fields found in dev
-  // field" and discards the block), so the value reaches neither `wrangler dev`
-  // nor a deploy, and the mock-identity branch is unreachable as configured.
+  // gateway configs used to name it inside a `dev` block, where `vars` is not
+  // a field wrangler accepts (wrangler 4.x warned "Unexpected fields found in
+  // dev field" and discarded the block), and none of the four does now, so the
+  // value reaches neither `wrangler dev` nor a deploy, and the mock-identity
+  // branch is unreachable as configured.
   // This stays declared as the belt: a gitignored `.dev.vars` file is the
   // supported way to supply a local-only var (OPERATIONS §4.5), and even then a
   // DEPLOY still cannot carry it, because ci/template-wrangler.mjs refuses to
@@ -67,7 +68,8 @@ export type Env = {
   // A gateway deployed before the key existed has none to send and must be
   // redeployed to receive it. The oauth-rs idle-clock touch does not need it:
   // index.ts sends the caller's own token, which the platform re-introspects
-  // (OPEN #35).
+  // (OPEN #35). The browser path's /_access/check (access-check.ts) presents
+  // it when bound; that route does not demand it, but refuses a wrong one.
   GATEWAY_INTROSPECT_KEY?: string;
   // RED signal (NoOp Phase 2, gateway/red.ts). Bound on all four gateway
   // variants, and OPTIONAL for a reason that is load-bearing rather than
@@ -77,9 +79,12 @@ export type Env = {
   RED?: AnalyticsEngineDataset;
   // Service binding to the platform Worker. On oauth-rs variants it carries
   // token introspection; on ALL variants (as of spec 2026-08-18) it carries
-  // the human-activity touch. The binding is ROUTING, not authentication —
-  // both platform routes are publicly reachable and authenticate by payload;
-  // see src/routes/mcp-introspect.ts and src/routes/activity.ts.
+  // the human-activity touch; on the Access path (capability 1) it carries
+  // the /_access/check every person's request waits on, so an Access-mode
+  // gateway without it refuses every request (index.ts). The binding is
+  // ROUTING, not authentication: these platform routes are publicly
+  // reachable and authenticate by payload; see src/routes/mcp-introspect.ts,
+  // src/routes/activity.ts and src/routes/access-check.ts.
   PLATFORM?: Fetcher;
   // Per-link generation secrets, one per deployed data link, templated by CI as
   // LINK_GEN_<SOURCE_APP_UPPER> (ci/template-wrangler.mjs). Cannot appear in

@@ -4,6 +4,7 @@ import { Container, getContainer } from "@cloudflare/containers";
 import { createRemoteJWKSet } from "jose";
 import type { Env } from "./env";
 import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, type AccessIdentity } from "./access";
+import { makeAccessChecker, noAccessPage, checkUnavailablePage } from "./access-check";
 import { sanitizeAndInject } from "./identity";
 import { instanceGroups, readPrefixes } from "./instance";
 import { errLine } from "./log-text";
@@ -12,7 +13,7 @@ import {
   authenticateMcp, bearerToken, protectedResourceMetadata, unauthorizedChallenge, isProtectedResourceRequest,
 } from "./mcp-auth";
 import { mcpWorkRequest, shouldTouch, markTouched, sendTouch } from "./activity";
-import { writeRed, pathClass, classifyStatus, appFromHostname, userBucket } from "./red";
+import { writeRed, pathClass, classifyStatus, appFromHostname, userBucket, type PathClass } from "./red";
 
 // The @cloudflare/containers runtime routes container calls through an internal
 // `ContainerProxy` Durable Object that it looks up via `ctx.exports.ContainerProxy`.
@@ -133,15 +134,26 @@ function queueTouch(c: { executionCtx: { waitUntil(p: Promise<unknown>): void } 
   try { c.executionCtx.waitUntil(send); } catch { /* no ExecutionContext (tests) */ }
 }
 
-// The caller bucket recorded for a request that never got as far as an
-// identity: the gateway's own 401/403 refusals. Those requests MUST still be
-// counted — a fleet-wide auth breakage (a stale ACCESS_AUD, an expired
-// service token) is exactly the kind of outage that shows up as "every
-// request 4xx" and nowhere else.
+// The caller bucket recorded for a request the gateway refused before it
+// reached the app: its 401s, its 500s for a broken config, its 403 to a
+// service credential outside /healthz, and the access check's 403 and 503.
+// The 401s and 500s are counted as the app's traffic, because a fleet-wide
+// auth breakage (a stale ACCESS_AUD, an expired service token) shows up as
+// "every request 4xx" and nowhere else. The access check's two are recorded
+// under their own class, which no platform reader counts yet (red.ts).
 const ANON_BUCKET = "anon";
 
+// A deploy-time error: nothing the caller sends can fix it, so 500 rather
+// than 401 (which a browser behind Access reads as "sign in again"), and
+// no-store so no client or cache keeps the answer past the fix.
+const MISCONFIGURED_HEADERS = { "cache-control": "no-store" };
+
 export function makeApp(deps: Deps = realDeps) {
-  const app = new Hono<{ Bindings: Env; Variables: { redUser?: string; redStatus?: "err" } }>();
+  const app = new Hono<{ Bindings: Env; Variables: { redUser?: string; redStatus?: "err"; redPath?: PathClass } }>();
+  // The /_access/check client and its cache (access-check.ts). One per app,
+  // and the default export below is the one app an isolate builds, so the
+  // cache is per isolate.
+  const checkAccess = makeAccessChecker();
   // Every response served on the app hostname carries HSTS — the proxied app
   // response and the gateway's own refusals (401/403/metadata) alike.
   app.use("*", async (c, next) => {
@@ -149,14 +161,18 @@ export function makeApp(deps: Deps = realDeps) {
     c.res = withHsts(c.res);
   });
   // RED signal (Phase 2). Wraps the whole handler so the gateway's own
-  // refusals are measured alongside proxied app responses — a fleet-wide auth
-  // breakage is "every request 4xx" and shows up nowhere else. Observation
+  // refusals are measured alongside proxied app responses: a fleet-wide auth
+  // breakage is "every request 4xx" and shows up nowhere else. The access
+  // check's 403 and 503 are the exception, written under `access` (below and
+  // red.ts) and so outside every rate the platform reads today. Observation
   // only: nothing here changes a status, a body, or an error.
   //
   // `err` (the app was unreachable) cannot be read off the response, because
   // Hono catches a handler throw and turns it into a 500 BEFORE next()
   // returns — indistinguishable from an app that genuinely answered 500. So
   // the forward marks the class in `redStatus` and this reads the override.
+  // `redPath` is the same kind of override for the path class: the access
+  // check's own refusals mark `access`, so they are never the app's traffic.
   app.use("*", async (c, next) => {
     const started = Date.now();
     // A gateway whose prefix vars are broken still records its refusal (the
@@ -166,7 +182,7 @@ export function makeApp(deps: Deps = realDeps) {
     const app_ = appFromHostname(new URL(c.req.url).hostname, pre.ok ? pre.prefixes.hostPrefix : "");
     const path = pathClass(c.req.path);
     const record = (status: Parameters<typeof writeRed>[1]["status"]) => writeRed(c.env, {
-      app: app_, path, status,
+      app: app_, path: c.get("redPath") ?? path, status,
       user: c.get("redUser") ?? ANON_BUCKET,
       latencyMs: Date.now() - started,
     });
@@ -185,12 +201,10 @@ export function makeApp(deps: Deps = realDeps) {
     // config without them, or with a malformed one, is a deploy-time error:
     // refuse every request, the public discovery document included, rather
     // than guess a prefix and forward the wrong groups while looking healthy.
-    // 500, not 401: nothing the caller sends can fix it, and no-store so no
-    // client or cache keeps the answer past the fix.
     const pre = readPrefixes(env);
     if (!pre.ok) {
       console.error(`gateway: ${pre.error}; refusing all requests`);
-      return c.text("misconfigured", 500, { "cache-control": "no-store" });
+      return c.text("misconfigured", 500, MISCONFIGURED_HEADERS);
     }
     const { prefixes } = pre;
     // The Host header is not guaranteed present on every Request object
@@ -273,9 +287,19 @@ export function makeApp(deps: Deps = realDeps) {
       // Fail CLOSED on a mis-templated deploy: without an AUD and team domain
       // there is nothing to verify a JWT against, and proceeding would check the
       // token against `undefined` rather than this app's Access application.
+      // The same 500 a missing prefix var gets (review D-18).
       if (!env.ACCESS_AUD || !env.ACCESS_TEAM_DOMAIN) {
-        console.error("gateway: Access mode without ACCESS_AUD/ACCESS_TEAM_DOMAIN — refusing all requests");
-        return c.text("unauthorized", 401);
+        console.error("gateway: Access mode without ACCESS_AUD/ACCESS_TEAM_DOMAIN; refusing all requests");
+        return c.text("misconfigured", 500, MISCONFIGURED_HEADERS);
+      }
+      // Capability 1 asks the platform about every person (below), so a
+      // gateway with no PLATFORM binding cannot admit anyone. All four
+      // gateway configs bind it. One that does not refuses every request,
+      // the health probe's included, so the probe reports the breakage
+      // instead of a healthy app no person can open.
+      if (!env.PLATFORM) {
+        console.error("gateway: Access mode without a PLATFORM service binding; refusing all requests");
+        return c.text("misconfigured", 500, MISCONFIGURED_HEADERS);
       }
       // hono's own cookie reader rather than a hand-rolled split: the header
       // is already parsed for this request, and a name that is a prefix of
@@ -293,11 +317,39 @@ export function makeApp(deps: Deps = realDeps) {
         console.warn(`gateway: 401 ${errLine(e, 120)} (${c.req.method} ${path})`);
         return c.text("unauthorized", 401);
       }
-      // Human-activity touch (spec 2026-08-18): any Access-verified request
-      // with a real user identity is human use — the service token's empty
-      // email excludes probes by construction. The platform re-verifies the
-      // forwarded JWT against this app's stored AUD before stamping.
-      if (env.PLATFORM && identity.email) {
+      // Capability 1: Access said who this is; the platform says whether they
+      // may use this app (access-check.ts). The service token's empty email
+      // is the health probe, which has no person to ask about and keeps its
+      // one request shape, GET /healthz. A person who asks for /healthz is
+      // asked about like any other request.
+      if (identity.email) {
+        const answer = await checkAccess({
+          platform: env.PLATFORM, gatewayKey: env.GATEWAY_INTROSPECT_KEY, host, email: identity.email, jwt: token,
+          waitUntil: (p) => c.executionCtx.waitUntil(p),
+        });
+        // Both refusals below are recorded in RED under `access`, not `app`
+        // (red.ts): the app never saw the request, so its error rate, which
+        // the post-deploy rollback and the restart act on, must not either.
+        if (answer.kind === "unanswered") {
+          console.warn(`gateway: 503 access check unanswered, ${answer.why} (${c.req.method} ${path})`);
+          c.set("redPath", "access");
+          return checkUnavailablePage();
+        }
+        if (answer.kind === "refuse") {
+          console.warn(`gateway: 403 access refused by the platform (${c.req.method} ${path})`);
+          c.set("redPath", "access");
+          return noAccessPage();
+        }
+        // The groups the app is told come from the answer, never the JWT's
+        // groups claim, filtered by the same two rules every identity path
+        // uses: this instance's groups (instanceGroups), then this app's own
+        // two (sanitizeAndInject's groupsVisibleToApp).
+        identity = { email: identity.email, groups: instanceGroups(prefixes.groupPrefix, answer.groups) };
+        // Human-activity touch (spec 2026-08-18): an admitted request with a
+        // real user identity is human use. After the allow, so a refused
+        // visitor never advances the app's idle clock. The platform
+        // re-verifies the forwarded JWT against this app's stored AUD before
+        // stamping.
         if (shouldTouch(host, Date.now())) {
           markTouched(host, Date.now());
           queueTouch(c, env.PLATFORM, { host, jwt: token });

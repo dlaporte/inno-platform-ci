@@ -1,8 +1,9 @@
 // The gateway's seam to the platform. Every call the gateway makes over the
-// PLATFORM service binding (token introspection, activity touches, link
-// checks, credential fetches) is addressed to one pseudo-origin and, where
-// the platform must know the caller is a gateway, carries one header. Both
-// live here so a seam added later cannot spell either differently.
+// PLATFORM service binding (token introspection, access checks, activity
+// touches, link checks, credential fetches) is addressed to one
+// pseudo-origin and, where the platform must know the caller is a gateway,
+// carries one header. Both live here so a seam added later cannot spell
+// either differently.
 //
 // gateway/ builds separately from src/ and cannot import it, which is why the
 // header is a hand-written twin of src/routes/mcp-introspect.ts's
@@ -18,4 +19,5 @@ export const PLATFORM_ORIGIN = "https://platform.internal";
 // on /app-introspect, and answers /_links/check at all, only for a caller
 // presenting the shared secret under this header, because both seams are
 // publicly reachable and the service binding is routing, not authentication.
+// /_access/check takes it when presented and refuses a wrong one.
 export const GATEWAY_KEY_HEADER = "x-inno-gateway-key";

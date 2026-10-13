@@ -16,18 +16,22 @@ export interface AccessIdentity {
   callerAssertion?: string;
 }
 
-// Cross-build twin of src/routes/activity.ts's makeRealVerifier: the same
-// Access JWT, the same issuer/audience/RS256 pins, hand-written on either side
-// of the gateway build boundary because gateway/ imports nothing from src/.
+// Cross-build twin of src/access-jwt.ts's makeRealVerifier: the same Access
+// JWT, the same issuer/audience/RS256 pins, hand-written on either side of
+// the gateway build boundary because gateway/ imports nothing from src/.
 // This is the one twin in the pair that is LOGIC rather than a constant, so it
 // is pinned by BEHAVIOR: test/access-verifier-parity.test.ts feeds one signed
 // token matrix to both verifiers and demands the same accept/reject answer. A
-// claims change landing on one side only makes every gateway touch fail
-// verification silently, which freezes last_seen_at on an app in real use.
+// claims change landing on one side only makes the platform refuse what the
+// gateway accepted: every /_access/check answers a refusal (capability 1),
+// and every touch fails verification silently, which freezes last_seen_at on
+// an app in real use.
 //
 // Only this instance's groups (opts.groupPrefix, the gateway's GROUP_PREFIX
 // var) are kept: the filter instance.ts states once for all three identity
-// paths.
+// paths. Since capability 1 the browser path does not tell the app these:
+// index.ts replaces them with the groups in the platform's /_access/check
+// answer (access-check.ts), so the JWT's groups claim decides nothing there.
 export async function verifyAccessJwt(
   token: string,
   opts: { jwks: Parameters<typeof jwtVerify>[1]; aud: string; teamDomain: string; groupPrefix: string },

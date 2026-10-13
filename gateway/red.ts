@@ -29,11 +29,25 @@ export type RedEnv = { RED?: AnalyticsEngineDataset };
 //   connections — the connection broker's backend fetch, written PLATFORM-side
 //                 (src/routes/connections.ts): a dead or locked backend
 //                 credential is its own failure class, not the app's 500s.
+//   access      : the gateway's own /_access/check outcomes (capability 1):
+//                 the 403 a refused person gets and the 503 when the
+//                 platform cannot answer. Both are the platform's answer
+//                 about a person, never the app's behavior, and the request
+//                 never reaches the app. Under `app`, a platform blip would
+//                 read as the app's error rate, which src/watch.ts's
+//                 post-deploy rollback and the NoOp restart act on.
+//                 WRITE-ONLY today: no platform reader selects it, so a
+//                 fleet-wide refusal or outage is not a RED signal anywhere;
+//                 it shows in the gateway's and the platform's own logs. A
+//                 reader for it is a recorded follow-up.
+// The platform's reader (src/lifecycle/red.ts, APP_TRAFFIC) counts an app's
+// requests and errors from `app` alone, so every other class is excluded by
+// construction; test/constant-parity.node.test.ts holds the two together.
 // `storage-proxy` from the spec is deliberately absent: that traffic runs
 // container→storage.internal through an outbound handler that never sees the
 // app name, and it needs no label to be excluded from the app's rate because
 // it never crosses this boundary at all.
-export type PathClass = "app" | "healthz" | "connections";
+export type PathClass = "app" | "healthz" | "connections" | "access";
 
 export function pathClass(pathname: string): PathClass {
   return pathname === "/healthz" ? "healthz" : "app";
