@@ -33,12 +33,12 @@ type S = StorageEnv;
 // CONN_NAME_RE) — restated rather than imported, same reason as APP_NAME_RE below:
 // the gateway builds separately from the platform Worker.
 const CONNECTION_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
-// Hand-written twin of src/routes/connections.ts's CONNECTIONS_FETCH_PATH
-// (gateway/ builds separately) — pinned by test/constant-parity.node.test.ts.
+// Hand-written twin of src/routes/seams.ts's CONNECTIONS_FETCH_PATH
+// (gateway/ builds separately), pinned by test/constant-parity.node.test.ts.
 const CONNECTIONS_FETCH_PATH = "/_connections/fetch";
 
-// Hand-written twin of src/routes/links.ts's LINKS_CHECK_PATH (gateway/ builds
-// separately) — pinned by test/constant-parity.node.test.ts.
+// Hand-written twin of src/routes/seams.ts's LINKS_CHECK_PATH (gateway/ builds
+// separately), pinned by test/constant-parity.node.test.ts.
 const LINK_CHECK_PATH = "/_links/check";
 
 // Per-isolate memo of the platform's answer. A linked-storage call is a hot
@@ -82,7 +82,7 @@ async function linkStillLive(env: S, sourceApp: string): Promise<boolean | null>
   if (hit && now - hit.at < LINK_CHECK_TTL_MS) return hit.live;
   const key = env.GATEWAY_INTROSPECT_KEY;
   if (!key) {
-    console.warn("gateway: linked storage carries a generation but no GATEWAY_INTROSPECT_KEY — refusing");
+    console.warn("gateway: linked storage carries a generation but no GATEWAY_INTROSPECT_KEY; refusing");
     return false;
   }
   try {
@@ -232,7 +232,7 @@ export async function handleStorage(request: Request, env: S): Promise<Response>
           error: "not_linked",
           detail:
             `No deployed data link to "${sourceApp}". Create one with the link_app_data MCP tool ` +
-            "(same owner only), then redeploy this app — links are bound at deploy time.",
+            "(same owner only), then redeploy this app: links are bound at deploy time.",
         }, 404);
       }
       // The binding proves the platform templated this link at DEPLOY time.

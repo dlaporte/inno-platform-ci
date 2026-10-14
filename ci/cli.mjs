@@ -1,7 +1,6 @@
 // Shared "am I the script node was told to run?" guard for every ci/ and
-// scripts/ CLI's main block. Lives on its own (not in broker-post.mjs, its
-// former home) so scripts/ — which has no reason to depend on the broker
-// helper — can import it standalone.
+// scripts/ CLI's main block. Lives on its own, apart from broker-post.mjs, so
+// a script can take the guard without the request helper.
 // The other ci/ helpers every script may need live here too, among them the
 // reader of the instance's names (loadInstanceData), so the mirror ships no
 // extra file for them.

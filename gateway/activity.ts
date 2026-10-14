@@ -5,8 +5,8 @@ import { readBoundedResultFrom } from "./bounded-body";
 import { errLine } from "./log-text";
 import { PLATFORM_ORIGIN } from "./platform";
 
-// gateway/ builds separately from src/ and cannot import it — TOUCH_PATH is a
-// deliberately duplicated constant (twin: src/routes/activity.ts), pinned by
+// gateway/ builds separately from src/ and cannot import it, so TOUCH_PATH is
+// a deliberately duplicated constant (twin: src/routes/seams.ts), pinned by
 // test/constant-parity.node.test.ts.
 export const TOUCH_PATH = "/_activity/touch";
 

@@ -138,13 +138,13 @@ async function cacheKeyFor(token: string, resource: string): Promise<string> {
 }
 
 // Ask the platform whether this token is live and who it belongs to. Fails
-// CLOSED on every failure mode — a non-200, a thrown binding call, or a
+// CLOSED on every failure mode: a non-200, a thrown binding call, or a
 // non-JSON body all resolve to {active:false}, so the caller answers the
 // recoverable 401 challenge (never a 500, which an MCP client treats as fatal
 // and does not retry).
-// gateway/ builds separately from src/ and cannot import it — this is a
-// hand-written twin of src/routes/mcp-introspect.ts's APP_INTROSPECT_PATH,
-// pinned by test/constant-parity.node.test.ts (TOUCH_PATH-style).
+// gateway/ builds separately from src/ and cannot import it, so this is a
+// hand-written twin of src/routes/seams.ts's APP_INTROSPECT_PATH, pinned
+// by test/constant-parity.node.test.ts.
 const APP_INTROSPECT_PATH = "/app-introspect";
 
 // Takes the binding, not Env, the way activity.ts's sendTouch does: the
@@ -195,13 +195,13 @@ export async function authenticateMcp(
   // the platform rejecting an empty resource across a gateway/platform version
   // skew. Also keeps every such gateway out of a shared `resource=""` key space.
   if (!resource) {
-    console.error("gateway: OAUTH_RS mode without OAUTH_RS_RESOURCE — refusing all requests");
+    console.error("gateway: OAUTH_RS mode without OAUTH_RS_RESOURCE; refusing all requests");
     return null;
   }
   if (!env.PLATFORM) {
     // Misconfiguration (an mcp gateway deployed without its service binding).
     // Fail closed rather than serve an app with no identity boundary at all.
-    console.error("gateway: OAUTH_RS mode without a PLATFORM service binding — refusing all requests");
+    console.error("gateway: OAUTH_RS mode without a PLATFORM service binding; refusing all requests");
     return null;
   }
 
@@ -257,7 +257,7 @@ export function protectedResourceMetadata(env: Env): Response {
   // intermediaries would keep that garbage for an hour after the config is
   // corrected. 500 + no-store instead: loud, and never cached.
   if (!env.OAUTH_RS_RESOURCE || !env.MCP_AUTH_SERVER) {
-    console.error("gateway: protected-resource metadata requested without OAUTH_RS_RESOURCE/MCP_AUTH_SERVER — refusing");
+    console.error("gateway: protected-resource metadata requested without OAUTH_RS_RESOURCE/MCP_AUTH_SERVER; refusing");
     return new Response("misconfigured", { status: 500, headers: { "cache-control": "no-store" } });
   }
   return Response.json({

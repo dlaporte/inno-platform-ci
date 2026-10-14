@@ -161,7 +161,7 @@ export async function checkDepAge({ appDir, thresholdDays, fetchImpl = fetch, no
 
   // package.json with NO usable lockfile, absent OR malformed, the operator's
   // own state either way: there are no exact npm versions to date, so an
-  // enabled cooldown cannot be applied to npm at all. The deploy job refuses
+  // enabled cooldown cannot be applied to npm at all. The app-deps job refuses
   // a function-shaped app with no committed lockfile anyway (R11); this flag
   // exists so the CLI fails an ENABLED cooldown plainly, naming the reason,
   // instead of printing a clean-pass line over nothing. (Registry-unreachable
@@ -186,7 +186,7 @@ export async function main({ appDir, thresholdDays } = {}) {
   appDir ??= process.argv[2] || "app";
   thresholdDays ??= Number(process.env.MIN_RELEASE_AGE_DAYS || 0);
   if (!Number.isFinite(thresholdDays) || thresholdDays <= 0) {
-    console.log("dep-age: min_release_age_days is 0 — cooldown gate disabled, nothing to check.");
+    console.log("dep-age: min_release_age_days is 0, so the cooldown gate is disabled; nothing to check.");
     return 0;
   }
   const { violations, checked, skipped, unpinnedNpm } = await checkDepAge({ appDir, thresholdDays });
@@ -201,22 +201,22 @@ export async function main({ appDir, thresholdDays } = {}) {
   // stdout. Do not harmonise it with deploy-finalize.mjs, whose stdout IS
   // piped into `jq` under `set -e` and whose warnings must be on stderr.
   for (const s of skipped) {
-    console.log(`::warning title=Dependency age unknown::${s.ecosystem}:${logSafe(s.name)}@${logSafe(s.version)} — no publish date from the registry; skipped`);
+    console.log(`::warning title=Dependency age unknown::${s.ecosystem}:${logSafe(s.name)}@${logSafe(s.version)}: no publish date from the registry; skipped`);
   }
-  // Reaching here means an admin explicitly set safety.min_release_age_days —
+  // Reaching here means an admin explicitly set safety.min_release_age_days:
   // they asked for a cooldown. Without a committed lockfile there are no exact
   // npm versions to date, so the cooldown cannot be applied to npm at all (the
-  // deploy job refuses a function-shaped app with no committed lockfile
+  // app-deps job refuses a function-shaped app with no committed lockfile
   // anyway, R11). Passing green would be exactly the defect this gate exists
   // to prevent: a clean report over work that was never done.
-  // Note the asymmetry with the disabled case above — with the gate OFF (the
+  // Note the asymmetry with the disabled case above: with the gate OFF (the
   // default) an unpinned app is fine and never reaches this branch. The gate
   // being ON is the opt-in; a committed app lockfile is not otherwise required
   // by the app contract.
   if (unpinnedNpm) {
     console.error(
       "::error title=Dependency cooldown cannot be applied::app/package.json has no committed, " +
-      "parseable app/package-lock.json, so there are no exact npm versions to date (and the deploy " +
+      "parseable app/package-lock.json, so there are no exact npm versions to date (and the app-deps " +
       `job refuses a function-shaped app without one anyway, R11). This app cannot satisfy the ${thresholdDays}-day cooldown its ` +
       "safety.min_release_age_days setting requires. Commit app/package-lock.json, or ask a platform " +
       "admin to set safety.min_release_age_days to 0 for this app.",

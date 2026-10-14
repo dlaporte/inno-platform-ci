@@ -6,7 +6,7 @@
 // either differently.
 //
 // gateway/ builds separately from src/ and cannot import it, which is why the
-// header is a hand-written twin of src/routes/mcp-introspect.ts's
+// header is a hand-written twin of src/routes/seams.ts's
 // GATEWAY_KEY_HEADER, pinned by test/constant-parity.node.test.ts. The
 // separate build justifies ONE twin per platform constant inside gateway/,
 // not one per file: this is that one.
@@ -19,5 +19,6 @@ export const PLATFORM_ORIGIN = "https://platform.internal";
 // on /app-introspect, and answers /_links/check at all, only for a caller
 // presenting the shared secret under this header, because both seams are
 // publicly reachable and the service binding is routing, not authentication.
-// /_access/check takes it when presented and refuses a wrong one.
+// /_access/check takes it when presented, answers a stale or unknown key as
+// if none were sent, and refuses no key.
 export const GATEWAY_KEY_HEADER = "x-inno-gateway-key";

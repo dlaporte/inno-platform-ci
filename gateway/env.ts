@@ -58,7 +58,7 @@ export type Env = {
   MCP_AUTH_SERVER?: string;
   // Shared secret proving to /app-introspect that this caller is a GATEWAY, not
   // some holder of an app access token. Only a caller presenting it receives a
-  // caller_assertion — the credential that opens /_connections/fetch. Pushed as
+  // caller_assertion, the credential that opens /_connections/fetch. Pushed as
   // a Worker secret by the platform at deploy time, never templated into the
   // config (the app's CI can read its own config, and must not read this).
   // The platform requires this header once its own key is provisioned, unless
@@ -69,7 +69,8 @@ export type Env = {
   // redeployed to receive it. The oauth-rs idle-clock touch does not need it:
   // index.ts sends the caller's own token, which the platform re-introspects
   // (OPEN #35). The browser path's /_access/check (access-check.ts) presents
-  // it when bound; that route does not demand it, but refuses a wrong one.
+  // it when bound; that route does not demand it, and answers a stale or
+  // unknown key as if none were sent.
   GATEWAY_INTROSPECT_KEY?: string;
   // RED signal (NoOp Phase 2, gateway/red.ts). Bound on all four gateway
   // variants, and OPTIONAL for a reason that is load-bearing rather than

@@ -3,7 +3,7 @@ import { getCookie } from "hono/cookie";
 import { Container, getContainer } from "@cloudflare/containers";
 import { createRemoteJWKSet } from "jose";
 import type { Env } from "./env";
-import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, type AccessIdentity } from "./access";
+import { verifyAccessJwt, ACCESS_JWT_HEADER, ACCESS_COOKIE, ACCESS_UNAVAILABLE, type AccessIdentity } from "./access";
 import { makeAccessChecker, noAccessPage, checkUnavailablePage } from "./access-check";
 import { sanitizeAndInject } from "./identity";
 import { instanceGroups, readPrefixes } from "./instance";
@@ -38,7 +38,7 @@ export function resolveSleepAfter(v: string | undefined, fallback = "10m"): stri
   // container.sleep_after to something this grammar rejects otherwise sees
   // the config store accept the value while the container keeps sleeping at
   // 10m, with no surface anywhere explaining the discrepancy.
-  if (v) console.warn(`gateway: ignoring malformed SLEEP_AFTER ${JSON.stringify(v)} — keeping ${fallback}`);
+  if (v) console.warn(`gateway: ignoring malformed SLEEP_AFTER ${JSON.stringify(v)}, keeping ${fallback}`);
   return fallback;
 }
 
@@ -136,11 +136,13 @@ function queueTouch(c: { executionCtx: { waitUntil(p: Promise<unknown>): void } 
 
 // The caller bucket recorded for a request the gateway refused before it
 // reached the app: its 401s, its 500s for a broken config, its 403 to a
-// service credential outside /healthz, and the access check's 403 and 503.
-// The 401s and 500s are counted as the app's traffic, because a fleet-wide
-// auth breakage (a stale ACCESS_AUD, an expired service token) shows up as
-// "every request 4xx" and nowhere else. The access check's two are recorded
-// under their own class, which no platform reader counts yet (red.ts).
+// service credential outside /healthz, the access check's 403 and 503, and
+// the 503 while Access's signing keys cannot be obtained. The 401s and 500s
+// are counted as the app's traffic, because a fleet-wide auth breakage (a
+// stale ACCESS_AUD, an expired service token) shows up as "every request
+// 4xx" and nowhere else. The access check's two, and the key-set 503, are
+// recorded under their own class, which no platform reader counts yet
+// (red.ts).
 const ANON_BUCKET = "anon";
 
 // A deploy-time error: nothing the caller sends can fix it, so 500 rather
@@ -163,16 +165,18 @@ export function makeApp(deps: Deps = realDeps) {
   // RED signal (Phase 2). Wraps the whole handler so the gateway's own
   // refusals are measured alongside proxied app responses: a fleet-wide auth
   // breakage is "every request 4xx" and shows up nowhere else. The access
-  // check's 403 and 503 are the exception, written under `access` (below and
-  // red.ts) and so outside every rate the platform reads today. Observation
-  // only: nothing here changes a status, a body, or an error.
+  // check's 403 and 503, and the 503 while Access's signing keys cannot be
+  // obtained, are the exception, written under `access` (below and red.ts)
+  // and so outside every rate the platform reads today. Observation only:
+  // nothing here changes a status, a body, or an error.
   //
   // `err` (the app was unreachable) cannot be read off the response, because
   // Hono catches a handler throw and turns it into a 500 BEFORE next()
-  // returns — indistinguishable from an app that genuinely answered 500. So
+  // returns, indistinguishable from an app that genuinely answered 500. So
   // the forward marks the class in `redStatus` and this reads the override.
   // `redPath` is the same kind of override for the path class: the access
-  // check's own refusals mark `access`, so they are never the app's traffic.
+  // check's own refusals and the key-set 503 mark `access`, so they are never
+  // the app's traffic.
   app.use("*", async (c, next) => {
     const started = Date.now();
     // A gateway whose prefix vars are broken still records its refusal (the
@@ -314,6 +318,18 @@ export function makeApp(deps: Deps = realDeps) {
           { jwks: deps.jwks(env), aud: env.ACCESS_AUD, teamDomain: env.ACCESS_TEAM_DOMAIN, groupPrefix: prefixes.groupPrefix },
           { allowService: isHealthProbe });
       } catch (e) {
+        // Access's signing keys that could not be obtained (access.ts) are an
+        // outage, no verdict on the person: the access check's 503 page,
+        // recorded under `access`, rather than a 401, which a browser behind
+        // Access reads as "sign in again". GET /healthz keeps its 401: the
+        // platform's probe reads a 503 as unhealthy (src/health.ts), which
+        // mails the owner and feeds the restart ladder over an outage of
+        // Access's, and reads a 401 as a blocked probe.
+        if (!isHealthProbe && e instanceof Error && e.message.startsWith(ACCESS_UNAVAILABLE)) {
+          console.warn(`gateway: 503 Access signing keys unavailable, ${errLine(e, 120)} (${c.req.method} ${path})`);
+          c.set("redPath", "access");
+          return checkUnavailablePage();
+        }
         console.warn(`gateway: 401 ${errLine(e, 120)} (${c.req.method} ${path})`);
         return c.text("unauthorized", 401);
       }

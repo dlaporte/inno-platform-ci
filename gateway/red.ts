@@ -35,7 +35,10 @@ export type RedEnv = { RED?: AnalyticsEngineDataset };
 //                 about a person, never the app's behavior, and the request
 //                 never reaches the app. Under `app`, a platform blip would
 //                 read as the app's error rate, which src/watch.ts's
-//                 post-deploy rollback and the NoOp restart act on.
+//                 post-deploy rollback and the NoOp restart act on. The 503
+//                 the gateway answers while it cannot obtain Access's
+//                 signing keys (index.ts) is written here too, for the same
+//                 reason: an Access outage is not the app's error.
 //                 WRITE-ONLY today: no platform reader selects it, so a
 //                 fleet-wide refusal or outage is not a RED signal anywhere;
 //                 it shows in the gateway's and the platform's own logs. A

@@ -24,7 +24,7 @@
 import { errLine } from "./log-text";
 import { GATEWAY_KEY_HEADER, PLATFORM_ORIGIN } from "./platform";
 
-// Hand-written twin of src/routes/access-check.ts's ACCESS_CHECK_PATH
+// Hand-written twin of src/routes/seams.ts's ACCESS_CHECK_PATH
 // (gateway/ builds separately and cannot import it), pinned by
 // test/constant-parity.node.test.ts.
 export const ACCESS_CHECK_PATH = "/_access/check";
@@ -66,8 +66,9 @@ export type AccessCheckRequest = {
   // requests joined to it are waiting on. A throw from it is ignored.
   waitUntil?: (p: Promise<unknown>) => void;
   // GATEWAY_INTROSPECT_KEY, presented when this gateway holds one, the way
-  // mcp-auth.ts and storage.ts present it. The route does not demand it, but
-  // refuses a wrong one (src/routes/access-check.ts).
+  // mcp-auth.ts and storage.ts present it. The route neither demands it nor
+  // refuses on it: a stale or unknown key is answered as if none were sent
+  // (src/routes/access-check.ts).
   gatewayKey?: string;
   host: string;
   // The email verifyAccessJwt verified, exactly as the JWT carries it. Not

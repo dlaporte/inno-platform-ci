@@ -131,7 +131,7 @@ if (isMainModule(import.meta.url)) {
       const result = await postDepsResults(base, token, app, deploymentIdNum, findings);
       console.log(`deps-results: ${JSON.stringify(result)}`);
     } else {
-      throw new Error(`unknown mode ${JSON.stringify(mode)} — use "gate" or "post"`);
+      throw new Error(`unknown mode ${JSON.stringify(mode)}: use "gate" or "post"`);
     }
   } catch (err) {
     console.error(String(err?.message ?? err));

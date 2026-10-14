@@ -65,7 +65,8 @@ const COMPETING_WRANGLER_RE = /^wrangler\.(json|toml|.+\.(json|jsonc|toml))$/;
 // the gateway's build inputs there at build time (no root install happens any
 // more, R02), and a .pnpmfile.cjs is arbitrary JavaScript an install would
 // execute. At depth only .npmrc matters (check 6b): npm is the one package
-// manager the deploy job runs inside the author-owned app/.
+// manager CI runs inside the author-owned app/, in the app-deps job's install
+// and the deps gate's audit.
 const ROOT_PACKAGE_MANAGER_CONFIG_RE = /^(\.npmrc|\.yarnrc|\.yarnrc\.yml|\.pnpmfile\.cjs|pnpm-workspace\.yaml|bunfig\.toml)$/;
 
 // Depth-first listing of everything below `root` as repo-relative POSIX paths.
@@ -155,55 +156,63 @@ export function checkConfig(appDir) {
       const name = entry.name;
       if (name === ".wrangler" && (entry.isDirectory() || entry.isSymbolicLink())) {
         violations.push(
-          `.wrangler/ must not be committed — it is a wrangler-generated cache/redirect directory ` +
+          `.wrangler/ must not be committed: it is a wrangler-generated cache/redirect directory ` +
             `(.wrangler/deploy/config.json can redirect the deploy to an unvetted config)`,
         );
         continue;
       }
       if (name === "wrangler.jsonc") {
         violations.push(
-          "delete wrangler.jsonc — the platform injects wrangler.jsonc at build time from the promoted gateway.ref " +
-            "(see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)",
+          "delete wrangler.jsonc: the platform injects wrangler.jsonc at build time from the promoted gateway.ref " +
+            "(see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)",
         );
         continue;
       }
       if (COMPETING_WRANGLER_RE.test(name)) {
         violations.push(
-          `${name} is a wrangler config file — apps may not carry ANY wrangler config; the platform injects it ` +
+          `${name} is a wrangler config file: apps may not carry ANY wrangler config; the platform injects it ` +
             `(wrangler's config discovery could silently prefer it over the gate-vetted file)`,
         );
       }
       // Every package manager's project-level config is rejected here at the
-      // repo root — npm, yarn classic and berry, pnpm, and bun (see
-      // ROOT_PACKAGE_MANAGER_CONFIG_RE for the exact file list). npm and
-      // yarn classic's rc files are an unpinned input to `npm ci` in the
-      // deploy job — they can redirect the registry, set install flags, or
-      // enable lifecycle behavior. npm also expands ${VAR} from the environment
-      // into rc values, so an rc file that reaches a step holding a credential
-      // exfiltrates it on the tarball fetch (reproduced 2026-09-14; the
-      // function-shaped app/ install has since moved out of the deploy job
-      // entirely, into `app-deps`, which holds no id-token grant. A step was
-      // never enough: `id-token: write` has no step-level scope, so every step
-      // of a job holding it sees the OIDC request credential, which is S01,
-      // reproduced 2026-09-17). --ignore-scripts does not help. Root-level
-      // here; check 6b below
-      // covers every other directory, because npm reads the rc of the directory
-      // it RUNS in, not only the repo root.
+      // repo root: npm, yarn classic and berry, pnpm, and bun (see
+      // ROOT_PACKAGE_MANAGER_CONFIG_RE for the exact file list). An rc file
+      // can redirect the registry, set install flags, or enable lifecycle
+      // behavior, and npm expands ${VAR} from the environment into rc values,
+      // so an rc file that reaches a step holding a credential exfiltrates it
+      // on the tarball fetch (reproduced 2026-09-14). --ignore-scripts does
+      // not help. A step is not the boundary: `id-token: write` has no
+      // step-level scope, so every step of a job holding it sees the OIDC
+      // request credential (S01, reproduced 2026-09-17), which is why the
+      // app/ install runs in `app-deps`, a job with no id-token grant.
+      //
+      // No install in CI reads a root rc file today. The deploy job's
+      // `npm ci` runs in $GW, a platform-owned directory outside the
+      // checkout, and the app-deps job's install and the deps gate's audit
+      // run in app/, which its own package.json makes npm's project root. The
+      // one npm call at the checkout root is the deploy job's setup-node
+      // `cache: npm` lookup (`npm config get cache`, run from the workspace),
+      // and it loads a root .npmrc. Rejecting every root copy keeps a root rc
+      // file out of that lookup and out of any package manager a later change
+      // runs at the root. Check 6b below covers every other directory,
+      // because npm reads the rc of the directory it RUNS in, not only the
+      // repo root.
+      //
       // wrangler loads .env/.env.* from cwd at CLI startup, and env keys the
-      // deploy step doesn't set are ADOPTED — a committed .env with
+      // deploy step doesn't set are ADOPTED: a committed .env with
       // CLOUDFLARE_API_BASE_URL (or WRANGLER_DOCKER_BIN/DOCKER_HOST) redirects
       // API calls, bearer token included, to an attacker host. Reject like
       // .npmrc: an unpinned deploy-build input. (2026-07-22 review find.)
       if (/^\.env(\..+)?$/.test(name)) {
         violations.push(
-          `${name} must not be committed — wrangler loads .env files at deploy time (an app-set ` +
+          `${name} must not be committed: wrangler loads .env files at deploy time (an app-set ` +
             `CLOUDFLARE_API_BASE_URL would redirect API calls, account token included); remove it`,
         );
         continue;
       }
       if (ROOT_PACKAGE_MANAGER_CONFIG_RE.test(name)) {
         violations.push(
-          `${name} must not be committed — package manager config is an unpinned deploy-build input; remove it`,
+          `${name} must not be committed: package manager config is an unpinned deploy-build input; remove it`,
         );
       }
     }
@@ -297,7 +306,7 @@ export function checkConfig(appDir) {
       // check 6b: a nested .npmrc (the root one is check 6's, above)
       if (name === ".npmrc" && rel.includes("/")) {
         violations.push(
-          `${rel} must not be committed — npm reads the .npmrc of whichever directory it runs in ` +
+          `${rel} must not be committed: npm reads the .npmrc of whichever directory it runs in ` +
             `and expands \${VAR} from the environment into it (an unpinned deploy-build input); remove it`,
         );
       }
@@ -342,7 +351,7 @@ export function checkConfig(appDir) {
         // otherwise report an empty list for a directory we never saw into).
         srcUnreadable = true;
         violations.push(
-          `delete src/ — the platform owns src/ and it could not be read (${err.code ?? err}); ` +
+          `delete src/: the platform owns src/ and it could not be read (${err.code ?? err}); ` +
             `a src/ the gate cannot inspect fails closed`,
         );
       }
@@ -363,52 +372,55 @@ export function checkConfig(appDir) {
     }
     if (gatewayPresent) {
       violations.push(
-        "delete src/gateway/ — the platform injects the gateway at build time (see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)",
+        "delete src/gateway/: the platform injects the gateway at build time (see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)",
       );
     }
     if (!srcUnreadable && (!srcStat.isDirectory() || entries.length > 0)) {
       const what = srcStat.isDirectory() ? entries.map((n) => `src/${n}`).join(", ") : "src is not a directory";
       violations.push(
-        `delete src/ — the platform owns src/ (reserved for the gateway: the deploy builds it outside your checkout ` +
-          `and wipes src/, and the gate refuses author files there so none can shadow the gateway's dependencies ` +
+        `delete src/: the platform owns src/ (reserved for the gateway, which the deploy builds outside your checkout; ` +
+          `the deploy wipes src/, and the gate refuses author files there so none can shadow the gateway's dependencies ` +
           `or compiler configuration): ${what} ` +
-          `(see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)`,
+          `(see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)`,
       );
     }
   }
 
-  // --- Check 7b: scaffold/ must NOT exist — registration prunes the ---
-  // deployment-type scaffolds out of every app repo; a surviving
-  // scaffold/ means the prune failed (or the template was copied by hand)
-  // and the repo is carrying BOTH variants' files.
+  // --- Check 7b: scaffold/ must NOT exist. Registration prunes the ---
+  // deployment-type scaffolds out of every app repo; a surviving scaffold/
+  // means the prune did not happen (it failed or could not run, or the
+  // template was copied by hand) and the repo is carrying BOTH variants'
+  // files.
   //
-  // EXCEPT while app/.needs-build exists: the template-generation commit (the
-  // user's "Use this template") fires its own
-  // CI run before registration's prune commit lands, and that run checks out
-  // the pristine, unpruned template — failing it would redline every new
-  // app's very first run for a transient state that only exists until
-  // registration's prune commit lands. The marker is the platform's existing
-  // "not an app yet" signal (scaffold-check skips deploys on it), and deleting
-  // it to start building re-arms this check; a genuinely failed prune can't
-  // deploy anyway (registration halts before the deploy prerequisites exist).
+  // EXCEPT while app/.needs-build exists. Registration prunes best effort, so
+  // an unbuilt repo can run CI before a prune lands, or after one that could
+  // not run (register_app then warns: it tells the owner of an overlay preset
+  // whose repo has no scaffold/<preset>/ to delete scaffold/, and points a
+  // failed prune at the contract's layout). Failing that run would redline an
+  // app that has not started building. The marker is the platform's "not an
+  // app yet" signal: scaffold-check skips that run's deploy anyway, and
+  // deleting the marker to start building re-arms this check.
   let scaffoldPresent = false;
   try { lstatSync(join(appDir, "scaffold")); scaffoldPresent = true; } catch {}
   if (scaffoldPresent && !existsSync(join(appDir, "app", ".needs-build"))) {
     violations.push(
-      "delete scaffold/ — the deployment-type scaffold directory is template-only; registration prunes it out of app repos",
+      "delete scaffold/: the deployment-type scaffold directory is template-only; registration prunes it out of app repos",
     );
   }
 
-  // --- Check 8: worker build inputs must NOT exist — the platform injects ---
-  // package.json / package-lock.json / tsconfig.json at build time from the
-  // promoted gateway ref; a vendored copy would shadow them and is always
-  // stale. No legacy acceptance.
+  // --- Check 8: worker build inputs must NOT exist at the root. The ---
+  // platform injects package.json / package-lock.json / tsconfig.json at build
+  // time from the promoted gateway ref into its own build directory, and puts
+  // only tsconfig.json at the checkout root, for the function shape, over any
+  // author copy. An author package.json or lockfile there would sit in
+  // esbuild's lookup from app/index.ts, and any of the three is always stale,
+  // so the gate keeps all three out. No legacy acceptance.
   //
   // Presence is an lstat, not existsSync: existsSync FOLLOWS symlinks, so a
   // dangling symlink named e.g. package.json (target absent) reports false
   // and would silently pass this check even though something occupies the
-  // name. lstat never follows the link, so ANYTHING at the path — a file, a
-  // directory, or a symlink of any kind (dangling included) — is caught.
+  // name. lstat never follows the link, so ANYTHING at the path (a file, a
+  // directory, or a symlink of any kind, dangling included) is caught.
   for (const relPath of PINNED_BUILD_INPUT_FILES) {
     let present = false;
     try {
@@ -419,7 +431,7 @@ export function checkConfig(appDir) {
     }
     if (present) {
       violations.push(
-        `delete ${relPath} — the platform injects worker build inputs at build time (see APP-CONTRACT R7 — get_app_contract, or docs/APP-CONTRACT.md)`,
+        `delete ${relPath}: the platform injects worker build inputs at build time (see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)`,
       );
     }
   }
