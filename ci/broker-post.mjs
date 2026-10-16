@@ -9,9 +9,10 @@
 // (test-enforced), not a list kept here. The callers:
 //   - brokerPost, below: the POST to a broker endpoint with the GitHub Actions
 //     OIDC token as a bearer, which the ci/ scripts that report to the broker
-//     share. Every broker endpoint answers JSON, so brokerPost refuses an
-//     empty body rather than let a report pass that the broker may never have
-//     read.
+//     share. Every broker endpoint answers a JSON object, so brokerPost
+//     refuses an empty body, and a body that is the literal JSON `null`, each
+//     with its own message, rather than let a report pass that the broker may
+//     never have read.
 //   - scripts/cf-api.mjs's apiReq, the operator scripts' Cloudflare API call.
 //   - ci/export-app.mjs's R2 list. Its object GET stays raw: it streams the
 //     body to disk.
@@ -62,7 +63,11 @@ export async function jsonRequest({ url, method, headers, body, label }, fetcher
  * (see jsonRequest for the read and the error shape). An empty 2xx body throws
  * `<label> failed: empty response body`: the broker always answers JSON, so
  * an empty one came from something else, and the caller's report may never
- * have reached it.
+ * have reached it. jsonRequest answers null for a body that is the literal
+ * JSON `null` too, which no broker route answers either; that one throws
+ * `<label> failed: JSON null response body`, so the two read apart. The text
+ * is read through a wrapper around the fetcher, since jsonRequest's answer
+ * alone cannot tell them apart and its other callers rely on its null.
  *
  * @param {object} req
  * @param {string} req.base - broker base URL, e.g. "https://inno-platform.example.workers.dev"
@@ -74,13 +79,17 @@ export async function jsonRequest({ url, method, headers, body, label }, fetcher
  *   - injectable for testing; defaults to global fetch
  * @returns {Promise<any>} the parsed JSON response body
  * @throws {Error & { status: number, body: string }} on a non-2xx answer
- * @throws {Error} on an empty 2xx body
+ * @throws {Error} on an empty 2xx body, or one that is the JSON null
  */
 export async function brokerPost({ base, path, label, token, body }, fetcher = fetch) {
+  let text = "";
   const answer = await jsonRequest(
     { url: `${base}${path}`, method: "POST", headers: { Authorization: `Bearer ${token}` }, body, label },
-    fetcher,
+    async (url, init) => {
+      const res = await fetcher(url, init);
+      return { ok: res.ok, status: res.status, text: async () => (text = await res.text()) };
+    },
   );
-  if (answer === null) throw new Error(`${label} failed: empty response body`);
+  if (answer === null) throw new Error(`${label} failed: ${text === "" ? "empty" : "JSON null"} response body`);
   return answer;
 }
