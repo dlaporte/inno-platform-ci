@@ -1800,7 +1800,7 @@ jobs:
       # download-artifact v7.0.0 and the upload-artifact v6.0.0 that wrote this
       # are each action's first Node 24 release, on the same @actions/artifact
       # 5, and neither changed an input default from the v4 pair before them:
-      # a download by name still extracts into the workspace root, and a
+      # a download by name with no path: still extracts into the workspace root (both steps below set one), and a
       # digest mismatch still only warns (error is v8's default). The id check
       # below, not the action, is what authenticates the image, and the
       # dependency tree's sha256 check does the same for the download after it.
@@ -1809,6 +1809,12 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: inno-scanned-image
+          # Under the runner's temp directory, never the workspace: an artifact
+          # an author job re-uploaded under this name may carry any entries, and
+          # an extract into $GITHUB_WORKSPACE would overwrite files this job
+          # already checked out (the mirror's ci/*.mjs scripts run in steps that
+          # hold the deploy token). Only the one file the id check reads is used.
+          path: ${{ runner.temp }}/artifact-image
 
       # THE build-once check (R11). wrangler used to re-build the author's
       # Dockerfile here, with CLOUDFLARE_API_TOKEN in env, producing a SECOND
@@ -1822,6 +1828,7 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         env:
           EXPECTED: ${{ steps.deploy_token.outputs.image_id }}
+          IMAGE_DIR: ${{ runner.temp }}/artifact-image
         # pipefail for the same reason as the save step: without it the
         # `gunzip -c | docker load` pipe below reports docker load's status
         # alone, and a truncated archive surfaced only as "Image mismatch".
@@ -1832,7 +1839,7 @@ jobs:
             echo "::error title=No scanned image recorded::the container job did not record an image id with the broker; re-run the release after a green safety preflight"
             exit 1
           fi
-          gunzip -c image.tar.gz | docker load
+          gunzip -c "$IMAGE_DIR/image.tar.gz" | docker load
           got="$(docker image inspect --format '{{.Id}}' app-under-test)"
           if [ "$got" != "$EXPECTED" ]; then
             echo "::error title=Image mismatch::the image in the workflow artifact is not the one the safety gates scanned ($got != $EXPECTED)" >&2
@@ -1865,14 +1872,18 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: app-node-modules-${{ github.run_id }}
+          # Under the runner's temp directory, never the workspace; see the
+          # image download above for why.
+          path: ${{ runner.temp }}/artifact-deps
 
       - name: Restore the app Worker's dependencies
         if: needs.policy.outputs.function_shaped == 'true'
         env:
           EXPECTED: ${{ needs.app-deps.outputs.tar_sha }}
+          DEPS_DIR: ${{ runner.temp }}/artifact-deps
         run: |
           set -e
-          if [ -f app-node-modules.tar ]; then
+          if [ -f "$DEPS_DIR/app-node-modules.tar" ]; then
             # The DIGEST is what makes this tree trustworthy, not the artifact
             # name: app-owned jobs in the calling repo share the run's artifact
             # namespace, exactly as the image handover above records of its own,
@@ -1891,7 +1902,7 @@ jobs:
               echo "::error title=No staged digest::app-deps recorded no sha256 for the app dependency tree; refusing this artifact rather than deploying an unverified one" >&2
               exit 1
             fi
-            got="$(sha256sum app-node-modules.tar | cut -d' ' -f1)"
+            got="$(sha256sum "$DEPS_DIR/app-node-modules.tar" | cut -d' ' -f1)"
             if [ "$got" != "$EXPECTED" ]; then
               echo "::error title=Dependency tree mismatch::the app-node-modules artifact is not the tree app-deps installed ($got != $EXPECTED)" >&2
               exit 1
@@ -1906,8 +1917,8 @@ jobs:
             # to the nightly deps sweep, which reads only the manifests. The
             # `npm ci` this replaced did the wipe for us.
             rm -rf app/node_modules
-            tar -xf app-node-modules.tar -C app
-            rm -f app-node-modules.tar
+            tar -xf "$DEPS_DIR/app-node-modules.tar" -C app
+            rm -f "$DEPS_DIR/app-node-modules.tar"
           elif [ -f app/package.json ]; then
             echo "::error title=Missing installed dependencies::app/package.json exists but the app-deps job produced no tree"
             exit 1
