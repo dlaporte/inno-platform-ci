@@ -3,10 +3,10 @@
 // (contract §3 and R8; guidance in docs/APP-ACCESSIBILITY.md).
 //
 // The container job's smoke test already runs the exact image that will
-// deploy, on the runner, with no Cloudflare Access in front of it. This script
-// points a headless Chromium at that container, sends the headers the gateway
-// would stamp (R3; see identityHeaders) to the app's own origin only, runs
-// axe-core on each route, and reports:
+// deploy, on the runner, with no front door in front of it. This script
+// points a headless Chromium at that container, sends the headers the front
+// door would stamp (R3; see identityHeaders) to the app's own origin only,
+// runs axe-core on each route, and reports:
 //   - axe violations under the WCAG 2.0/2.1/2.2 A + AA tags, by impact;
 //   - which routes were scanned and which could not be (coverage);
 //   - an advisory response-header check (CSP, nosniff, framing, referrer
@@ -64,6 +64,10 @@ export const BLOCKING_IMPACTS = ["critical", "serious"];
 export const IMPACT_ORDER = ["critical", "serious", "moderate", "minor"];
 export const MAX_ROUTES = 10;
 export const SCAN_USER = "a11y-scan@ci.invalid";
+// The synthetic person's subject (X-Forwarded-Subject). APP-CONTRACT R3 tells
+// apps to key per-person data on the subject, so a page that does renders as
+// it does for a signed-in person rather than for a caller with none.
+export const SCAN_SUBJECT = "a11y-scan";
 const NAV_TIMEOUT_MS = 20_000;
 const IDLE_QUIET_MS = 500;
 const IDLE_MAX_MS = 8_000;
@@ -160,10 +164,10 @@ export function parseMode(raw) {
 }
 
 /**
- * The headers the gateway owns under R3, as the scan sends them: a synthetic
- * member of the app's users group (<groupPrefix><app>-users, the gateway's
- * and src/naming.ts oktaGroupName's formula), and the forwarded host and
- * proto of --base. Those two are what is true on the runner (production
+ * The headers the front door owns under R3, as the scan sends them: a
+ * synthetic member of the app's users group (<groupPrefix><app>-users,
+ * src/naming.ts oktaGroupName's formula) with a synthetic subject, and the
+ * forwarded host and proto of --base. Those two are what is true on the runner (production
  * sends the app's hostname and https); APP-CONTRACT tells apps to build
  * links from them, and an https proto here would send an app's own
  * redirects off the scanned origin. Never throws, so scan() can keep its
@@ -186,6 +190,7 @@ export function identityHeaders({ base, app, groupPrefix }) {
     { name: "X-Forwarded-User", value: SCAN_USER },
     { name: "X-Forwarded-Email", value: SCAN_USER },
     { name: "X-Forwarded-Groups", value: app && groupPrefix ? `${groupPrefix}${app}-users` : "" },
+    { name: "X-Forwarded-Subject", value: SCAN_SUBJECT },
     { name: "X-Forwarded-Host", value: host },
     { name: "X-Forwarded-Proto", value: proto },
   ];
@@ -194,7 +199,7 @@ export function identityHeaders({ base, app, groupPrefix }) {
 /**
  * A same-origin request's headers with the identity headers set: any copy
  * the page sent of one of them (any case) is dropped first, so the app sees
- * exactly what the gateway would stamp, never what page script supplied.
+ * exactly what the front door would stamp, never what page script supplied.
  *
  * @param {Record<string, unknown>|undefined} headers - the request's headers
  * @param {Array<{name: string, value: string}>} identity
@@ -267,7 +272,7 @@ export function evaluate(result, mode, ignores) {
 
 /**
  * Advisory response-header findings for an HTML page served by the app.
- * HSTS is deliberately not checked: the gateway owns it (APP-SECURITY §1) and
+ * HSTS is deliberately not checked: the front door owns it (APP-SECURITY §1) and
  * a localhost response never carries it.
  *
  * @param {Record<string, string>} headers - response headers (any case)
@@ -611,8 +616,8 @@ export const APP_FAULT_STATUSES = ["http", "redirect", "blank", "timeout"];
  * Classify the status of a page's (same-origin) document response. A 4xx is
  * the app's own answer ("http", blocking in enforce, on "/" above all). A 5xx
  * is not held against it: CI runs the image with nothing behind
- * http://storage.internal (the platform's storage gateway, there once
- * deployed), so a page that reads storage can fail here and work in
+ * http://storage.internal (the platform's storage relay in the app's host,
+ * there once deployed), so a page that reads storage can fail here and work in
  * production, and blocking on it would fail an app for the scan environment.
  * It is listed as not scanned, with a warning.
  *

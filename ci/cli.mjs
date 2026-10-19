@@ -97,8 +97,8 @@ export const logSafe = (s, n = 200) => String(s).replace(/[\u0000-\u001f\u007f]+
 // --- The instance's names ---------------------------------------------------
 // Tenant CI's copy of the names the instance builds everything from:
 // ci/instance.json, which scripts/instance.mjs generates from the instance
-// manifest and the publish mirror ships beside these scripts. The templater
-// and the accessibility scanner read it; neither spells a name of its own.
+// manifest and the publish mirror ships beside these scripts. The
+// accessibility scanner reads it, and spells no name of its own.
 
 // The rules, restated from src/instance.ts (itself restated from
 // scripts/lib/manifest.mjs): ci/ ships standalone and imports nothing from
@@ -106,7 +106,7 @@ export const logSafe = (s, n = 200) => String(s).replace(/[\u0000-\u001f\u007f]+
 // config's JSON string and in a String.replace replacement, so these rules
 // are also what keeps a quote, a backslash or a `$` out of both.
 // test/instance-formula-parity.node.test.ts holds the prefix rule to the
-// Worker's and the gateway's, verdict for verdict.
+// Worker's, verdict for verdict.
 const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
 const INSTANCE_RULES = {
   // Only the host prefix may be empty (apps at <app>.<domain>); a missing key

@@ -5,17 +5,18 @@
 //
 // Usage: node ci/explain-unresolved.mjs <wrangler-log> <app/package.json>
 //
-// Since platform v0.14.21 the app-deps job installs a function-shaped app's
-// dependencies with `npm ci --ignore-scripts --omit=dev`, so the tree the
-// deploy bundles is exactly the tree the dependency gate audited. What that
-// buys is a failure the platform previously shipped past: production code
-// that imports a devDependency. It now stops wrangler's bundle in the deploy
-// job, which is the truth arriving at the right time, but the only evidence
-// is esbuild's one-line module-not-found, printed inside a reusable workflow
-// whose source the app author cannot read. Hence this: the same line, said in
-// terms of the author's own app/package.json.
+// Since platform v0.14.21 a function-shaped app's dependencies install with
+// `npm ci --ignore-scripts --omit=dev` (since v0.17.0 in the app-build job),
+// so the tree the bundle reads is exactly the tree the dependency gate
+// audited. What that buys is a failure the platform previously shipped past:
+// production code that imports a devDependency. It now stops wrangler's
+// bundle in the app-build job, on every push, which is the truth arriving at
+// the right time, but the only evidence is esbuild's one-line
+// module-not-found, printed inside a reusable workflow whose source the app
+// author cannot read. Hence this: the same line, said in terms of the
+// author's own app/package.json.
 //
-// It explains, it never judges. Exit status is 0 in every case (the deploy
+// It explains, it never judges. Exit status is 0 in every case (the bundle
 // step's own `exit 1` is what fails the run, so a non-zero exit here would
 // only mask wrangler's failure with the explainer's), and it prints nothing
 // at all when there is nothing to explain: no unresolved line in the log, a
@@ -112,17 +113,17 @@ for (const m of log.matchAll(UNRESOLVED)) {
     // inside single quotes: NPM_NAME admits no quote.
     console.log(
       `::error title=devDependency imported at runtime::"${pkg}" is declared under devDependencies in `
-      + "app/package.json but your production code imports it. Since platform v0.14.21 the deploy installs "
+      + "app/package.json but your production code imports it. Since platform v0.14.21 CI installs "
       + "production dependencies only (npm ci --omit=dev), so it is not present at bundle time. Move it: "
       + `(cd app && p='${pkg}' && spec="$(npm pkg get "devDependencies[$p]" | tr -d '"')" && test "$spec" != "{}" `
       + `&& npm pkg set "dependencies[$p]=$spec" && npm pkg delete "devDependencies[$p]" && npm install `
-      + "--package-lock-only), commit app/package.json and app/package-lock.json, then tag again. The dependency "
+      + "--package-lock-only), commit app/package.json and app/package-lock.json, then push again. The dependency "
       + "gate will audit it from then on.",
     );
   } else {
     console.log(
       `::error title=Undeclared import::"${pkg}" is imported by your production code but not declared in `
-      + `app/package.json. Declare it: cd app && npm install ${pkg}, commit both manifest files, then tag again.`,
+      + `app/package.json. Declare it: cd app && npm install ${pkg}, commit both manifest files, then push again.`,
     );
   }
 }

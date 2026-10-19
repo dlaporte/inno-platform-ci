@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 // Config-integrity gate: verifies an app repo has not weakened the security
-// posture the platform requires — required CLAUDE.md guidance present, and no
-// platform-owned build input vendored into the app repo (gateway source,
-// worker build inputs, and ANY wrangler config; the platform injects all of
-// them at build time from the promoted gateway.ref), nothing of the author's
-// under src/ (reserved for the gateway, which the deploy builds outside the
-// checkout), and no package-manager configuration at any depth (npm expands
+// posture the platform requires: required CLAUDE.md guidance present, no
+// platform-owned build input vendored into the app repo (the root build
+// files and ANY wrangler config; the platform supplies them at build time
+// from its mirror), nothing of the author's under src/ (which the platform
+// owns), and no package-manager configuration at any depth (npm expands
 // ${VAR} from the environment into it). The live checks are 1, 1b, 1c, 6, 6b,
 // 7, 7b and 8; see checkConfig's own note on the numbering.
 //
@@ -39,21 +38,23 @@ const CLAUDE_MD_HEADER_VARIANTS = [
   ["## Container contract", "## Function contract", "## Worker contract"],
 ];
 
-// Worker build-input files that are platform-owned: the deploy job copies the
-// promoted gateway's package.json, package-lock.json and tsconfig.json into
-// the checkout root at build time (they feed setup-node's cache key and the
-// function-shaped app Worker's tsconfig lookup), and wrangler runs with that
-// root as its cwd. A vendored copy would shadow them and is always stale, so
+// Worker build-input files that are platform-owned: the app-build job's
+// wrangler runs with the checkout root as its cwd, that job copies the
+// mirror's tsconfig there for the function-shaped app Worker's tsconfig
+// lookup (an author's app/tsconfig.json, which R7 permits, is found first),
+// and an author package.json or lockfile there would sit in the bundler's
+// lookup from app/index.ts. A vendored copy would shadow them and is always stale, so
 // check 8 rejects any of them outright. They are not template files any more;
 // .github/workflows/ci.yml's template-drift reverse walk says so too.
 const PINNED_BUILD_INPUT_FILES = ["package.json", "package-lock.json", "tsconfig.json"];
 
 // wrangler discovers its config in the app root as `wrangler.json ??
 // wrangler.jsonc ?? wrangler.toml`, honoring env-variants too. The platform
-// injects the ONLY permitted config (wrangler.jsonc, from the promoted
-// gateway.ref) at deploy time — so ANY wrangler config committed to an app
-// repo is a shadow/bypass and is rejected. `--config wrangler.jsonc` at
-// deploy pins the file as the belt to this suspenders.
+// supplies the ONLY permitted config (a function app's app-worker.jsonc, from
+// the mirror, which the app-build job bundles with; a container app has no
+// Worker config of its own), so ANY wrangler config committed to an app repo
+// is a shadow or a bypass and is rejected. `--config app-worker.jsonc` in
+// app-build's bundle step pins the file as the belt to this suspenders.
 // Matches a wrangler config file we must reject: the bare `wrangler.json` /
 // `wrangler.toml`, or any env-variant `wrangler.<something>.(json|jsonc|toml)`.
 // wrangler.jsonc itself never matches (no middle segment, and .jsonc is only
@@ -61,11 +62,11 @@ const PINNED_BUILD_INPUT_FILES = ["package.json", "package-lock.json", "tsconfig
 const COMPETING_WRANGLER_RE = /^wrangler\.(json|toml|.+\.(json|jsonc|toml))$/;
 
 // Every package manager's project-level configuration, rejected at the repo
-// ROOT: wrangler runs with the checkout root as its cwd, the deploy job copies
-// the gateway's build inputs there at build time (no root install happens any
-// more, R02), and a .pnpmfile.cjs is arbitrary JavaScript an install would
+// ROOT: wrangler runs with the checkout root as its cwd (no root install
+// happens: the build tools install in a platform-owned directory outside the
+// checkout), and a .pnpmfile.cjs is arbitrary JavaScript an install would
 // execute. At depth only .npmrc matters (check 6b): npm is the one package
-// manager CI runs inside the author-owned app/, in the app-deps job's install
+// manager CI runs inside the author-owned app/, in the app-build job's install
 // and the deps gate's audit.
 const ROOT_PACKAGE_MANAGER_CONFIG_RE = /^(\.npmrc|\.yarnrc|\.yarnrc\.yml|\.pnpmfile\.cjs|pnpm-workspace\.yaml|bunfig\.toml)$/;
 
@@ -102,11 +103,11 @@ function* walkTree(root, rel = "") {
 
 /**
  * Check that `appDir` (a registered app repo) complies with the platform's
- * config-integrity requirements. Everything platform-owned (gateway source,
- * worker build inputs, wrangler.jsonc) is INJECTED at build time from the
- * promoted gateway.ref — this gate verifies the repo does not carry shadow
- * copies, plus the repo-local rules (CLAUDE.md headers, no package-manager
- * config, no wrangler cache dirs).
+ * config-integrity requirements. Everything platform-owned (the root build
+ * files, the Worker config) is SUPPLIED at build time from the platform's
+ * mirror, and src/ is the platform's; this gate verifies the repo does not
+ * carry shadow copies, plus the repo-local rules (CLAUDE.md headers, no
+ * package-manager config, no wrangler cache dirs).
  *
  * (Check numbering has gaps: the live checks are 1, 1b, 1c, 6, 6b, 7, 7b and 8.
  * The original checks 2-6 inspected an app-owned wrangler.jsonc and were
@@ -140,15 +141,15 @@ export function checkConfig(appDir) {
   }
 
   // --- Check 1b: no wrangler config file at all in the app root ---
-  // NO wrangler config may exist here — the platform injects the only
-  // permitted one at deploy time from the promoted gateway.ref. Anything
-  // committed could be silently preferred by `wrangler deploy`'s discovery
-  // order (wrangler.json OUTRANKS wrangler.jsonc), which is why this gate
-  // rejects rather than inspects: it vets none of them.
+  // NO wrangler config may exist here: the platform supplies the only
+  // permitted one at build time. Anything committed could be silently
+  // preferred by `wrangler deploy`'s discovery order (wrangler.json OUTRANKS
+  // wrangler.jsonc), which is why this gate rejects rather than inspects: it
+  // vets none of them.
   //
-  // The deploy step pins --config wrangler.jsonc (hard override of wrangler's
-  // discovery + redirect); this gate check is the independent belt to that
-  // suspenders — keep both. Rejecting .wrangler/ closes the redirect
+  // The deploy step pins --config app-worker.jsonc (hard override of
+  // wrangler's discovery and redirect); this gate check is the independent
+  // belt to that suspenders. Keep both. Rejecting .wrangler/ closes the redirect
   // (.wrangler/deploy/config.json) path that would reopen the bypass if
   // --config were ever dropped.
   if (existsSync(appDir)) {
@@ -163,7 +164,7 @@ export function checkConfig(appDir) {
       }
       if (name === "wrangler.jsonc") {
         violations.push(
-          "delete wrangler.jsonc: the platform injects wrangler.jsonc at build time from the promoted gateway.ref " +
+          "delete wrangler.jsonc: the platform supplies the app's Worker config itself " +
             "(see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)",
         );
         continue;
@@ -184,29 +185,34 @@ export function checkConfig(appDir) {
       // not help. A step is not the boundary: `id-token: write` has no
       // step-level scope, so every step of a job holding it sees the OIDC
       // request credential (S01, reproduced 2026-09-17), which is why the
-      // app/ install runs in `app-deps`, a job with no id-token grant.
+      // app/ install runs in `app-build`, a job with no id-token grant.
       //
-      // No install in CI reads a root rc file today. The deploy job's
-      // `npm ci` runs in $GW, a platform-owned directory outside the
-      // checkout, and the app-deps job's install and the deps gate's audit
-      // run in app/, which its own package.json makes npm's project root. The
-      // one npm call at the checkout root is the deploy job's setup-node
-      // `cache: npm` lookup (`npm config get cache`, run from the workspace),
-      // and it loads a root .npmrc. Rejecting every root copy keeps a root rc
+      // No install in CI reads a root rc file today. The build tools'
+      // `npm ci` runs in $RUNNER_TEMP/build-tools, a platform-owned directory
+      // outside the checkout (in app-build, and in the deploy job for a
+      // container app's image push), and the app-build job's install and the
+      // deps gate's audit run in app/, which its own package.json makes npm's
+      // project root. The
+      // one npm call at the checkout root is the app-build and deploy jobs'
+      // setup-node `cache: npm` lookup (`npm config get cache`, run from the
+      // workspace), and it loads a root .npmrc. Rejecting every root copy keeps a root rc
       // file out of that lookup and out of any package manager a later change
       // runs at the root. Check 6b below covers every other directory,
       // because npm reads the rc of the directory it RUNS in, not only the
       // repo root.
       //
       // wrangler loads .env/.env.* from cwd at CLI startup, and env keys the
-      // deploy step doesn't set are ADOPTED: a committed .env with
+      // step running it doesn't set are ADOPTED: a committed .env with
       // CLOUDFLARE_API_BASE_URL (or WRANGLER_DOCKER_BIN/DOCKER_HOST) redirects
-      // API calls, bearer token included, to an attacker host. Reject like
-      // .npmrc: an unpinned deploy-build input. (2026-07-22 review find.)
+      // the calls wrangler makes to an attacker host. wrangler runs at the
+      // checkout root in app-build's bundle, on every push, in a job that
+      // holds no credential, and in the deploy job's image push for a
+      // container app, whose job env pins CLOUDFLARE_API_BASE_URL. Reject
+      // like .npmrc: an unpinned build input. (2026-07-22 review find.)
       if (/^\.env(\..+)?$/.test(name)) {
         violations.push(
-          `${name} must not be committed: wrangler loads .env files at deploy time (an app-set ` +
-            `CLOUDFLARE_API_BASE_URL would redirect API calls, account token included); remove it`,
+          `${name} must not be committed: wrangler loads .env files when it runs at the repository root (an app-set ` +
+            `CLOUDFLARE_API_BASE_URL would redirect the build's own calls); remove it`,
         );
         continue;
       }
@@ -243,16 +249,18 @@ export function checkConfig(appDir) {
   //
   // A symlink to a FILE stays legal only while its target resolves INSIDE the
   // app tree (an in-tree alias.ts -> real.ts). An out-of-tree file link is
-  // rejected: the deploy build reads the target's BYTES (wrangler's default
-  // module rules bundle an imported .txt/.html/.sql as content), so a link
-  // named to match a bundler glob, e.g. environment.txt -> /proc/self/environ
-  // or a ../ escape, bakes whatever the link points at into the Worker,
-  // including the deploy job's own environment (the account deploy token).
+  // rejected: the build reads the target's BYTES (wrangler's default module
+  // rules bundle an imported .txt/.html/.sql as content), so a link named to
+  // match a bundler glob, e.g. environment.txt -> /proc/self/environ or a ../
+  // escape, bakes whatever the link points at into the Worker: a file no gate
+  // ever saw. (Until v0.17.0 that included the deploy job's own environment,
+  // the account deploy token; the bundle is now built in a job that holds no
+  // credential.)
   // The by-name checks fail closed on type, but nothing stopped an
   // arbitrary-named file link whose content the bundler then reads; this is
   // that stop. (Vuln 2026-10-18, contract 33, "not additive".) node_modules
   // is not walked here, so a link planted there at install time is caught by
-  // the deploy job's own realpath guard, not this gate.
+  // the app-build job's own realpath guard, not this gate.
   //
   // Never followed: walkTree's readdir already reports whether an entry is a
   // symlink (that is the same answer it uses to decide not to recurse), and
@@ -269,10 +277,10 @@ export function checkConfig(appDir) {
   //
   // --- Check 6b: a nested .npmrc ANYWHERE in the tree ---
   // Check 6 inspects the root because that is where wrangler runs (no root
-  // install happens any more: the gateway's own `npm ci` runs in a
-  // platform-owned directory outside the checkout, R02). CI runs exactly one
+  // install happens: the build tools' `npm ci` runs in a platform-owned
+  // directory outside the checkout). CI runs exactly one
   // package manager inside the author-owned app/ directory: npm (`npm ci` in
-  // the `app-deps` job, whose installed tree the deploy job then restores;
+  // the `app-build` job, which bundles the installed tree in the same job;
   // plus `npm audit` in the `deps` gate. The `npm install` fallback is gone
   // since R11), and nothing in CI runs yarn, pnpm or bun there. Do NOT read
   // this rule as guarding one step: since S01 (2026-09-17) the deploy job runs
@@ -320,8 +328,8 @@ export function checkConfig(appDir) {
           if (real === null || !(real === appRoot || real.startsWith(appRoot + sep))) {
             violations.push(
               `${rel} is a symlink whose target resolves outside your app (-> ${target}); ` +
-                `a committed file symlink must point inside your app, because the deploy build reads the ` +
-                `target's bytes and a link out of the tree can bake deploy-time secrets into your app`,
+                `a committed file symlink must point inside your app, because the build reads the ` +
+                `target's bytes and a link out of the tree can bake files the gate never saw into your app`,
             );
           }
         }
@@ -342,23 +350,19 @@ export function checkConfig(appDir) {
   }
 
   // --- Check 7: src/ is platform-owned; nothing of the author's may exist ---
-  // under it. Before v0.14.2 the platform injected the promoted gateway (config
-  // gateway.ref) into src/gateway/ and bundled it FROM there, inside the app
-  // checkout. esbuild resolves bare imports by walking up from the importing
-  // file, so a committed src/node_modules/<dep> outranked the platform's
-  // pinned copy, and src/tsconfig.json (paths) or src/package.json (browser
-  // field) redirected resolution the same way: an author could replace hono or
-  // jose inside their own app's authentication perimeter while the deployment
-  // recorded a legitimate gateway ref (2026-09-13 review F08, reproduced with
-  // wrangler --dry-run 2026-09-14). The deploy job now builds the gateway in a
-  // platform-owned directory outside the checkout (R02), which takes the
-  // author's tree off the resolution path; this check and the deploy job's
-  // wipe of src/ stay as the belt. A vendored src/gateway/ keeps its original
-  // message.
+  // under it. Before v0.14.2 the platform injected its per-app gateway into a
+  // directory under src/ and bundled it FROM there, inside the app checkout.
+  // esbuild resolves bare imports by walking up from the importing file, so a
+  // committed src/node_modules/<dep> outranked the platform's pinned copy, and
+  // src/tsconfig.json (paths) or src/package.json (browser field) redirected
+  // resolution the same way (2026-09-13 review F08, reproduced with wrangler
+  // --dry-run 2026-09-14). No platform code is built from the checkout any
+  // more, and src/ stays the platform's: the gate refuses anything under it,
+  // an old gateway copy included, with the one message below.
   //
-  // lstat (not existsSync): a symlink at src/ or src/gateway must fail closed
-  // without being followed — same rule as check 8 below. An EMPTY src/
-  // directory is tolerated (nothing to shadow with).
+  // lstat (not existsSync): a symlink at src/ must fail closed without being
+  // followed, same rule as check 8 below. An EMPTY src/ directory is
+  // tolerated (nothing in it).
   let srcStat = null;
   try { srcStat = lstatSync(join(appDir, "src")); } catch (err) { if (err?.code !== "ENOENT") throw err; }
   if (srcStat) {
@@ -366,11 +370,11 @@ export function checkConfig(appDir) {
     let srcUnreadable = false;
     if (srcStat.isDirectory()) {
       try {
-        entries = readdirSync(join(appDir, "src")).filter((n) => n !== "gateway");
+        entries = readdirSync(join(appDir, "src"));
       } catch (err) {
         // An unreadable src/ is NOT the same as an empty one: fail closed
-        // rather than silently treating "we couldn't find out" as "nothing to
-        // shadow with", and skip the entries-based violation below (it would
+        // rather than silently treating "we couldn't find out" as "nothing
+        // there", and skip the entries-based violation below (it would
         // otherwise report an empty list for a directory we never saw into).
         srcUnreadable = true;
         violations.push(
@@ -379,31 +383,10 @@ export function checkConfig(appDir) {
         );
       }
     }
-    // Only probe src/gateway once src/ is known to be a readable directory —
-    // otherwise (src is a file, or unreadable) the readdirSync above has
-    // already produced the right violation, and lstat-ing a "gateway" child
-    // of something that isn't a normal directory would throw ENOTDIR/EACCES
-    // for a fact we already have, not a new one.
-    let gatewayPresent = false;
-    if (srcStat.isDirectory() && !srcUnreadable) {
-      try {
-        lstatSync(join(appDir, "src", "gateway"));
-        gatewayPresent = true;
-      } catch (err) {
-        if (err?.code !== "ENOENT") throw err;
-      }
-    }
-    if (gatewayPresent) {
-      violations.push(
-        "delete src/gateway/: the platform injects the gateway at build time (see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)",
-      );
-    }
     if (!srcUnreadable && (!srcStat.isDirectory() || entries.length > 0)) {
       const what = srcStat.isDirectory() ? entries.map((n) => `src/${n}`).join(", ") : "src is not a directory";
       violations.push(
-        `delete src/: the platform owns src/ (reserved for the gateway, which the deploy builds outside your checkout; ` +
-          `the deploy wipes src/, and the gate refuses author files there so none can shadow the gateway's dependencies ` +
-          `or compiler configuration): ${what} ` +
+        `delete src/: the platform owns src/ (the gate refuses author files there; keep your code under app/): ${what} ` +
           `(see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)`,
       );
     }
@@ -432,12 +415,13 @@ export function checkConfig(appDir) {
   }
 
   // --- Check 8: worker build inputs must NOT exist at the root. The ---
-  // platform injects package.json / package-lock.json / tsconfig.json at build
-  // time from the promoted gateway ref into its own build directory, and puts
-  // only tsconfig.json at the checkout root, for the function shape, over any
-  // author copy. An author package.json or lockfile there would sit in
-  // esbuild's lookup from app/index.ts, and any of the three is always stale,
-  // so the gate keeps all three out. No legacy acceptance.
+  // platform installs its build tools from the mirror into its own directory
+  // outside the checkout, and puts only app-worker.jsonc and tsconfig.json at
+  // the checkout root, in the app-build job, for the function shape, over any
+  // author copy. An author package.json or
+  // lockfile there would sit in esbuild's lookup from app/index.ts, and any of
+  // the three is always stale, so the gate keeps all three out. No legacy
+  // acceptance.
   //
   // Presence is an lstat, not existsSync: existsSync FOLLOWS symlinks, so a
   // dangling symlink named e.g. package.json (target absent) reports false

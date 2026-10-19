@@ -7,8 +7,8 @@ name: Platform CI
 # manifest (instance/instance.jsonc), so every instance value below is the
 # manifest's: BROKER_URL, the deploy job's Cloudflare account id, the seven
 # cross-repo `repository:` checkouts of this instance's contract mirror
-# (dlaporte/inno-platform-ci: six fetch the ci/ scripts, one the
-# promoted gateway), and the app name prefixes. To change one, edit the
+# (dlaporte/inno-platform-ci, every one fetching ci/ at
+# PLATFORM_REF), and the app name prefixes. To change one, edit the
 # manifest and run `node scripts/instance.mjs render` (OPERATIONS §2.1).
 # This file itself lives in BOTH repos: rendered in inno-platform,
 # published byte for byte into dlaporte/inno-platform-ci by
@@ -63,7 +63,9 @@ name: Platform CI
 #     pointing at inno-platform itself is now refused.) Combined with
 #     GitHub's guarantee that a caller cannot bypass a reusable workflow's
 #     internal `needs:` graph, that is the platform's whole provenance
-#     guarantee: a repo that strips or forks the gates gets no token.
+#     guarantee: a repo that strips or forks the gates is refused at every
+#     deploy call (/deploy-token, /deploy-bundle, /deploy-complete), so it
+#     deploys nothing.
 #
 # See docs/superpowers/plans/2026-07-17-plan3-ci-deploy-on-push.md (Task 5).
 
@@ -108,7 +110,6 @@ jobs:
       ignores_semgrep: ${{ steps.fetch.outputs.ignores_semgrep }}   # space-separated IDs
       ignores_trivy: ${{ steps.fetch.outputs.ignores_trivy }}
       ignores_deps: ${{ steps.fetch.outputs.ignores_deps }}
-      gateway_ref: ${{ steps.fetch.outputs.gateway_ref }}
       min_release_age_days: ${{ steps.fetch.outputs.min_release_age_days }}
       # Accessibility check mode (off | report | enforce) and its axe rule
       # waivers (safety.ignore.a11y.*), contract 22.
@@ -117,7 +118,7 @@ jobs:
       shape: ${{ steps.fetch.outputs.shape }}
       perimeter: ${{ steps.fetch.outputs.perimeter }}
       # The shape axis, collapsed to a boolean: 'true' when the app's code is
-      # an app-owned Worker behind the gateway (shape == 'function'), i.e. NOT a
+      # an app-owned Worker in the dispatch namespace (shape == 'function'), i.e. NOT a
       # container image. Derived once here so the container-only gates and the
       # function-shaped deploy each test a single flag instead of enumerating types.
       function_shaped: ${{ steps.fetch.outputs.function_shaped }}
@@ -184,17 +185,10 @@ jobs:
         run: |
           # This step must NEVER fail the job: a broker outage must not block
           # deploys, and the fallback is the SECURE direction (everything on).
-          # Deliberate exception: gate jobs still fail OPEN to secure defaults
-          # (all gates on, no ignores) on a broker outage, but gateway_ref has
-          # no secure default (there is no safe fallback gateway to run), so
-          # emit_defaults leaves it empty, and the deploy job's "Require a
-          # promoted gateway" step hard-fails the tag deploy on that, by
-          # design (see OPERATIONS §7.9).
           emit_defaults() {
             echo "::warning title=Gate policy unavailable::running all gates with no ignores (secure default)"
             for g in semgrep trivy gitleaks deps; do echo "gates_$g=true" >> "$GITHUB_OUTPUT"; done
             for t in semgrep trivy deps; do echo "ignores_$t=" >> "$GITHUB_OUTPUT"; done
-            echo "gateway_ref=" >> "$GITHUB_OUTPUT"
             # Falls back to shape=container, perimeter=sso on a broker outage:
             # the safe, original build path (a function app that can't be
             # identified just runs the container gates, which its repo won't
@@ -233,7 +227,6 @@ jobs:
           done
           # A missing or unknown mode reads as report (the non-blocking default).
           echo "a11y_mode=$(printf '%s' "$resp" | jq -r 'if (.a11y_mode == "off" or .a11y_mode == "enforce") then .a11y_mode else "report" end')" >> "$GITHUB_OUTPUT"
-          echo "gateway_ref=$(printf '%s' "$resp" | jq -r '(.gateway_ref // empty) | select(test("^[0-9a-fA-F]{7,40}$"))')" >> "$GITHUB_OUTPUT"
           # Numeric cooldown threshold; a missing/garbage value reads 0 (off).
           echo "min_release_age_days=$(printf '%s' "$resp" | jq -r '(.min_release_age_days // 0) | if type=="number" then . else 0 end')" >> "$GITHUB_OUTPUT"
           # Axes only (the legacy type field died with Phase B); unknown/absent
@@ -399,10 +392,9 @@ jobs:
         # Scope: the whole app repo MINUS the platform-owned tree. `app/` was
         # too narrow: the docker build context is the repo ROOT, so an
         # author-written Dockerfile and anything it COPYs from the root shipped
-        # unscanned (review I-31). src/ is excluded because the platform owns it
-        # (config-integrity check 7 rejects any author file there, and the
-        # gateway is injected at deploy time from the promoted gateway.ref), so
-        # scanning it would only yield findings on the platform's own patterns.
+        # unscanned (review I-31). src/ is excluded because the platform owns it:
+        # config-integrity check 7 rejects any author file there, so nothing
+        # under it is code an author could fix.
         # Admin-set rule ignores arrive as repeatable --exclude-rule flags;
         # the set --/positional-args pattern keeps each one a separate
         # argument, and the IDs are grammar-pinned server-side.
@@ -445,7 +437,7 @@ jobs:
       # The audit POSTs /-/npm/v1/security/advisories/bulk to the CONFIGURED
       # registry, so an author-owned .npmrc could point the dependency gate at
       # a registry that reports nothing and reads as clean. Pinned here for the
-      # same reason as in app-deps.
+      # same reason as in app-build.
       npm_config_registry: https://registry.npmjs.org/
     steps:
       - name: Gate switch
@@ -488,18 +480,17 @@ jobs:
         run: |
           # There is deliberately no root `npm audit` here: config-integrity
           # check 8 REJECTS a repo carrying a root package.json/package-lock.json
-          # /tsconfig.json. The platform injects the worker build inputs at
-          # deploy time from the promoted gateway.ref into its own build
-          # directory, and puts only tsconfig.json at the checkout root, for the
+          # /tsconfig.json. The deploy job installs the platform's build tools
+          # from the mirror's ci/build/ into its own directory outside the
+          # checkout, and puts only tsconfig.json at the checkout root, for the
           # function shape, over any author copy. An author package.json or
           # lockfile there would sit in esbuild's lookup from app/index.ts, and
           # any of the three is always stale, so the gate keeps all three out.
-          # So any repo that reaches this job has no root manifest to audit. The
-          # gateway's runtime dependencies are audited elsewhere: the
-          # platform's own CI audits gateway/ at main, and each deploy audits
-          # the promoted ref's, as a warning.
+          # So any repo that reaches this job has no root manifest to audit.
+          # The build tools (wrangler, a dev tool bundled into no app) are
+          # reported by the platform's CI and watched by Dependabot.
           # The app's OWN dependencies are audited by the two steps below.
-          echo "root manifest is forbidden by config-integrity; the platform's CI audits gateway/ at main, and each deploy audits the promoted gateway.ref's runtime dependencies as a warning"
+          echo "root manifest is forbidden by config-integrity; the platform's build tools come from the mirror's ci/build, reported by the platform's CI and watched by Dependabot"
 
       - name: pip-audit (app/requirements.txt, if present)
         if: steps.gate.outputs.enabled == 'true'
@@ -568,8 +559,8 @@ jobs:
     # deploy token, no Cloudflare credential, and no platform secret in its
     # env: an app author fully controls this build's inputs (the Dockerfile
     # + app/ sources), so nothing of value to the platform is reachable from
-    # it. See the token-ordering NOTE above the deploy job's
-    # `wrangler deploy (container)` step.
+    # it. The deploy job holds the token, and pushes only the image this job
+    # built, scanned and recorded (R11).
     # (The OIDC token minted below for the SBOM upload is NOT a credential:
     # it only proves provenance to the broker's /deploy-sbom endpoint.)
     steps:
@@ -589,7 +580,7 @@ jobs:
       # runner-side use of node is running inno-platform-ci/ci/sbom-upload.mjs
       # directly). A cache key would have to hash a root lockfile that, once
       # app repos stop vendoring worker build inputs, won't exist here; this
-      # job never checks out `gateway/` or injects anything.
+      # job installs no build tools and injects nothing.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -1225,7 +1216,7 @@ jobs:
           set -o pipefail
           docker save app-under-test | gzip -1 > image.tar.gz
 
-      # overwrite: true for the same reason the app-deps job's upload needs it
+      # overwrite: true for the same reason the app-build job's upload needs it
       # (below): artifacts are scoped to the RUN, not the attempt, so with the
       # default false, a "Re-run all jobs" on a tag would 409 against this
       # same-named artifact and take the deploy down with it.
@@ -1282,7 +1273,7 @@ jobs:
   # deploy; deploying it would serve the template and send a premature "live"
   # email. The new-app / migrate-app skills delete the marker once real code is
   # in place. The safety gate jobs still run on a scaffold push; only the
-  # deploy job is gated.
+  # app Worker's bundle (app-build's steps) and the deploy job are gated.
   scaffold-check:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -1303,33 +1294,44 @@ jobs:
             echo "built=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # The author's own Worker dependencies install HERE, in a job that holds NO
-  # id-token grant, and the installed tree reaches the deploy job as an
-  # artifact. R01 moved CLOUDFLARE_API_TOKEN out of this install's step env
+  # The app Worker is built HERE, in a job that holds NO credential of any
+  # kind: no id-token grant, no Cloudflare token, no secret (v0.17.0). It
+  # installs the author's own Worker dependencies and bundles the app with the
+  # pinned wrangler's `deploy --dry-run --outfile`, which writes the exact
+  # multipart upload form wrangler would have sent, every module with its
+  # content type, as one regular file. That file and its sha256, pinned as a
+  # job output, are all this job hands on: the deploy job checks the file
+  # against that digest and hands it to the platform, which throws away
+  # wrangler's own metadata and uploads the Worker under the app's lease, with
+  # bindings it writes itself. No tenant job holds a credential that can
+  # write a Worker script.
+  #
+  # The install was split out of the deploy job first, for the OIDC grant
+  # alone. R01 moved CLOUDFLARE_API_TOKEN out of the install's step env
   # (review F01, reproduced 2026-09-14 against a loopback registry); the OIDC
-  # REQUEST credential could not follow it, because `id-token: write`
-  # has no step-level scope and the deploy job genuinely needs the grant. So
-  # the runner handed ACTIONS_ID_TOKEN_REQUEST_TOKEN to a step running
-  # author-controlled npm, and an author-owned app/.npmrc expands ${VAR} from
-  # the environment into auth fields. A token minted that way is
+  # REQUEST credential could not follow it, because `id-token: write` has no
+  # step-level scope. So the runner handed ACTIONS_ID_TOKEN_REQUEST_TOKEN to a
+  # step running author-controlled npm, and an author-owned app/.npmrc expands
+  # ${VAR} from the environment into auth fields. A token minted that way is
   # indistinguishable from the intended one: OIDC claims describe the job, not
   # the step. Reproduced 2026-09-17 (review S01, with the gate bypass that
   # reached the .npmrc). Splitting the job is what actually removes the
   # credential from author-controlled code; the gate rule (check 1c) is the
-  # belt to this suspenders. Keep both.
+  # belt to this suspenders. Keep both. The bundle followed the install here
+  # in v0.17.0, so author code is now built where no credential exists at all.
   #
   # `needs: [config-integrity]` orders the gate that rejects an author-owned
-  # app/.npmrc (checks 1c and 6b) before THIS install, the one whose output
-  # reaches wrangler. It deliberately does not claim more than that: the `deps`
-  # job reads app/ with npm concurrently with config-integrity, by design, and
-  # that is safe because the .npmrc is at once the attack tool and the thing
-  # another gate rejects. There is no run in which such a file influences
-  # `deps` and config-integrity still passes, so `deploy` is skipped whatever
-  # `deps` voted. Ordering `deps` behind the gate would buy no security and
-  # would serialize a gate onto every push.
+  # app/.npmrc (checks 1c and 6b) before THIS install. It deliberately does
+  # not claim more than that: the `deps` job reads app/ with npm concurrently
+  # with config-integrity, by design, and that is safe because the .npmrc is
+  # at once the attack tool and the thing another gate rejects. There is no
+  # run in which such a file influences `deps` and config-integrity still
+  # passes, so `deploy` is skipped whatever `deps` voted. Ordering `deps`
+  # behind the gate would buy no security and would serialize a gate onto
+  # every push.
   #
-  # What this edge is really insurance for is the future, not today: app-deps
-  # exists precisely because it holds no OIDC grant, and the likeliest way S01
+  # What this edge is really insurance for is the future, not today: app-build
+  # exists precisely because it holds no grant, and the likeliest way S01
   # reopens is accretion rather than a revert, someone needing the broker from
   # here, or copying a `permissions:` block over from `container` or `deploy`
   # while adding a step. On that day the ordering already holds, so the
@@ -1340,58 +1342,75 @@ jobs:
   #
   # Like the container job, this job is never `if:`-skipped as a WHOLE, for the
   # reason at the top of this file: a skipped needed job skips `deploy`, which
-  # would stop every container-shaped app from releasing. The shape condition
-  # sits on the install step instead, and the job publishes a `staged` output
-  # so the deploy job asks for the artifact only when one exists.
-  app-deps:
-    name: Install app Worker dependencies
-    needs: [policy, config-integrity]
+  # would stop every container-shaped app from releasing. Every step carries
+  # the condition instead: a function shape, and a built app. An unbuilt
+  # scaffold (app/.needs-build, no app/index.ts yet) has nothing to bundle,
+  # and since the bundle runs on every push, not only at a release tag, it
+  # must not fail that push. A function app that reaches the deploy job is
+  # therefore always built, so the job publishes the bundle's digest alone:
+  # the deploy job downloads the bundle for every function app, and fails
+  # closed if there is none.
+  app-build:
+    name: Build the app Worker
+    needs: [policy, config-integrity, scaffold-check]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
     outputs:
-      # 'true' only when there is an artifact to download: the install step is
-      # skipped for container-shaped apps, and a function-shaped app is free to
-      # declare no app/package.json at all.
-      staged: ${{ steps.install.outputs.staged }}
-      # sha256 of the tar these bytes were staged as, so the deploy job can
-      # refuse any other tar that reaches it under the same artifact name. See
-      # the install step's comment for why an output is the channel that
-      # settles it.
-      tar_sha: ${{ steps.install.outputs.tar_sha }}
+      # sha256 of worker.form, so the hand-over can refuse any other file
+      # that reaches the deploy job under the same artifact name. See the
+      # bundle step's comment for why an output is the channel that settles
+      # it.
+      bundle_sha: ${{ steps.bundle.outputs.bundle_sha }}
     env:
-      # Suspenders, not a control (R01 step 3, never shipped until now): env
-      # beats project config for the DEFAULT registry, but not for a scoped
-      # `@scope:registry=`, and not for a lockfile entry carrying an absolute
-      # `resolved` tarball URL. The .npmrc rejection in check 6b, now made
-      # total by check 1c, is the load-bearing control. This pin also keeps
-      # `npm audit` pointed at the real advisory database, which the same file
-      # could otherwise redirect (the audit POSTs to the CONFIGURED registry,
-      # and an empty advisory set reads as "dependency gate clean").
+      # Suspenders, not a control (R01 step 3): env beats project config for
+      # the DEFAULT registry, but not for a scoped `@scope:registry=`, and not
+      # for a lockfile entry carrying an absolute `resolved` tarball URL. The
+      # .npmrc rejection in check 6b, now made total by check 1c, is the
+      # load-bearing control. This pin also keeps `npm audit` pointed at the
+      # real advisory database, which the same file could otherwise redirect
+      # (the audit POSTs to the CONFIGURED registry, and an empty advisory set
+      # reads as "dependency gate clean").
       npm_config_registry: https://registry.npmjs.org/
     steps:
       - name: Checkout app repo (the caller)
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # This root is the root the bundle reads from. No step in this job
+          # runs `git`, and the credential actions/checkout would leave in
+          # .git/config would sit inside the tree wrangler bundles.
           persist-credentials: false
 
-      # The version the app's dependencies installed under while this step
-      # lived in the deploy job (whose setup-node runs before it). Without it
-      # the author's tree would quietly start installing under whatever npm the
-      # runner image happens to ship that week.
-      #
-      # `cache: npm` is deliberately OMITTED, not forgotten: with no
-      # cache-dependency-path, setup-node looks for a lock file at the
-      # WORKSPACE ROOT and fails the step when none is there, and
-      # config-integrity check 8 forbids an app repo the root build inputs.
-      # The deploy job's cache keys on the gateway's lock in its own checkout
-      # of the mirror (see its setup-node step); this job checks out no
-      # mirror, and its one install is the author's own tree, which nothing
-      # here caches.
+      - name: Checkout inno-platform-ci (ci/ scripts)
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform-ci
+          ref: ${{ env.PLATFORM_REF }}
+          path: inno-platform-ci
+          # This checkout lands inside the app checkout the bundle reads
+          # from. The mirror is public, so cloning it needs no credential,
+          # but actions/checkout would still persist the run's GITHUB_TOKEN
+          # here. Only read from here (ci/ scripts); no later git op needs a
+          # credential.
+          persist-credentials: false
+
+      # The cache keys on the lock the build-tools install below copies, read
+      # in the mirror checkout above, which nothing removes. Without
+      # cache-dependency-path setup-node looks for a lock at the workspace root
+      # and fails the step when none is there, and the app checkout cannot
+      # carry one (config-integrity check 8). The node version is also the one
+      # the author's dependencies install under: without the pin the tree would
+      # quietly start installing under whatever npm the runner image happens to
+      # ship that week.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: inno-platform-ci/ci/build/package-lock.json
 
       # `npm ci` REQUIRES a committed app/package-lock.json. The old fallback
       # resolved the ranges fresh when the lockfile was missing or stale, which
@@ -1405,18 +1424,26 @@ jobs:
       # install rode into the deployed tree without any gate looking at it. The
       # installed tree is now the audited tree. What that costs is production
       # code that imports a devDependency: the package is simply absent at
-      # bundle time, so the deploy job's app-Worker wrangler run stops with
-      # esbuild's `Could not resolve "<specifier>"`, and that step runs
-      # ci/explain-unresolved.mjs on the log to say which package it was and
-      # what to do about it.
-      - name: Install and stage the app Worker's dependencies
-        id: install
-        if: needs.policy.outputs.function_shaped == 'true'
+      # bundle time, so the bundle step below stops with esbuild's `Could not
+      # resolve "<specifier>"`, and that step runs ci/explain-unresolved.mjs on
+      # the log to say which package it was and what to do about it.
+      #
+      # `npm ci` removes a committed app/node_modules before it installs, so
+      # nothing committed there reaches the bundle unaudited. An app with no
+      # app/package.json installs nothing, and the same rule holds for it: a
+      # committed app/node_modules is removed, so its imports resolve against
+      # nothing no gate has seen. A committed node_modules at the checkout
+      # root is removed first, in both cases: esbuild resolves a bare import
+      # from app/index.ts there next, and it has no legitimate use, since a
+      # root package.json is refused (config-integrity check 8).
+      - name: Install the app Worker's dependencies
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
         run: |
           set -e
+          rm -rf node_modules
           if [ ! -f app/package.json ]; then
             echo "No app/package.json; nothing to install."
-            echo "staged=false" >> "$GITHUB_OUTPUT"
+            rm -rf app/node_modules
             exit 0
           fi
           if [ ! -f app/package-lock.json ]; then
@@ -1424,27 +1451,151 @@ jobs:
             exit 1
           fi
           (cd app && npm ci --ignore-scripts --omit=dev)
-          # npm creates no node_modules AT ALL for a lockfile that resolves to
-          # zero dependencies (npm 11.19.1, whether app/package.json omits
-          # `dependencies` or declares it empty), so the tar below would fail
-          # the step under set -e and skip the deploy of a shape that deployed
-          # fine before this job existed. An empty directory is the faithful
-          # staging of an empty install, and normalizing HERE is what lets the
-          # restore step stay strict: the producer always ships a complete
-          # tree, the consumer always replaces its target with exactly that.
-          mkdir -p app/node_modules
-          tar -cf app-node-modules.tar -C app node_modules
-          # Bind these bytes to a channel the caller cannot write. App-owned
-          # jobs in the calling repo share this run's artifact namespace, so
-          # the artifact name alone proves nothing (OPERATIONS says so of the
-          # image handover, and it is just as true here): an author job beside
-          # the `uses:` job can poll for this name and upload its own tar under
-          # it once this job finishes, and overwrite:true means the last writer
-          # wins. A job OUTPUT is writable only by the job that declares it,
-          # from inside this reusable workflow, which the caller cannot edit and
-          # which the broker pins by job_workflow_ref. The image handover in the
-          # deploy job makes the same move with the id the broker recorded.
-          echo "tar_sha=$(sha256sum app-node-modules.tar | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # The platform's build tools: the wrangler the mirror's ci/build/
+      # lockfile pins, which follows the mirror's main (PLATFORM_REF) as the
+      # ci/ scripts do. Installed, install scripts off, in a copy under
+      # $RUNNER_TEMP outside the app checkout, so nothing of the author's sits
+      # on its resolution path. wrangler runs exclusively as "$WRANGLER",
+      # never via `npx` (which would fetch wrangler from the registry,
+      # unpinned).
+      #
+      # It also puts the mirror's bundling config and compiler settings at the
+      # checkout root, over any author file of either name: app-worker.jsonc,
+      # which names the entry and the compatibility values and nothing else
+      # (the platform writes every binding at upload), and tsconfig.json, a
+      # real build input of the app Worker. The bundle builds from the checkout
+      # (app/index.ts is author code by design) and app-worker.jsonc pins no
+      # tsconfig, so esbuild's nearest-tsconfig lookup from app/index.ts finds
+      # an author's app/tsconfig.json first (APP-CONTRACT R7 permits one,
+      # and it steers only the author's own bundle) and otherwise falls
+      # through to this root copy.
+      - name: Install the platform's build tools
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
+        run: |
+          set -e
+          rm -rf "$RUNNER_TEMP/build-tools"
+          cp -R inno-platform-ci/ci/build "$RUNNER_TEMP/build-tools"
+          (cd "$RUNNER_TEMP/build-tools" && npm ci --ignore-scripts)
+          echo "WRANGLER=$RUNNER_TEMP/build-tools/node_modules/.bin/wrangler" >> "$GITHUB_ENV"
+          # Removed first: `cp` onto a committed symlink of either name
+          # would write the mirror's file through it, wherever it points.
+          rm -f app-worker.jsonc tsconfig.json
+          cp inno-platform-ci/ci/app-worker.jsonc app-worker.jsonc
+          cp inno-platform-ci/ci/tsconfig.app.json tsconfig.json
+
+      # Keeps a link from naming an arbitrary file for the bundle: refuse any
+      # symlink in the checkout whose target resolves outside the repository
+      # checkout. The config gate (check-config.mjs check 1c) already refuses
+      # a COMMITTED out-of-tree file link, but it does not walk node_modules,
+      # so a link shipped in a dependency's tarball and extracted by `npm ci`
+      # would be invisible to it. wrangler reads an imported file's bytes at
+      # bundle time, and a link can give a file with no bundle-able name a
+      # name that is one (environment.txt -> /proc/self/environ). The walk
+      # starts at the checkout root, not app/, so it also sees a linked
+      # package's own dependencies, which `npm ci` installs beside that
+      # package (a `file:../shared` dependency's shared/node_modules), and a
+      # node_modules committed anywhere. It prunes .git and the mirror
+      # checkout (public platform code), and the containment
+      # root is the checkout root, the root check 1c contains links to, so a
+      # `file:../shared` dependency, which `npm ci` links from app/ to a
+      # directory beside it inside the repository, passes. In-tree links
+      # (node_modules/.bin entries, in-repo aliases) pass.
+      #
+      # This is not containment of the build: a plain relative import (or an
+      # author app/tsconfig.json path) reaches a file outside the repository
+      # with no link at all, and wrangler bundles it. The control for that
+      # (threat model DP11) is that this job holds nothing worth reading: no
+      # credential, no token, no secret. A later change that puts anything
+      # sensitive on this job's disk must not rely on this guard.
+      #
+      # It runs immediately before the bundle and under its condition, so
+      # nothing between the two can add a link.
+      - name: Reject a symlink that escapes the repository
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
+        run: |
+          set -euo pipefail
+          root="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+          bad=0
+          while IFS= read -r -d '' link; do
+            link="${link#./}"
+            # `-e` follows the link, so a dangling one (its target, or a link
+            # in its chain, missing) fails here on every runner: GNU realpath
+            # prints a path for a missing final component where BSD's does not.
+            if [ -e "$link" ] && tgt="$(realpath "$link" 2>/dev/null)"; then
+              case "$tgt/" in
+                "$root"/*) : ;;
+                *) echo "::error title=Symlink escapes the repository::$link resolves outside your repository (-> $tgt)" >&2; bad=1 ;;
+              esac
+            else
+              echo "::error title=Dangling symlink::$link does not resolve; remove it" >&2
+              bad=1
+            fi
+          done < <(find . \( -path ./.git -o -path ./inno-platform-ci \) -prune -o -type l -print0)
+          if [ "$bad" -ne 0 ]; then
+            echo "A symlink in your repository points outside it; a link may name only a file inside your repository. Remove it, or point it inside." >&2
+            exit 1
+          fi
+
+      # Bundles the app Worker from the checkout with the bundling config
+      # above. `--dry-run` needs no auth and makes no call to Cloudflare, and
+      # `--outfile` writes the serialized upload form before the dry run
+      # returns: one regular file, worker.form. The banner and metrics are
+      # pinned off in the step env, beside the run, because the banner's npm
+      # update check and the metrics post are the dry run's only outbound
+      # calls, and because wrangler adopts an unset key from a cwd .env file
+      # (the gate rejects a committed .env; this is the suspenders).
+      #
+      # --config app-worker.jsonc pins the exact file copied from the mirror.
+      # (config-integrity does not vet this file: it REJECTS any wrangler
+      # config committed to the app repo; the guarantee is provenance, not
+      # inspection.) wrangler discovers config as wrangler.json ??
+      # wrangler.jsonc ?? wrangler.toml (wrangler.json OUTRANKS .jsonc, and
+      # multiple files don't error), so without --config an attacker could add
+      # an unvetted wrangler.json and have wrangler silently use it.
+      #
+      # `pipefail` is set explicitly rather than assumed: a `run:` block with
+      # no `shell:` key executes as `bash -e {0}`, where a pipeline reports
+      # only its LAST command's status, so the `| tee` would hand back tee's 0
+      # for a wrangler that failed. Teed to $RUNNER_TEMP because wrangler's own
+      # output is the ONLY evidence of which import failed: esbuild prints
+      # `Could not resolve "<specifier>"` and nothing downstream carries the
+      # specifier. The likeliest cause since v0.14.21 is production code
+      # importing a devDependency, and the author cannot read this workflow to
+      # work that out, so explain-unresolved.mjs reads the log back and names
+      # the package and the fix. The `if !` wrapper is what keeps that failure
+      # inspectable: a bare call would end the step under errexit before
+      # anything could read the log, and `|| true` would lose the failure, so
+      # the explanation is printed and `exit 1` puts the failure back.
+      #
+      # Then deploy-bundle.mjs reads the bundle exactly as the hand-over in the
+      # deploy job will (one regular file, at most the platform's size cap),
+      # so an oversized bundle fails this push, not the release, and prints
+      # its sha256. That digest is bound to a channel the caller cannot write:
+      # app-owned jobs in the calling repo share this run's artifact
+      # namespace, so the artifact name alone proves nothing (OPERATIONS says
+      # so of the image handover, and it is just as true here). An author job
+      # beside the `uses:` job can poll for the name and upload its own file
+      # under it once this job finishes, and overwrite:true means the last
+      # writer wins. A job OUTPUT is writable only by the job that declares
+      # it, from inside this reusable workflow, which the caller cannot edit
+      # and which the broker pins by job_workflow_ref.
+      - name: Bundle the app Worker
+        id: bundle
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
+        env:
+          WRANGLER_HIDE_BANNER: "true"
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          set -eo pipefail
+          rm -rf "$RUNNER_TEMP/app-bundle"
+          mkdir -p "$RUNNER_TEMP/app-bundle"
+          if ! "$WRANGLER" deploy --dry-run --config app-worker.jsonc --outfile "$RUNNER_TEMP/app-bundle/worker.form" 2>&1 | tee "$RUNNER_TEMP/wrangler-app.log"; then
+            node inno-platform-ci/ci/explain-unresolved.mjs "$RUNNER_TEMP/wrangler-app.log" app/package.json
+            exit 1
+          fi
+          sha="$(node inno-platform-ci/ci/deploy-bundle.mjs --digest "$RUNNER_TEMP/app-bundle")"
+          echo "bundle_sha=$sha" >> "$GITHUB_OUTPUT"
           echo "staged=true" >> "$GITHUB_OUTPUT"
 
       # retention-days: 1 because this is a build intermediate, not a record
@@ -1454,40 +1605,41 @@ jobs:
       # already exists, so "Re-run all jobs" on a function-shaped release
       # would 409 here and take the deploy down with it.
       #
-      # Only a tag run deploys, so only a tag run needs the tree handed over
+      # Only a tag run deploys, so only a tag run needs the bundle handed over
       # (the same reason the container job gives for the scanned image). The
-      # install itself still runs on a push, where it IS the preflight.
+      # bundle itself still runs on a push, where it IS the preflight: an
+      # import that does not resolve fails the push, not the release.
       # github.ref is the CALLER run's ref for both jobs, so this condition and
       # the deploy job's own agree by construction.
-      - name: Upload the installed tree
-        if: steps.install.outputs.staged == 'true' && startsWith(github.ref, 'refs/tags/v')
+      - name: Upload the app Worker's bundle
+        if: steps.bundle.outputs.staged == 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: app-node-modules-${{ github.run_id }}
-          path: app-node-modules.tar
+          name: app-bundle-${{ github.run_id }}
+          path: ${{ runner.temp }}/app-bundle/worker.form
           retention-days: 1
           if-no-files-found: error
           overwrite: true
 
   deploy:
-    needs: [policy, config-integrity, secrets, sast, deps, dep-age, container, scaffold-check, app-deps]
+    needs: [policy, config-integrity, secrets, sast, deps, dep-age, container, scaffold-check, app-build]
     # Release-driven: only a v* TAG deploys. A push to main runs the safety
     # gates above and stops here: the push IS the safety preflight. github.ref
     # in a reusable workflow is the CALLER run's ref, and the broker
     # independently re-verifies it from the signed OIDC claims.
     #
     # Two artifact handovers key off this same tag test agreeing with the
-    # container job's and the app-deps job's own copies: the scanned image
-    # and, added this release, the staged app dependency tree. Loosening this
-    # condition without touching those would silently orphan both uploads.
+    # container job's and the app-build job's own copies: the scanned image
+    # and the app Worker's bundle. Loosening this condition without touching
+    # those would silently orphan both uploads.
     if: needs.scaffold-check.outputs.built == 'true' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
     # Serialize deploys per app repo. The broker already makes its OWN side
     # safe (deploy-complete runs under withAppLease and the status flip is
     # guarded on 'deploying', so a loser gets 409 rather than interleaving),
-    # but the two `wrangler deploy` calls below race at Cloudflare with no
-    # interlock: two tags pushed in quick succession can land the OLDER code
-    # last while the registry records the newer deployment as live.
+    # and since v0.17.0 it uploads either shape's Worker there, at finalize.
+    # This keeps CI's own steps outside that lease (the image push, the
+    # bundle hand-over) from interleaving with a second tag's as well.
     # Keyed on repository, NOT github.ref: inside a reusable workflow that ref
     # is the CALLER's, so a ref-keyed group would put two tags in two groups
     # and serialize nothing. cancel-in-progress:false protects the RUNNING
@@ -1502,12 +1654,13 @@ jobs:
     permissions:
       id-token: write   # mints a broker OIDC token
       contents: read
-    # The two NON-secret values every wrangler call in this job needs, declared
-    # once here so the push step and both deploy steps get them by
-    # construction instead of by three copies. The deploy token itself stays
-    # STEP-scoped (never job-level): test/workflow-lint.node.test.ts pins both.
+    # The two NON-secret values the image push's wrangler call needs, declared
+    # once here, at job level, so no step restates them. The push token itself
+    # stays STEP-scoped (never job-level), on the push step alone:
+    # test/workflow-lint.node.test.ts pins both. A function app's deploy runs
+    # no wrangler at all: the platform uploads its Worker.
     env:
-      # The minted deploy token is narrowly scoped and cannot call
+      # The minted push token is narrowly scoped and cannot call
       # /memberships to auto-discover the account, so pin the account id
       # explicitly (non-secret, it appears in dashboard URLs). Otherwise
       # wrangler fails with an auth error on the membership lookup.
@@ -1521,12 +1674,11 @@ jobs:
       - name: Checkout app repo (the caller)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # This root is the wrangler docker build context, exactly as the
-          # mirror checkout below says, so the same reasoning applies to the
-          # clone that CONTAINS it: no step in this job runs `git`, and the
-          # credential actions/checkout would leave in .git/config would sit
-          # inside an author-controlled build in the one job that also holds
-          # the deploy token.
+          # No step in this job runs `git`, and the credential
+          # actions/checkout would leave in .git/config would sit inside the
+          # author-controlled tree of the one job that also holds the OIDC
+          # grant and the push token. Finalize reads the app's declared
+          # variables (app/inno-variables.json) from this checkout.
           persist-credentials: false
 
       - name: Checkout inno-platform-ci (ci/ scripts)
@@ -1535,150 +1687,88 @@ jobs:
           repository: dlaporte/inno-platform-ci
           ref: ${{ env.PLATFORM_REF }}
           path: inno-platform-ci
-          # This checkout lands inside the app root that becomes the wrangler
-          # docker build context below. The mirror is public, so cloning it
-          # needs no credential, but actions/checkout would still persist the
-          # run's GITHUB_TOKEN here. Only read from here (ci/ scripts); no
-          # later git op needs a credential.
+          # This checkout lands inside the app checkout. The mirror is public,
+          # so cloning it needs no credential, but actions/checkout would
+          # still persist the run's GITHUB_TOKEN here. Only read from here
+          # (ci/ scripts); no later git op needs a credential.
           persist-credentials: false
 
-      - name: Require a promoted gateway (gateway.ref)
-        env:
-          GATEWAY_REF: ${{ needs.policy.outputs.gateway_ref }}
-        run: |
-          if [ -z "$GATEWAY_REF" ]; then
-            echo "::error title=Gateway not promoted::gateway.ref is unset or the policy fetch failed, so there is no fallback. Promote with the sync_gateway_ref MCP tool (or set_config gateway.ref <inno-platform-ci mirror sha>)"
-            exit 1
-          fi
-
-      - name: Checkout promoted gateway
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: dlaporte/inno-platform-ci
-          ref: ${{ needs.policy.outputs.gateway_ref }}
-          path: gateway-src
-          sparse-checkout: gateway
-          # Same reasoning as the mirror checkout above: this dir lands in the
-          # wrangler docker build context, and actions/checkout would persist
-          # the run's GITHUB_TOKEN here although the public mirror needs none.
-          # Only read from here (cp of gateway build inputs); no later git op
-          # needs a credential.
-          persist-credentials: false
-
-      - name: Inject gateway into a platform-owned build directory
-        env:
-          SHAPE: ${{ needs.policy.outputs.shape }}
-          PERIMETER: ${{ needs.policy.outputs.perimeter }}
-        run: |
-          set -e
-          [ -f gateway-src/gateway/package.json ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the build-input move (no gateway/package.json at that ref); promote a current inno-platform-ci mirror SHA with the sync_gateway_ref MCP tool"; exit 1; }
-          [ -f gateway-src/gateway/wrangler.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the wrangler.jsonc move; promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
-          # THE R02 fix. The gateway is the per-app authentication perimeter
-          # (Access JWT verify, identity injection, storage proxy), and it used
-          # to be bundled from src/gateway INSIDE the app's own checkout with
-          # the app's own tree on esbuild's resolution path: a committed
-          # src/node_modules/hono, src/tsconfig.json (paths) or src/package.json
-          # (browser field) outranked the pinned copy and let an author replace
-          # a dependency inside their own gateway while the deployment recorded
-          # a legitimate gateway ref (review F08, reproduced with this repo's
-          # own wrangler). Building from a platform-owned directory removes the
-          # author's tree from the resolution path entirely; the config-integrity
-          # gate's src/ rules and the wipe below stay as belt.
-          GW="$RUNNER_TEMP/gateway-build"
-          rm -rf "$GW"
-          mkdir -p "$GW/src/gateway"
-          # The gateway SOURCE is identical for ALL types (src/gateway/index.ts
-          # dispatches on OAUTH_RS_MODE and the APP_WORKER binding); only the
-          # wrangler config differs. package.json/lock/tsconfig are its build
-          # inputs, and its wrangler config pins "tsconfig" explicitly so
-          # nearest-tsconfig lookup never applies.
-          cp gateway-src/gateway/*.ts "$GW/src/gateway/"
-          cp gateway-src/gateway/package.json gateway-src/gateway/package-lock.json gateway-src/gateway/tsconfig.json "$GW/"
-          # src/ stays platform-owned and EMPTY in the checkout: nothing is
-          # bundled from there any more, and the gate (check 7) rejects any
-          # author file under it. Belt to those suspenders.
-          rm -rf src
-          # Nothing at the checkout root is installed (R02), and the one
-          # gateway file the root receives is the function shape's
-          # tsconfig.json below. setup-node's npm cache reads the gateway's
-          # lock where the checkout above put it (cache-dependency-path).
-          if [ "$SHAPE" = "function" ]; then
-            [ -f gateway-src/gateway/app-worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type; promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
-            cp gateway-src/gateway/app-worker.jsonc app-worker.jsonc
-            # A real build input of the app Worker: it builds from the
-            # CHECKOUT (main: app/index.ts is author code by design) and
-            # app-worker.jsonc pins no tsconfig, so esbuild's nearest-tsconfig
-            # lookup from app/index.ts falls through to this root copy.
-            cp gateway-src/gateway/tsconfig.json .
-            if [ "$PERIMETER" = "oauth-rs" ]; then
-              [ -f gateway-src/gateway/wrangler.mcp.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp deployment type; promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
-              cp gateway-src/gateway/wrangler.mcp.jsonc "$GW/wrangler.jsonc"
-            else
-              [ -f gateway-src/gateway/wrangler.worker.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the function deployment type; promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
-              cp gateway-src/gateway/wrangler.worker.jsonc "$GW/wrangler.jsonc"
-            fi
-          else
-            if [ "$PERIMETER" = "oauth-rs" ]; then
-              [ -f gateway-src/gateway/wrangler.mcp-container.jsonc ] || { echo "::error title=Stale gateway.ref::promoted gateway.ref predates the mcp-container preset; promote a current inno-platform-ci mirror SHA (sync_gateway_ref)"; exit 1; }
-              cp gateway-src/gateway/wrangler.mcp-container.jsonc "$GW/wrangler.jsonc"
-            else
-              cp gateway-src/gateway/wrangler.jsonc "$GW/wrangler.jsonc"
-            fi
-          fi
-          echo "GW=$GW" >> "$GITHUB_ENV"
-
-      # The cache keys on the lock $GW installs from, read in the gateway
-      # checkout above, which nothing removes. Without cache-dependency-path
-      # setup-node looks for a lock at the workspace root and fails the step
-      # when none is there, and the app checkout cannot carry one
-      # (config-integrity check 8).
+      # The cache keys on the lock the install below copies, read in the
+      # mirror checkout above, which nothing removes. Without
+      # cache-dependency-path setup-node looks for a lock at the workspace root
+      # and fails the step when none is there, and the app checkout cannot
+      # carry one (config-integrity check 8).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: gateway-src/gateway/package-lock.json
+          cache-dependency-path: inno-platform-ci/ci/build/package-lock.json
 
-      # The gateway's own dependency tree, installed IN the platform-owned
-      # build directory. It and the audit below run before the OIDC and
-      # deploy-token steps: neither needs a token, so neither spends the deploy
-      # token's 15 minutes, and a failed install ends the run before the
-      # broker records a deployment. This is the ONLY npm install in this job:
-      # nothing at the checkout root needs installing. wrangler itself runs
-      # exclusively from this directory's pinned copy
-      # ("$GW/node_modules/.bin/wrangler"), never via `npx` (which would fetch
-      # wrangler from the registry, unpinned, with CLOUDFLARE_API_TOKEN already
-      # in the environment: the exact class R01 closed). The app Worker's own
-      # deps are installed by the app-deps job and only unpacked here (S01).
-      - name: Install gateway build dependencies
-        run: cd "$GW" && npm ci --ignore-scripts
-
-      # The gateway's runtime dependencies (--omit=dev: the packages bundled
-      # into every app), audited where they were just installed. The
-      # platform's own CI audits gateway/ at main and fails there on a high
-      # advisory, but this deploy builds the promoted gateway.ref, which can
-      # lag main: a fix there reaches this tree only when it is promoted. Its
-      # devDependencies, wrangler among them, are not audited here (the
-      # platform repository's .github/dependabot.yml covers gateway/ for
-      # those). A warning, never a failure: one advisory would otherwise fail
-      # every tenant deploy at once, and only a platform admin can fix it.
-      #
-      # Bounded at 120s, killed 10s after that if npm ignores the TERM, and a
-      # timeout warns like an advisory: npm's own fetch timeout is 5 minutes
-      # with retries, so a stalled advisory service would otherwise hold the
-      # deploy, and any deploy of the same repository waiting behind it, that
-      # long.
-      - name: Audit the gateway's dependencies (warning only)
+      # The platform's build tools: the wrangler the mirror's ci/build/
+      # lockfile pins, which follows the mirror's main (PLATFORM_REF) as the
+      # ci/ scripts do. The image push is the one wrangler call in this job,
+      # so only a container shape installs them; a function app's Worker was
+      # bundled in app-build, and the platform uploads it. Installed, install
+      # scripts off, in a copy under $RUNNER_TEMP outside the app checkout, so
+      # nothing of the author's sits on its resolution path. It runs before
+      # the OIDC and deploy-token steps: it needs no token, so it spends none
+      # of the push token's 15 minutes, and a failed install ends the run
+      # before the broker records a deployment. This is the ONLY npm install
+      # in this job: nothing at the checkout root is installed. wrangler runs
+      # exclusively as "$WRANGLER", never via `npx` (which would fetch
+      # wrangler from the registry, unpinned, with CLOUDFLARE_API_TOKEN
+      # already in the environment: the exact class R01 closed).
+      - name: Install the platform's build tools
+        if: needs.policy.outputs.function_shaped != 'true'
         run: |
-          if ! (cd "$GW" && timeout -k 10 120 npm audit --omit=dev --audit-level=high); then
-            echo "::warning title=Gateway dependency advisory::the platform gateway's runtime dependencies (gateway.ref) have a high or critical advisory, or could not be audited (npm's advisory service failed, or took over 120s). Nothing in this app needs to change: a platform admin promotes a fixed gateway with sync_gateway_ref."
-          fi
+          set -e
+          rm -rf "$RUNNER_TEMP/build-tools"
+          cp -R inno-platform-ci/ci/build "$RUNNER_TEMP/build-tools"
+          (cd "$RUNNER_TEMP/build-tools" && npm ci --ignore-scripts)
+          echo "WRANGLER=$RUNNER_TEMP/build-tools/node_modules/.bin/wrangler" >> "$GITHUB_ENV"
+
+      # Function-shaped only: the bundle app-build built and uploaded, fetched
+      # before the OIDC and deploy-token steps for the same reason the install
+      # above runs there: it needs no token, and a missing or failed download
+      # ends the run before the broker records a deployment. Nothing here
+      # trusts it yet: the step after it checks it against app-build's pinned
+      # digest, and the hand-over below again before a byte of it is sent
+      # (see the note on the downloads, below, for why it lands under the
+      # runner's temp).
+      #
+      # `if: always()` would be wrong here, and so would `continue-on-error`: a
+      # function-shaped app whose build failed must not deploy. app-build is in
+      # this job's `needs:`, so its failure already skips the deploy, and a
+      # function app that reaches this step always has a bundle to download.
+      - name: Download the app Worker's bundle
+        if: needs.policy.outputs.function_shaped == 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: app-bundle-${{ github.run_id }}
+          path: ${{ runner.temp }}/app-bundle
+
+      # The hand-over's local checks, run on the download as soon as it lands
+      # and before the OIDC and deploy-token steps (deploy-bundle.mjs
+      # --verify): an empty or malformed EXPECTED, a directory holding
+      # anything but one regular worker.form, a file over the size cap, bytes
+      # whose sha256 is not app-build's pinned output, and a file with no
+      # boundary line. A swapped or extra file then ends the run before the
+      # broker records a deployment, rather than leaving the app deploying
+      # with a stranded row. The hand-over checks the bytes it sends again.
+      - name: Check the downloaded bundle against app-build's digest
+        if: needs.policy.outputs.function_shaped == 'true'
+        env:
+          EXPECTED: ${{ needs.app-build.outputs.bundle_sha }}
+        run: |
+          set -e
+          node inno-platform-ci/ci/deploy-bundle.mjs --verify "$RUNNER_TEMP/app-bundle" "$EXPECTED"
 
       # Requests a GitHub OIDC token scoped to audience "inno-platform-deploy"
       # (id-token: write, granted above). This token is used ONLY for
-      # /deploy-token; the finalize step below mints a FRESH one, because
-      # GitHub OIDC tokens are short-lived and the container build/push inside
-      # `wrangler deploy` can outlast the TTL: an expired token there left
-      # the worker deployed but never finalized (no domain attach, not live).
+      # /deploy-token; the bundle hand-over and the finalize step below each
+      # mint a FRESH one, because GitHub OIDC tokens are short-lived and an
+      # image push can outlast the TTL: an expired token there left the app
+      # deployed but never finalized (no domain attach, not live).
       # actions/github-script wraps the
       # ACTIONS_ID_TOKEN_REQUEST_URL/ACTIONS_ID_TOKEN_REQUEST_TOKEN dance
       # that `core.getIDToken(audience)` performs internally; the equivalent
@@ -1710,10 +1800,11 @@ jobs:
           #
           # --max-time 30 and NO --retry, unlike the policy fetch above: this
           # request is not a read. Each call inserts a deployment row, flips
-          # the app to "deploying" and mints an account-wide 15-minute
-          # Cloudflare token, so a curl retry on a 5xx or a 429 would mint a
-          # second one and strand the first row. 30s is twice the policy
-          # fetch's bound because this call does that work before it answers.
+          # the app to "deploying" and, for a container app, mints a 15-minute
+          # push-only Cloudflare token, so a curl retry on a 5xx or a 429 would
+          # start a second deployment (and mint a second token) and strand the
+          # first row. 30s is twice the policy fetch's bound because this call
+          # does that work before it answers.
           #
           # The one exception is the loop below: a 409 whose error is app_busy
           # (another change to this app, or to an app linked to it, holds the
@@ -1721,21 +1812,14 @@ jobs:
           # apart, so 50s of waiting covers a holder doing one slow
           # identity-provider read.
           # The broker answers it before it inserts the row or flips the
-          # status (both run under the lease) and revokes the token it minted
+          # status (both run under the lease) and revokes any token it minted
           # for the refused call, so a retry strands nothing. Every other
           # answer, a 409 for a stopped app or a link refusal included, still
           # fails at once.
           #
-          # The request carries the gateway's capability number (v0.16.4),
-          # read by deploy-finalize.mjs's own reader from the file Finalize
-          # passes below, in the gateway source checked out at gateway.ref.
-          # The broker refuses every browser app when that gateway is below
-          # capability 1 (409 gateway_too_old, before it mints or writes
-          # anything; its message names the admin's fix). A missing or
-          # unreadable file reads as 0, which no MCP app is ever refused for.
-          # Built once, so every attempt below sends the same body.
-          gateway_capability="$(node inno-platform-ci/ci/deploy-finalize.mjs --capability "$GITHUB_WORKSPACE/gateway-src/gateway/capability.json")"
-          body="$(jq -cn --arg app "$APP" --argjson cap "$gateway_capability" '{app: $app, gateway_capability: $cap}')"
+          # The request names the app and nothing else. Built once, so every
+          # attempt below sends the same body.
+          body="$(jq -cn --arg app "$APP" '{app: $app}')"
           for attempt in 1 2 3 4; do
             resp="$(curl -sS --max-time 30 -X POST "$BROKER_URL/deploy-token" \
               -H "Authorization: Bearer $OIDC_TOKEN" \
@@ -1762,59 +1846,49 @@ jobs:
             exit 1
           fi
 
-          token="$(echo "$resp" | jq -r .token)"
-          database_id="$(echo "$resp" | jq -r .database_id)"
-          access_aud="$(echo "$resp" | jq -r .access_aud)"
+          # The answer's fields a later step reads, each handed on as a step
+          # output (an absent optional one as empty, never jq's literal
+          # "null"). The answer carries more (expires_on, shape, perimeter);
+          # no step reads them, so none is handed on.
+          # The push-only Cloudflare token, for a container app's image push.
+          # A function app's answer carries none: the platform uploads its
+          # Worker, so its CI holds no Cloudflare credential at all.
+          token="$(echo "$resp" | jq -r '.token // empty')"
           deployment_id="$(echo "$resp" | jq -r .deployment_id)"
-          # Effective container.sleep_after from the platform config store.
-          # The broker always sends it (src/routes/deploy.ts). No default
-          # here: an answer without it leaves the value empty, the container
-          # deploy then passes no --var, and the gateway keeps its own.
-          sleep_after="$(echo "$resp" | jq -r '.sleep_after // empty')"
-          # oauth-rs perimeter only: this app's RFC 8707/9728 resource identifier.
-          # Emitted as the empty string for the sso perimeter (the templater
-          # rejects an empty value, so an oauth-rs deploy against an older
-          # broker fails loudly rather than pinning a bogus audience).
-          oauth_rs_resource="$(echo "$resp" | jq -r '.oauth_rs_resource // empty')"
-          # Cross-app data links (migration 0028). Compact JSON array, empty for
-          # almost every app. -c keeps it on ONE line so it survives $GITHUB_OUTPUT
-          # (which is line-oriented); an older broker that omits the field yields
-          # [], which the templater treats as "no links".
-          linked_databases="$(echo "$resp" | jq -c '.linked_databases // []')"
           # The scanned image's id for THIS run, if the container job recorded
-          # one (R11). Empty for an older broker or a function-shaped app.
+          # one (R11). Empty for a function-shaped app.
           image_id="$(echo "$resp" | jq -r '.image_id // empty')"
 
-          echo "::add-mask::$token"
+          # Masked only when there is one: a function app's answer has none.
+          if [ -n "$token" ]; then echo "::add-mask::$token"; fi
           {
             echo "token=$token"
-            echo "database_id=$database_id"
-            echo "access_aud=$access_aud"
             echo "deployment_id=$deployment_id"
-            echo "sleep_after=$sleep_after"
-            echo "oauth_rs_resource=$oauth_rs_resource"
-            echo "linked_databases=$linked_databases"
             echo "image_id=$image_id"
           } >> "$GITHUB_OUTPUT"
 
-      # download-artifact v7.0.0 and the upload-artifact v6.0.0 that wrote this
-      # are each action's first Node 24 release, on the same @actions/artifact
-      # 5, and neither changed an input default from the v4 pair before them:
-      # a download by name with no path: still extracts into the workspace root (both steps below set one), and a
-      # digest mismatch still only warns (error is v8's default). The id check
-      # below, not the action, is what authenticates the image, and the
-      # dependency tree's sha256 check does the same for the download after it.
+      # download-artifact v7.0.0 and the upload-artifact v6.0.0 that wrote
+      # these are each action's first Node 24 release, on the same
+      # @actions/artifact 5, and neither changed an input default from the v4
+      # pair before them: a download by name extracts into the workspace root
+      # unless `path:` says otherwise, and a digest mismatch still only warns
+      # (error is v8's default). The id check below, not the action, is what
+      # authenticates the image, and the hand-over's sha256 check does the
+      # same for the bundle downloaded above.
+      #
+      # Each download lands in a directory of its own under the runner's temp,
+      # never the workspace: an app-owned job in the caller shares this run's
+      # artifact namespace and can upload its own archive under either name,
+      # and extracted at the workspace root it would replace the files the
+      # mirror checkout put there (the ci/ scripts this job runs, beside the
+      # OIDC grant and the push token) before any check ran. The verify step
+      # and the hand-over read from those directories.
       - name: Load the scanned image
         if: needs.policy.outputs.function_shaped != 'true'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: inno-scanned-image
-          # Under the runner's temp directory, never the workspace: an artifact
-          # an author job re-uploaded under this name may carry any entries, and
-          # an extract into $GITHUB_WORKSPACE would overwrite files this job
-          # already checked out (the mirror's ci/*.mjs scripts run in steps that
-          # hold the deploy token). Only the one file the id check reads is used.
-          path: ${{ runner.temp }}/artifact-image
+          path: ${{ runner.temp }}/scanned-image
 
       # THE build-once check (R11). wrangler used to re-build the author's
       # Dockerfile here, with CLOUDFLARE_API_TOKEN in env, producing a SECOND
@@ -1828,7 +1902,6 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         env:
           EXPECTED: ${{ steps.deploy_token.outputs.image_id }}
-          IMAGE_DIR: ${{ runner.temp }}/artifact-image
         # pipefail for the same reason as the save step: without it the
         # `gunzip -c | docker load` pipe below reports docker load's status
         # alone, and a truncated archive surfaced only as "Image mismatch".
@@ -1839,7 +1912,7 @@ jobs:
             echo "::error title=No scanned image recorded::the container job did not record an image id with the broker; re-run the release after a green safety preflight"
             exit 1
           fi
-          gunzip -c "$IMAGE_DIR/image.tar.gz" | docker load
+          gunzip -c "$RUNNER_TEMP/scanned-image/image.tar.gz" | docker load
           got="$(docker image inspect --format '{{.Id}}' app-under-test)"
           if [ "$got" != "$EXPECTED" ]; then
             echo "::error title=Image mismatch::the image in the workflow artifact is not the one the safety gates scanned ($got != $EXPECTED)" >&2
@@ -1853,115 +1926,13 @@ jobs:
           # itself (I-1 fix round).
           echo "id=$got" >> "$GITHUB_OUTPUT"
 
-      # Function-shaped only: the app author's own Worker may declare npm deps in
-      # app/package.json (config-integrity forbids a ROOT package.json, not this
-      # one). That install ran in the app-deps job, which holds no id-token
-      # grant (see its comment). Nothing in THIS job runs a package manager
-      # inside the app checkout any more, so no author-owned .npmrc is ever
-      # read by a step the runner has handed the OIDC request credential to.
-      #
-      # `if: always()` would be wrong here, and so would `continue-on-error`: a
-      # function-shaped app whose deps failed to install must not deploy a
-      # half-built Worker. app-deps is in this job's `needs:`, so its failure
-      # already skips the deploy. The download is conditioned on app-deps' own
-      # `staged` output rather than on its result, because a function-shaped app
-      # with no app/package.json at all SUCCEEDS while producing no artifact,
-      # and download-artifact fails on a name that was never uploaded.
-      - name: Download the app Worker's installed dependencies
-        if: needs.app-deps.outputs.staged == 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: app-node-modules-${{ github.run_id }}
-          # Under the runner's temp directory, never the workspace; see the
-          # image download above for why.
-          path: ${{ runner.temp }}/artifact-deps
-
-      - name: Restore the app Worker's dependencies
-        if: needs.policy.outputs.function_shaped == 'true'
-        env:
-          EXPECTED: ${{ needs.app-deps.outputs.tar_sha }}
-          DEPS_DIR: ${{ runner.temp }}/artifact-deps
-        run: |
-          set -e
-          if [ -f "$DEPS_DIR/app-node-modules.tar" ]; then
-            # The DIGEST is what makes this tree trustworthy, not the artifact
-            # name: app-owned jobs in the calling repo share the run's artifact
-            # namespace, exactly as the image handover above records of its own,
-            # and an author job can upload its own tar under this name any time
-            # after app-deps finishes (the window is the rest of this job's
-            # setup). app-deps published the sha256 as a JOB OUTPUT, which only
-            # the declaring job can write, from a workflow the caller cannot
-            # edit. Compared BEFORE the wipe below, so a refusal leaves the
-            # workspace as it found it.
-            #
-            # Fail closed on an EMPTY expected digest: a job output sourced from
-            # a skipped step is "" and not null, and container-shaped apps skip
-            # that install step, so "nothing to compare" must never read here as
-            # "matches".
-            if [ -z "$EXPECTED" ]; then
-              echo "::error title=No staged digest::app-deps recorded no sha256 for the app dependency tree; refusing this artifact rather than deploying an unverified one" >&2
-              exit 1
-            fi
-            got="$(sha256sum "$DEPS_DIR/app-node-modules.tar" | cut -d' ' -f1)"
-            if [ "$got" != "$EXPECTED" ]; then
-              echo "::error title=Dependency tree mismatch::the app-node-modules artifact is not the tree app-deps installed ($got != $EXPECTED)" >&2
-              exit 1
-            fi
-            echo "app dependency tree verified: $got"
-            # The wipe answers the OTHER way this tree can be wrong: a committed
-            # app/node_modules. `tar -xf` overwrites only the archive's own
-            # members, and this job's checkout re-materializes anything the
-            # author committed there, so without it a package committed but
-            # absent from app/package-lock.json survives into the tree esbuild
-            # resolves app/index.ts against: audited by nothing, and invisible
-            # to the nightly deps sweep, which reads only the manifests. The
-            # `npm ci` this replaced did the wipe for us.
-            rm -rf app/node_modules
-            tar -xf "$DEPS_DIR/app-node-modules.tar" -C app
-            rm -f "$DEPS_DIR/app-node-modules.tar"
-          elif [ -f app/package.json ]; then
-            echo "::error title=Missing installed dependencies::app/package.json exists but the app-deps job produced no tree"
-            exit 1
-          fi
-
-      # Defense in depth for the function bundle: refuse any symlink under app/
-      # (node_modules included) whose target resolves outside app/. The config
-      # gate (check-config.mjs check 1c) already refuses a COMMITTED out-of-tree
-      # file link, but it does not walk node_modules, so a link shipped in a
-      # dependency's tarball and extracted by `npm ci` would be invisible to it.
-      # wrangler reads an imported file's bytes at bundle time, and THIS step
-      # runs with the account deploy token in the job's environment, so an
-      # out-of-tree link (environment.txt -> /proc/self/environ, a ../ escape)
-      # could otherwise bake that token into the Worker. In-tree links, the
-      # only legitimate kind (node_modules/.bin entries, in-repo aliases),
-      # resolve under app/ and pass. Function shapes only: a container app's
-      # author code never runs through wrangler bundling.
-      - name: Reject a symlink that escapes the app tree
-        if: needs.policy.outputs.function_shaped == 'true'
-        run: |
-          set -euo pipefail
-          root="$(cd app && pwd -P)"
-          bad=0
-          while IFS= read -r -d '' link; do
-            if tgt="$(realpath "$link" 2>/dev/null)"; then
-              case "$tgt/" in
-                "$root"/*) : ;;
-                *) echo "::error title=Symlink escapes the app::$link resolves outside your app (-> $tgt)" >&2; bad=1 ;;
-              esac
-            else
-              echo "::error title=Dangling symlink::$link does not resolve; remove it" >&2
-              bad=1
-            fi
-          done < <(find app -type l -print0)
-          if [ "$bad" -ne 0 ]; then
-            echo "A symlink in your app points outside it; the build will not read out-of-tree files." >&2
-            exit 1
-          fi
-
       # Push the VERIFIED image to Cloudflare's managed registry and pin the
-      # deploy to its digest. This is the only build-adjacent command that runs
-      # with the token, and it runs on an image that is already scanned, loaded
-      # and id-checked; no author Dockerfile is built here.
+      # deploy to its digest. This is the one command in tenant CI that runs
+      # with a Cloudflare credential, and it runs on an image that is already
+      # scanned, loaded and id-checked; no author Dockerfile is built here. It is a container
+      # app's whole deploy from CI: Finalize hands the digest-pinned reference
+      # to the broker, which checks it is this app's own registry path and
+      # uploads the app's host Worker with it.
       - name: Push the scanned image and pin its digest
         id: push
         if: needs.policy.outputs.function_shaped != 'true'
@@ -1974,7 +1945,7 @@ jobs:
           # commit that produced the image.
           tag="inno-$APP:${GITHUB_SHA:0:12}"
           docker tag app-under-test "$tag"
-          "$GW/node_modules/.bin/wrangler" containers push "$tag"
+          "$WRANGLER" containers push "$tag"
           remote="registry.cloudflare.com/$CLOUDFLARE_ACCOUNT_ID/$tag"
           digest="$(docker image inspect --format '{{json .RepoDigests}}' "$remote" | tr ',' '\n' | tr -d '"[]' | grep "^registry.cloudflare.com/$CLOUDFLARE_ACCOUNT_ID/inno-$APP@sha256:" | head -n1)"
           if [ -z "$digest" ]; then
@@ -1984,206 +1955,49 @@ jobs:
           echo "pinned image: $digest"
           echo "image=$digest" >> "$GITHUB_OUTPUT"
 
-      - name: Template wrangler.jsonc (container)
-        if: needs.policy.outputs.function_shaped != 'true' && needs.policy.outputs.perimeter == 'sso'
-        env:
-          APP: ${{ needs.policy.outputs.app }}
-          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
-          ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
-          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
-          # Digest-pinned reference for the verified, pushed image (R11): the
-          # ONLY image source this job ever hands the templater for a
-          # container shape. No INNO_DOCKERFILE is exported here any more (I-4
-          # fix round): ci/template-wrangler.mjs's containerImageValue refuses
-          # outright when this is empty rather than silently falling back to
-          # rebuilding the author's Dockerfile a second time, the exact hole
-          # R11 exists to close.
-          INNO_IMAGE: ${{ steps.push.outputs.image }}
-        run: node inno-platform-ci/ci/template-wrangler.mjs "$APP" "$DATABASE_ID" "$ACCESS_AUD" "$GW/wrangler.jsonc"
+      # Function-shaped: hand the bundle app-build built to the platform,
+      # which validates the form, stages it under this app and this
+      # deployment, and answers the digest it computed itself. Nothing goes
+      # live here: finalize names the staged bundle by that digest, and the
+      # platform uploads the Worker under the app's lease, after its gates,
+      # with bindings it writes itself. No Cloudflare credential is in this
+      # job for a function app at all.
+      #
+      # A fresh OIDC token first, as finalize mints one: the first token may
+      # have expired by now (see the note on the first OIDC step).
+      - name: Get OIDC token for the bundle hand-over
+        id: oidc_bundle
+        if: needs.policy.outputs.function_shaped == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const token = await core.getIDToken('inno-platform-deploy');
+            core.setSecret(token);
+            core.setOutput('token', token);
 
-      # mcp-container: the container-fronting gateway keyed by the app's RFC
-      # 8707/9728 resource identifier instead of an Access AUD (no Access
-      # application exists for the oauth-rs perimeter). OAUTH_RS_RESOURCE comes
-      # from the broker so the value the gateway pins a token's audience
-      # against is never rebuilt in CI.
-      - name: Template wrangler.jsonc (mcp-container)
-        if: needs.policy.outputs.function_shaped != 'true' && needs.policy.outputs.perimeter == 'oauth-rs'
-        env:
-          APP: ${{ needs.policy.outputs.app }}
-          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
-          OAUTH_RS_RESOURCE: ${{ steps.deploy_token.outputs.oauth_rs_resource }}
-          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
-          # Digest-pinned reference for the verified, pushed image (R11); no
-          # INNO_DOCKERFILE fallback here either; see the sso templating
-          # step's comment above (I-4 fix round).
-          INNO_IMAGE: ${{ steps.push.outputs.image }}
-        run: node inno-platform-ci/ci/template-wrangler.mjs --mcp-container-gateway "$APP" "$DATABASE_ID" "$OAUTH_RS_RESOURCE" "$GW/wrangler.jsonc"
-
-      - name: Template function configs (gateway + app worker)
-        if: needs.policy.outputs.function_shaped == 'true' && needs.policy.outputs.perimeter == 'sso'
-        env:
-          APP: ${{ needs.policy.outputs.app }}
-          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
-          ACCESS_AUD: ${{ steps.deploy_token.outputs.access_aud }}
-          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
-        run: |
-          # The gateway config (wrangler.jsonc here = the worker-gateway variant)
-          # takes only the Access AUD + names; the app worker takes the D1 id.
-          node inno-platform-ci/ci/template-wrangler.mjs --worker-gateway "$APP" "$ACCESS_AUD" "$GW/wrangler.jsonc"
-          node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
-
-      # oauth-rs perimeter: the app worker config is identical to the sso
-      # perimeter's, but the gateway is keyed by this app's RFC 8707/9728
-      # resource identifier instead of an Access AUD (these apps have no
-      # Access application). OAUTH_RS_RESOURCE comes from the broker so the
-      # value the gateway pins a token's audience against is never rebuilt in CI.
-      - name: Template mcp configs (gateway + app worker)
-        if: needs.policy.outputs.function_shaped == 'true' && needs.policy.outputs.perimeter == 'oauth-rs'
-        env:
-          APP: ${{ needs.policy.outputs.app }}
-          DATABASE_ID: ${{ steps.deploy_token.outputs.database_id }}
-          OAUTH_RS_RESOURCE: ${{ steps.deploy_token.outputs.oauth_rs_resource }}
-          INNO_LINKED_DATABASES: ${{ steps.deploy_token.outputs.linked_databases }}
-        run: |
-          node inno-platform-ci/ci/template-wrangler.mjs --mcp-gateway "$APP" "$OAUTH_RS_RESOURCE" "$GW/wrangler.jsonc"
-          node inno-platform-ci/ci/template-wrangler.mjs --worker-app "$APP" "$DATABASE_ID" app-worker.jsonc
-
-      # NOTE (token-ordering, spec §5.2, superseded by R11, build once/deploy
-      # the digest): `containers[0].image` is now the digest-pinned Cloudflare
-      # registry reference the push step above wrote (`templateWrangler`'s
-      # `containerImageValue`), so this `wrangler deploy` pushes the WORKER
-      # config only: it does NOT rebuild the app's Dockerfile, and
-      # CLOUDFLARE_API_TOKEN is never in scope while the author-controlled
-      # image builds (that build, the scan, and the push all happened
-      # earlier, token-less or under the id-checked push step above). There
-      # is no Dockerfile fallback any more (I-4 fix round): this job never
-      # exports INNO_DOCKERFILE, and containerImageValue refuses outright
-      # when INNO_IMAGE is empty, a run this old comment used to describe as
-      # the only path there was.
-      # --config wrangler.jsonc: pin the exact file injected from the promoted
-      # gateway.ref. (config-integrity does not vet this file: it REJECTS any
-      # wrangler config committed to the app repo; the guarantee is provenance,
-      # not inspection.)
-      # wrangler discovers config as wrangler.json ?? wrangler.jsonc ??
-      # wrangler.toml (wrangler.json OUTRANKS .jsonc, and multiple files don't
-      # error), so without --config an attacker could add an unvetted
-      # wrangler.json and have wrangler silently use it.
-      - name: wrangler deploy (container)
-        if: needs.policy.outputs.function_shaped != 'true'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
-          # The platform-configured container sleep timeout (config store,
-          # app-overridable); the gateway's AppContainer reads it at
-          # construction. Validated server-side (duration grammar) before the
-          # broker returns it.
-          SLEEP_AFTER: ${{ steps.deploy_token.outputs.sleep_after }}
-        # CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_BASE_URL come from the job's
-        # env (see its comment).
-        #
-        # Invoked as "$GW/node_modules/.bin/wrangler", not `npx wrangler` and
-        # not `cd "$GW" &&`: the checkout root has no node_modules/wrangler of
-        # its own any more (R02 moved the gateway's install to $GW), so an
-        # `npx wrangler` here would silently fetch wrangler from the registry,
-        # unpinned, with CLOUDFLARE_API_TOKEN already in the environment: the
-        # exact class R01 closed. --config is the absolute path so this runs
-        # correctly regardless of cwd.
-        #
-        # SLEEP_AFTER is passed only when the broker sent it; otherwise the
-        # gateway keeps its own pinned default.
-        run: |
-          vars=()
-          if [ -n "$SLEEP_AFTER" ]; then vars+=(--var "SLEEP_AFTER:$SLEEP_AFTER"); fi
-          "$GW/node_modules/.bin/wrangler" deploy --config "$GW/wrangler.jsonc" "${vars[@]}"
-
-      # Function-shaped (the 'function' and 'mcp-function' presets): deploy the app's own Worker FIRST (so
-      # the gateway's service binding resolves), then the gateway. The app Worker
-      # has workers_dev:false and no route, so only the gateway can reach it. No
-      # SLEEP_AFTER (that is a container knob). The same deploy token deploys both
-      # scripts. The app Worker's npm install runs in the app-deps job, which
-      # holds no id-token grant. Identical for both types: only the gateway
-      # CONFIG differed, and that was already chosen at injection/templating time.
-      - name: "wrangler deploy (function-shaped: app Worker then gateway)"
+      # deploy-bundle.mjs refuses, before any request, an empty EXPECTED (a
+      # job output sourced from a skipped step is "", and "nothing to compare"
+      # must never read as "matches"), a download directory holding anything
+      # but one regular file named worker.form, a file over the platform's
+      # size cap, and bytes whose sha256 is not app-build's pinned output: the
+      # DIGEST is what makes these bytes trustworthy, not the artifact name
+      # (see app-build's bundle step). It reads the file once and sends those
+      # same bytes, and it refuses an answer that names any other digest. Its
+      # stdout is that digest alone, which Finalize sends as `bundle`; a
+      # refusal's message is an error annotation on the run. No retry: a 409
+      # is final, and a 5xx means re-running the job.
+      - name: Hand the bundle to the platform
+        id: bundle
         if: needs.policy.outputs.function_shaped == 'true'
         env:
-          CLOUDFLARE_API_TOKEN: ${{ steps.deploy_token.outputs.token }}
+          OIDC_TOKEN: ${{ steps.oidc_bundle.outputs.token }}
+          APP: ${{ needs.policy.outputs.app }}
+          DEPLOYMENT_ID: ${{ steps.deploy_token.outputs.deployment_id }}
+          EXPECTED: ${{ needs.app-build.outputs.bundle_sha }}
         run: |
-          set -eo pipefail
-          # `pipefail` is set explicitly rather than assumed: a `run:` block
-          # with no `shell:` key executes as `bash -e {0}`, where a pipeline
-          # reports only its LAST command's status. Without it the `| tee` in
-          # retry_on_10007 below would hand back tee's 0 for a wrangler that
-          # failed, and a run with no Worker deployed would go on to finalize
-          # as green.
-          # (backup-d1.yml writes `set -euo pipefail` for the same reason.)
-          #
-          # The app Worker's deps were installed in the app-deps job and
-          # unpacked by the restore step above (see its comment, and app-deps'
-          # own). Nothing in this step may read author-owned
-          # package-manager configuration: only wrangler runs here.
-          # CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_BASE_URL come from the
-          # job's env (see its comment).
-          # Both deploys run via "$GW/node_modules/.bin/wrangler", never `npx
-          # wrangler`: the checkout root has no node_modules/wrangler of its
-          # own (R02 moved the gateway's install to $GW), and `npx wrangler`
-          # here would fetch wrangler from the registry, unpinned, with
-          # CLOUDFLARE_API_TOKEN already in the environment: the exact class
-          # R01 closed.
-          #
-          # retry_on_10007 <log> <command...> runs the command it is handed,
-          # teeing each attempt's output to <log> (overwritten, so the log
-          # holds the last attempt), and runs it again only when that attempt
-          # failed with wrangler's "This Worker does not exist on your
-          # account. [code: 10007]". Cloudflare can answer it to wrangler's
-          # follow-up call for a Worker uploaded moments before (a new
-          # function app's first deploy), and a later attempt passes. The
-          # match is `[code: 10007]` or a bare `[10007]`, bracketed on both
-          # sides so a code that only ends in 10007 is not retried. Three
-          # attempts in all, 10s and then 20s apart; any other failure is
-          # final at once. It names no wrangler binary of its own:
-          # each call below passes the whole invocation, so the pinned binary
-          # stays on the line that deploys. Its `if`s read each status
-          # themselves, so it behaves the same under errexit (the gateway's
-          # call) as inside `if !` (the app Worker's, where errexit is off).
-          retry_on_10007() {
-            local log="$1" attempt wait_s
-            shift
-            for attempt in 1 2 3; do
-              if "$@" 2>&1 | tee "$log"; then return 0; fi
-              if [ "$attempt" -eq 3 ] || ! grep -qE '\[(code: )?10007\]' "$log"; then return 1; fi
-              wait_s=$(( attempt * 10 ))
-              echo "::warning title=Cloudflare not ready::wrangler answered 10007 (the new Worker is not visible yet); retrying in ${wait_s}s (attempt $attempt of 3)"
-              sleep "$wait_s"
-            done
-          }
-          #
-          # App Worker FIRST (so the gateway's service binding resolves), from
-          # the checkout (main: app/index.ts is author code by design), so
-          # --config stays the relative, checkout-root path; only the
-          # wrangler binary itself comes from $GW.
-          #
-          # Teed to $RUNNER_TEMP because wrangler's own output is the ONLY
-          # evidence of which import failed: esbuild prints `Could not resolve
-          # "<specifier>"` and nothing downstream carries the specifier. Since
-          # v0.14.21 the app-deps install is `--omit=dev` (OPEN 33), so the
-          # likeliest cause of that line is production code importing a
-          # devDependency, and the author cannot read this workflow to work
-          # that out. explain-unresolved.mjs reads the log back and names the
-          # package and the fix. It is invoked out of the mirror checkout the
-          # way every sibling script in this workflow is (template-wrangler
-          # and deploy-finalize above), because this workflow executes in the
-          # APP's repo, which carries no ci/ of its own.
-          #
-          # The `if !` wrapper is what keeps that failure inspectable: a bare
-          # call would end the step under errexit before anything could read
-          # the log, and `|| true` would lose the failure altogether, so the
-          # explanation is printed and `exit 1` puts the failure back.
-          if ! retry_on_10007 "$RUNNER_TEMP/wrangler-app.log" "$GW/node_modules/.bin/wrangler" deploy --config app-worker.jsonc; then
-            node inno-platform-ci/ci/explain-unresolved.mjs "$RUNNER_TEMP/wrangler-app.log" app/package.json
-            exit 1
-          fi
-          # Then the gateway, from the platform-owned build directory (R02).
-          # No `cd`: --config is the absolute path instead.
-          retry_on_10007 "$RUNNER_TEMP/wrangler-gateway.log" "$GW/node_modules/.bin/wrangler" deploy --config "$GW/wrangler.jsonc"
+          set -e
+          bundle="$(node inno-platform-ci/ci/deploy-bundle.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$RUNNER_TEMP/app-bundle" "$EXPECTED")"
+          echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
 
       # Fresh token for finalize; see the note on the first OIDC step.
       - name: Refresh OIDC token for finalize
@@ -2210,15 +2024,22 @@ jobs:
           OIDC_TOKEN: ${{ steps.oidc_finalize.outputs.token }}
           APP: ${{ needs.policy.outputs.app }}
           DEPLOYMENT_ID: ${{ steps.deploy_token.outputs.deployment_id }}
-          GATEWAY_REF: ${{ needs.policy.outputs.gateway_ref }}
           # The verify step's OWN observation (I-1 fix round), never the
           # broker's /deploy-token response round-tripped back at it, which
           # would compare the broker's staged record against itself. Empty for
           # function-shaped apps (the verify step never ran).
           IMAGE_ID: ${{ steps.verify_image.outputs.id }}
+          # The digest-pinned reference the push step wrote, which the broker
+          # checks is this app's own before it uploads the host. Empty for
+          # function-shaped apps (the push step never ran).
+          IMAGE: ${{ steps.push.outputs.image }}
+          # The digest the platform answered for the staged bundle, which
+          # names the bundle it uploads the app's Worker from. Empty for
+          # container-shaped apps (the hand-over never ran).
+          BUNDLE: ${{ steps.bundle.outputs.bundle }}
         run: |
           set -e
-          result="$(node inno-platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$GATEWAY_REF" "$IMAGE_ID" "$GITHUB_WORKSPACE/gateway-src/gateway/capability.json")"
+          result="$(node inno-platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$IMAGE_ID" "$IMAGE" "$BUNDLE")"
           echo "$result"
           # Guard the shape, not just the exit status: a well-formed JSON body
           # that isn't the broker's would otherwise write "Deployed: null" into
