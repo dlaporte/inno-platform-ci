@@ -1924,6 +1924,40 @@ jobs:
             exit 1
           fi
 
+      # Defense in depth for the function bundle: refuse any symlink under app/
+      # (node_modules included) whose target resolves outside app/. The config
+      # gate (check-config.mjs check 1c) already refuses a COMMITTED out-of-tree
+      # file link, but it does not walk node_modules, so a link shipped in a
+      # dependency's tarball and extracted by `npm ci` would be invisible to it.
+      # wrangler reads an imported file's bytes at bundle time, and THIS step
+      # runs with the account deploy token in the job's environment, so an
+      # out-of-tree link (environment.txt -> /proc/self/environ, a ../ escape)
+      # could otherwise bake that token into the Worker. In-tree links, the
+      # only legitimate kind (node_modules/.bin entries, in-repo aliases),
+      # resolve under app/ and pass. Function shapes only: a container app's
+      # author code never runs through wrangler bundling.
+      - name: Reject a symlink that escapes the app tree
+        if: needs.policy.outputs.function_shaped == 'true'
+        run: |
+          set -euo pipefail
+          root="$(cd app && pwd -P)"
+          bad=0
+          while IFS= read -r -d '' link; do
+            if tgt="$(realpath "$link" 2>/dev/null)"; then
+              case "$tgt/" in
+                "$root"/*) : ;;
+                *) echo "::error title=Symlink escapes the app::$link resolves outside your app (-> $tgt)" >&2; bad=1 ;;
+              esac
+            else
+              echo "::error title=Dangling symlink::$link does not resolve; remove it" >&2
+              bad=1
+            fi
+          done < <(find app -type l -print0)
+          if [ "$bad" -ne 0 ]; then
+            echo "A symlink in your app points outside it; the build will not read out-of-tree files." >&2
+            exit 1
+          fi
+
       # Push the VERIFIED image to Cloudflare's managed registry and pin the
       # deploy to its digest. This is the only build-adjacent command that runs
       # with the token, and it runs on an image that is already scanned, loaded

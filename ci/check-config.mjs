@@ -15,8 +15,8 @@
 // Zero npm dependencies: node:fs, node:path builtins plus the local (also
 // zero-dependency) ci/cli.mjs helper only.
 
-import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { join, sep } from "node:path";
 import { isMainModule } from "./cli.mjs";
 
 // Headers every app's CLAUDE.md must carry, regardless of deployment type.
@@ -240,8 +240,19 @@ export function checkConfig(appDir) {
   // name list is a control that a future layout change can outgrow silently;
   // rejecting every directory symlink makes the walk's coverage total by
   // construction. Directory symlinks have no legitimate use in an app repo.
-  // A symlink to a FILE stays legal: every by-name check already lstats and
-  // fails closed on type, so a file link cannot hide content from anything.
+  //
+  // A symlink to a FILE stays legal only while its target resolves INSIDE the
+  // app tree (an in-tree alias.ts -> real.ts). An out-of-tree file link is
+  // rejected: the deploy build reads the target's BYTES (wrangler's default
+  // module rules bundle an imported .txt/.html/.sql as content), so a link
+  // named to match a bundler glob, e.g. environment.txt -> /proc/self/environ
+  // or a ../ escape, bakes whatever the link points at into the Worker,
+  // including the deploy job's own environment (the account deploy token).
+  // The by-name checks fail closed on type, but nothing stopped an
+  // arbitrary-named file link whose content the bundler then reads; this is
+  // that stop. (Vuln 2026-10-18, contract 33, "not additive".) node_modules
+  // is not walked here, so a link planted there at install time is caught by
+  // the deploy job's own realpath guard, not this gate.
   //
   // Never followed: walkTree's readdir already reports whether an entry is a
   // symlink (that is the same answer it uses to decide not to recurse), and
@@ -283,24 +294,36 @@ export function checkConfig(appDir) {
   // does not descend into node_modules — nothing under a node_modules
   // directory is examined at all, because npm resolves its project rc from
   // the directory it is run in, never from inside node_modules.
+  const appRoot = (() => { try { return realpathSync(appDir); } catch { return appDir; } })();
   try {
     for (const { rel, name, isSymlink } of walkTree(appDir)) {
-      // check 1c: a committed directory symlink
+      // check 1c: a committed directory symlink, or a file symlink whose
+      // target resolves outside the app tree
       if (isSymlink) {
         const abs = join(appDir, rel);
+        const target = (() => { try { return readlinkSync(abs); } catch { return "?"; } })();
         let targetIsDir = null;               // null = unresolvable (dangling)
         try {
           targetIsDir = statSync(abs).isDirectory();
         } catch {
           targetIsDir = null;
         }
-        if (targetIsDir !== false) {          // a link to a file is allowed
-          const target = (() => { try { return readlinkSync(abs); } catch { return "?"; } })();
+        if (targetIsDir !== false) {          // a directory link, or dangling
           violations.push(
             `${rel} is a symlink to ${targetIsDir === null ? "an unresolvable path" : "a directory"} ` +
               `(-> ${target}); directory symlinks must not be committed, because the config gate ` +
               `inspects the tree without following them and content behind one is never checked`,
           );
+        } else {
+          // a file link: legal only if its target resolves inside the app tree
+          const real = (() => { try { return realpathSync(abs); } catch { return null; } })();
+          if (real === null || !(real === appRoot || real.startsWith(appRoot + sep))) {
+            violations.push(
+              `${rel} is a symlink whose target resolves outside your app (-> ${target}); ` +
+                `a committed file symlink must point inside your app, because the deploy build reads the ` +
+                `target's bytes and a link out of the tree can bake deploy-time secrets into your app`,
+            );
+          }
         }
       }
       // check 6b: a nested .npmrc (the root one is check 6's, above)
