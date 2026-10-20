@@ -115,6 +115,10 @@ jobs:
       # waivers (safety.ignore.a11y.*), contract 22.
       a11y_mode: ${{ steps.fetch.outputs.a11y_mode }}
       ignores_a11y: ${{ steps.fetch.outputs.ignores_a11y }}
+      # The app's identity (identity-aware | anonymous): the accessibility
+      # scan sends an anonymous app the four identity headers empty, as the
+      # front door serves it.
+      identity: ${{ steps.fetch.outputs.identity }}
       shape: ${{ steps.fetch.outputs.shape }}
       perimeter: ${{ steps.fetch.outputs.perimeter }}
       # The shape axis, collapsed to a boolean: 'true' when the app's code is
@@ -206,6 +210,9 @@ jobs:
             # quality check nor silently drop the report.
             echo "a11y_mode=report" >> "$GITHUB_OUTPUT"
             echo "ignores_a11y=" >> "$GITHUB_OUTPUT"
+            # The scan falls back to identity-aware (a synthetic member), the
+            # headers every app was scanned with before identity existed.
+            echo "identity=identity-aware" >> "$GITHUB_OUTPUT"
           }
           resp="$(curl -sS --max-time 15 --retry 2 -X POST "$BROKER_URL/ci/policy" \
             -H "Authorization: Bearer $OIDC_TOKEN" \
@@ -227,6 +234,9 @@ jobs:
           done
           # A missing or unknown mode reads as report (the non-blocking default).
           echo "a11y_mode=$(printf '%s' "$resp" | jq -r 'if (.a11y_mode == "off" or .a11y_mode == "enforce") then .a11y_mode else "report" end')" >> "$GITHUB_OUTPUT"
+          # Only the broker's "anonymous" reads anonymous; a missing or
+          # unknown identity reads identity-aware, as on an outage.
+          echo "identity=$(printf '%s' "$resp" | jq -r 'if .identity == "anonymous" then "anonymous" else "identity-aware" end')" >> "$GITHUB_OUTPUT"
           # Numeric cooldown threshold; a missing/garbage value reads 0 (off).
           echo "min_release_age_days=$(printf '%s' "$resp" | jq -r '(.min_release_age_days // 0) | if type=="number" then . else 0 end')" >> "$GITHUB_OUTPUT"
           # Axes only (the legacy type field died with Phase B); unknown/absent
@@ -1020,6 +1030,7 @@ jobs:
           A11Y_MODE: ${{ needs.policy.outputs.a11y_mode }}
           A11Y_IGNORES: ${{ needs.policy.outputs.ignores_a11y }}
           APP: ${{ needs.policy.outputs.app }}
+          IDENTITY: ${{ needs.policy.outputs.identity }}
         run: |
           # pipefail: the integrity pipeline below must hand a failed openssl
           # to its `||` rather than base64's 0.
@@ -1107,7 +1118,7 @@ jobs:
             -v "$SCAN/out:/out" \
             "$SCANNER_IMAGE" \
             node /ci/a11y-scan.mjs --base http://a11y-target:8080 --axe /in/axe.min.js \
-              --app "$APP" --mode "$A11Y_MODE" --ignore "$A11Y_IGNORES" --routes /in/routes.json \
+              --app "$APP" --identity "$IDENTITY" --mode "$A11Y_MODE" --ignore "$A11Y_IGNORES" --routes /in/routes.json \
               --summary /out/summary.md --json /out/result.json --wait-healthz 90 || status=$?
           # The scanner's outputs are read only as regular files: /out is the
           # one directory the scanner container can write, so a symlink there
@@ -1638,8 +1649,12 @@ jobs:
     # safe (deploy-complete runs under withAppLease and the status flip is
     # guarded on 'deploying', so a loser gets 409 rather than interleaving),
     # and since v0.17.0 it uploads either shape's Worker there, at finalize.
-    # This keeps CI's own steps outside that lease (the image push, the
-    # bundle hand-over) from interleaving with a second tag's as well.
+    # From v0.17.2 it also refuses the finalize of any run but the newest one
+    # started (409 deployment_not_completable, before any upload), so an
+    # older run can never put its code live over a newer one: this group is
+    # a second guard there, not the only one. It keeps CI's own steps
+    # outside that lease (the image push, the bundle hand-over) from
+    # interleaving with a second tag's as well.
     # Keyed on repository, NOT github.ref: inside a reusable workflow that ref
     # is the CALLER's, so a ref-keyed group would put two tags in two groups
     # and serialize nothing. cancel-in-progress:false protects the RUNNING

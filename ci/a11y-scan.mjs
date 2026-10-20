@@ -36,9 +36,15 @@
 //
 // Usage:
 //   node ci/a11y-scan.mjs --base <url> --axe <axe.min.js> [--app <name>]
+//     [--identity identity-aware|anonymous]
 //     [--mode report|enforce] [--ignore "<rule ids, space-separated>"]
 //     [--routes <inno-a11y.json>] [--summary <file>] [--json <file>]
 //     [--chrome <binary>] [--wait-healthz <seconds>] [--instance <instance.json>]
+//
+// --identity is the app's identity as /ci/policy serves it. An anonymous app
+// is told nobody's identity by the front door, so it is scanned with the four
+// identity headers empty, as it is served; any other value, or none, scans
+// it as a synthetic member (identityHeaders).
 //
 // The synthetic user's group is built from the instance's group prefix, read
 // from --instance <path>, else INNO_INSTANCE_JSON (the JSON itself, not a
@@ -164,6 +170,19 @@ export function parseMode(raw) {
 }
 
 /**
+ * Normalize the app's identity (--identity, from /ci/policy): only
+ * "anonymous" reads as anonymous, and anything else as "identity-aware",
+ * the scan every app had before identity existed (the policy job's
+ * fallback too).
+ *
+ * @param {string|undefined} raw
+ * @returns {"identity-aware"|"anonymous"}
+ */
+export function parseIdentity(raw) {
+  return raw === "anonymous" ? "anonymous" : "identity-aware";
+}
+
+/**
  * The headers the front door owns under R3, as the scan sends them: a
  * synthetic member of the app's users group (<groupPrefix><app>-users,
  * src/naming.ts oktaGroupName's formula) with a synthetic subject, and the
@@ -173,12 +192,15 @@ export function parseMode(raw) {
  * redirects off the scanned origin. Never throws, so scan() can keep its
  * promise of a result. main() never scans without a group prefix (it reports
  * unreadable instance data as "did not run"), so no group is sent only when
- * no app is named.
+ * no app is named. For an anonymous app the four identity headers are sent
+ * present and empty, as the front door serves that app every caller
+ * (front-door/identity.ts NO_IDENTITY), so its pages are checked as a caller
+ * with no identity sees them; the host and proto are the same.
  *
- * @param {{base: string, app?: string, groupPrefix?: string}} args
+ * @param {{base: string, app?: string, groupPrefix?: string, anonymous?: boolean}} args
  * @returns {Array<{name: string, value: string}>}
  */
-export function identityHeaders({ base, app, groupPrefix }) {
+export function identityHeaders({ base, app, groupPrefix, anonymous = false }) {
   let host = "";
   let proto = "";
   try {
@@ -187,10 +209,10 @@ export function identityHeaders({ base, app, groupPrefix }) {
     proto = u.protocol.replace(/:$/, "");
   } catch { /* no usable --base: the scan then fails as a whole, platform-side */ }
   return [
-    { name: "X-Forwarded-User", value: SCAN_USER },
-    { name: "X-Forwarded-Email", value: SCAN_USER },
-    { name: "X-Forwarded-Groups", value: app && groupPrefix ? `${groupPrefix}${app}-users` : "" },
-    { name: "X-Forwarded-Subject", value: SCAN_SUBJECT },
+    { name: "X-Forwarded-User", value: anonymous ? "" : SCAN_USER },
+    { name: "X-Forwarded-Email", value: anonymous ? "" : SCAN_USER },
+    { name: "X-Forwarded-Groups", value: !anonymous && app && groupPrefix ? `${groupPrefix}${app}-users` : "" },
+    { name: "X-Forwarded-Subject", value: anonymous ? "" : SCAN_SUBJECT },
     { name: "X-Forwarded-Host", value: host },
     { name: "X-Forwarded-Proto", value: proto },
   ];
@@ -850,9 +872,9 @@ async function waitHealthz(base, seconds) {
  * Drive the browser over every route. Never throws: a failure to start is a
  * result with no scanned pages and an error string.
  */
-export async function scan({ base, routes, axeSource, app, groupPrefix, chrome, budgetMs = SCAN_BUDGET_MS }) {
+export async function scan({ base, routes, axeSource, app, groupPrefix, anonymous = false, chrome, budgetMs = SCAN_BUDGET_MS }) {
   const deadline = Date.now() + budgetMs;
-  const identity = identityHeaders({ base, app, groupPrefix });
+  const identity = identityHeaders({ base, app, groupPrefix, anonymous });
   const binary = chrome || findChrome();
   if (!binary) return { pages: [], infra: true, error: "no Chromium found in the scanner image" };
   const { proc, profile } = launchChrome(binary);
@@ -882,12 +904,13 @@ export async function scan({ base, routes, axeSource, app, groupPrefix, chrome, 
 // --- CLI --------------------------------------------------------------------
 
 const USAGE = "Usage: node ci/a11y-scan.mjs --base <url> --axe <axe.min.js> [--app <name>] " +
+  "[--identity identity-aware|anonymous] " +
   "[--mode report|enforce] [--ignore \"<rule ids, space-separated>\"] [--routes <inno-a11y.json>] " +
   "[--summary <file>] [--json <file>] [--chrome <binary>] [--wait-healthz <seconds>] [--instance <instance.json>]";
 // Every flag in USAGE. Anything else is refused rather than skipped: a typo
 // such as --wait-heathz would otherwise drop the setting it meant without a
 // word, and an unquoted --ignore list would lose all but its first rule id.
-const FLAGS = new Set(["base", "axe", "app", "mode", "ignore", "routes", "summary", "json", "chrome", "wait-healthz", "instance"]);
+const FLAGS = new Set(["base", "axe", "app", "identity", "mode", "ignore", "routes", "summary", "json", "chrome", "wait-healthz", "instance"]);
 
 /**
  * Parse `--flag value` pairs (a flag followed by another flag, or by
@@ -956,7 +979,8 @@ export async function main(argv = process.argv.slice(2)) {
     // the scan environment's problem, reported but never blocking.
     result = { pages: [], infra: true, error: "the app did not answer /healthz 200 for the scan" };
   }
-  if (!result) result = await scan({ base: args.base, routes, axeSource, app: args.app, groupPrefix, chrome: args.chrome });
+  const anonymous = parseIdentity(args.identity) === "anonymous";
+  if (!result) result = await scan({ base: args.base, routes, axeSource, app: args.app, groupPrefix, anonymous, chrome: args.chrome });
   const outcome = evaluate(result, mode, ignores);
   const first = result.pages.find((p) => p.headers && p.status === "scanned") ?? result.pages.find((p) => p.headers);
   const headers = first ? headerFindings(first.headers) : [];
