@@ -27,15 +27,14 @@ const REQUIRED_CLAUDE_MD_HEADERS = [
 
 // Type-variant header groups: each group carries the same safety guidance for
 // its runtime, and ANY member satisfies the gate. The gate stays
-// deliberately type-blind — it must not depend on the broker's policy fetch
+// deliberately type-blind: it must not depend on the broker's policy fetch
 // (which can fall back to 'container' on an outage) to know which variant to
-// demand, and pre-scaffold apps all carry the container member. "## Worker
-// contract" is the legacy heading of "## Function contract" (the 'worker'
-// preset was renamed 'function' 2026-07-30): scaffolds emit the new heading,
-// but existing app repos keep their CLAUDE.md forever, so both satisfy.
+// demand, and pre-scaffold apps all carry the container member. The retired
+// "## Worker contract" heading (the 'function' preset's before 2026-07-30) is
+// no longer accepted (v0.17.3): an app still carrying it renames it.
 const CLAUDE_MD_HEADER_VARIANTS = [
   ["## Persistence (use the storage client)", "## Persistence (use your bindings)"],
-  ["## Container contract", "## Function contract", "## Worker contract"],
+  ["## Container contract", "## Function contract"],
 ];
 
 // Worker build-input files that are platform-owned: the app-build job's
@@ -280,9 +279,12 @@ export function checkConfig(appDir) {
   // install happens: the build tools' `npm ci` runs in a platform-owned
   // directory outside the checkout). CI runs exactly one
   // package manager inside the author-owned app/ directory: npm (`npm ci` in
-  // the `app-build` job, which bundles the installed tree in the same job;
-  // plus `npm audit` in the `deps` gate. The `npm install` fallback is gone
-  // since R11), and nothing in CI runs yarn, pnpm or bun there. Do NOT read
+  // the `app-build` job, which bundles the installed tree in the same job,
+  // and in the `deps` gate `npm audit`, plus, for a container app with
+  // app/package.json and no lockfile, the `npm install --package-lock-only
+  // --ignore-scripts` that resolves the throwaway lock it audits; a function
+  // app without a lockfile is refused there, as app-build refuses it), and
+  // nothing in CI runs yarn, pnpm or bun there. Do NOT read
   // this rule as guarding one step: since S01 (2026-09-17) the deploy job runs
   // no package manager in app/ at all, and this check is what keeps it that
   // way rather than a leftover from when it did. npm reads the PROJECT .npmrc
@@ -438,7 +440,7 @@ export function checkConfig(appDir) {
     }
     if (present) {
       violations.push(
-        `delete ${relPath}: the platform injects worker build inputs at build time (see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)`,
+        `delete ${relPath}: the platform supplies the build inputs at the repository root itself (see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)`,
       );
     }
   }

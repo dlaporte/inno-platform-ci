@@ -5,7 +5,7 @@ name: Platform CI
 # RENDERED, never edited by hand: scripts/instance.mjs writes this file from
 # the platform repo's templates/platform-ci.template.yml and its instance
 # manifest (instance/instance.jsonc), so every instance value below is the
-# manifest's: BROKER_URL, the deploy job's Cloudflare account id, the seven
+# manifest's: BROKER_URL, the deploy job's Cloudflare account id, the eight
 # cross-repo `repository:` checkouts of this instance's contract mirror
 # (dlaporte/inno-platform-ci, every one fetching ci/ at
 # PLATFORM_REF), and the app name prefixes. To change one, edit the
@@ -66,8 +66,6 @@ name: Platform CI
 #     guarantee: a repo that strips or forks the gates is refused at every
 #     deploy call (/deploy-token, /deploy-bundle, /deploy-complete), so it
 #     deploys nothing.
-#
-# See docs/superpowers/plans/2026-07-17-plan3-ci-deploy-on-push.md (Task 5).
 
 on:
   workflow_call:
@@ -147,7 +145,7 @@ jobs:
           # than the authorization boundary, but a caller-asserted value
           # reaching $GITHUB_OUTPUT unfiltered is exactly the shape that stops
           # being hygiene the day something downstream trusts it.
-          # Grammar mirrors src/naming.ts APP_NAME_RE: ^[a-z][a-z0-9-]{2,28}$.
+          # Grammar mirrors src/leaves.ts APP_NAME_RE: ^[a-z][a-z0-9-]{2,28}$.
           # `case` compares the WHOLE string, so an embedded newline is caught
           # by the negated class (grep -q would match line-by-line and pass).
           valid=0
@@ -485,7 +483,7 @@ jobs:
         with:
           node-version: 22
 
-      - name: Worker dependency audit (not run here, by construction)
+      - name: Root manifest audit (not run here, by construction)
         if: steps.gate.outputs.enabled == 'true'
         run: |
           # There is deliberately no root `npm audit` here: config-integrity
@@ -525,22 +523,34 @@ jobs:
       # app/package.json (there is no root package.json: config-integrity forbids
       # it, and function apps have no container image for Trivy to scan), so without
       # this their dependencies would ship un-audited, the parity gap vs the
-      # container path (pip-audit + Trivy). Audits the lockfile without installing;
-      # generates a throwaway lock if the app didn't commit one so the gate still
-      # runs. Runs with --json through deps-normalize.mjs gate so
+      # container path (pip-audit + Trivy). Audits the lockfile without installing.
+      # A function app with app/package.json and no committed lockfile is refused
+      # here with app-build's own sentence: app-build refuses to deploy it (the
+      # platform deploys the versions this gate audited), so auditing a lock
+      # resolved here would pass a resolution that never ships (R7-6). A
+      # container app's contract allows a package.json with no lockfile, and for
+      # it this gate resolves a throwaway lock and audits that, the one audit of
+      # its app/package.json. Runs with --json through sweep-results.mjs gate so
       # safety.ignore.deps.* applies to npm exactly as it does to pip-audit,
-      # keeping the gate and the deps sweep lane on one ignore mechanism.
+      # keeping the gate and the deps sweep lane on one normalizer and one
+      # ignore mechanism.
       - name: npm audit (app/package.json, if present)
         if: steps.gate.outputs.enabled == 'true'
         env:
           IGNORES: ${{ needs.policy.outputs.ignores_deps }}
+          FUNCTION_SHAPED: ${{ needs.policy.outputs.function_shaped }}
         run: |
           if [ -f app/package.json ]; then
             cd app
-            # Do NOT swallow this: an unresolvable app/package.json means the
-            # gate has nothing to audit, which must fail loudly rather than
-            # silently pass. (A gate that only logs a warning is a broken gate.)
             if [ ! -f package-lock.json ]; then
+              if [ "$FUNCTION_SHAPED" = "true" ]; then
+                echo "::error title=Missing app/package-lock.json::commit app/package-lock.json; the platform deploys the versions the dependency gates audited, and will not resolve your ranges fresh at deploy time"
+                exit 1
+              fi
+              # A container app's throwaway resolution. Do NOT swallow this: an
+              # unresolvable app/package.json means the gate has nothing to
+              # audit, which must fail loudly rather than silently pass. (A gate
+              # that only logs a warning is a broken gate.)
               npm install --package-lock-only --ignore-scripts || {
                 echo "::error title=Dependency gate::could not resolve app/package.json into a lockfile: fix the dependency ranges or commit a package-lock.json"
                 exit 1
@@ -548,7 +558,7 @@ jobs:
             fi
             # npm exits 1 on findings; the filter script is the gate's verdict.
             npm audit --package-lock-only --omit=dev --audit-level=high --json > audit.json || true
-            node ../inno-platform-ci/ci/deps-normalize.mjs gate audit.json
+            node ../inno-platform-ci/ci/sweep-results.mjs gate audit.json
           else
             echo "no app/package.json, skipping app npm audit"
           fi
@@ -574,6 +584,33 @@ jobs:
     # (The OIDC token minted below for the SBOM upload is NOT a credential:
     # it only proves provenance to the broker's /deploy-sbom endpoint.)
     steps:
+      # The registry mirror step's script (ci/registry-mirror.sh) comes from
+      # the mirror, which is checked out, copied out of into $RUNNER_TEMP and
+      # removed again BEFORE the app checkout, as the sast job does for its
+      # lock: the app checkout's root IS the `docker build` context below, so a
+      # mirror checkout left inside it would be in the image's build context,
+      # and one removed after the app checkout would take an author directory
+      # of the same name with it. A function-shaped app builds no image, so
+      # neither step runs for one. (The ci/ scripts the later steps run come
+      # from the second mirror checkout, after the build.)
+      - name: Checkout inno-platform-ci (the registry mirror script)
+        if: needs.policy.outputs.function_shaped != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: dlaporte/inno-platform-ci
+          ref: ${{ env.PLATFORM_REF }}
+          path: inno-platform-ci
+          # The mirror is public, so nothing here needs a credential, and the
+          # next step deletes the directory before checkout's post step could
+          # clean up the token file it would otherwise leave in RUNNER_TEMP.
+          persist-credentials: false
+
+      - name: Copy the registry mirror script out of the mirror checkout
+        if: needs.policy.outputs.function_shaped != 'true'
+        run: |
+          cp inno-platform-ci/ci/registry-mirror.sh "$RUNNER_TEMP/registry-mirror.sh"
+          rm -rf inno-platform-ci
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This checkout root IS the `docker build` context below, so anything
@@ -630,82 +667,21 @@ jobs:
       # is spent, and every GitHub runner behind one address shares that limit
       # (OPEN 49: a canary's base-image pull failed on it). This job pulls Docker
       # Hub images in two places: the author's FROM images in the build, and the
-      # digest-pinned Trivy image below. mirror.gcr.io is Google's cache of
-      # Docker Hub, and the daemon falls back to Docker Hub itself for anything
-      # the mirror cannot serve, so the mirror can only remove failures. A
-      # digest-pinned pull is still checked against its digest, whichever host
-      # serves it. `docker build` here is buildx's default builder, whose
-      # `docker` driver is the daemon's own BuildKit and reads the same
-      # setting; the step logs the driver, so a runner image that changes it
-      # shows up in the log. Restarting the daemon is safe here: no container
-      # has started in this job yet.
-      #
-      # Never a gate: a file that is not a JSON object is left as it is, a
-      # daemon that will not restart with the mirror gets its original file
-      # back, and a missing mirror warns. Each of those builds exactly as this
-      # job did before. Only a daemon that stays down fails here, where the
-      # cause is visible, rather than in the build.
+      # digest-pinned Trivy image below. ci/registry-mirror.sh (copied out of
+      # the mirror at the start of this job) points the daemon at mirror.gcr.io,
+      # Google's cache of Docker Hub, with Docker Hub itself as the fallback, so
+      # the mirror can only remove failures; a digest-pinned pull is still
+      # checked against its digest, whichever host serves it. `docker build`
+      # here is buildx's default builder, whose `docker` driver is the daemon's
+      # own BuildKit and reads the same setting; the script logs the driver, so
+      # a runner image that changes it shows up in the log. Restarting the
+      # daemon is safe here: no container has started in this job yet. Never a
+      # gate: the script says why at its head, and only a daemon that stays
+      # down fails here, where the cause is visible, rather than in the build.
       - name: Pull Docker Hub images through mirror.gcr.io
         if: needs.policy.outputs.function_shaped != 'true'
         run: |
-          conf=/etc/docker/daemon.json
-          mirror=https://mirror.gcr.io
-          work="$(mktemp -d)"
-          had_conf=false
-          if sudo test -f "$conf"; then
-            had_conf=true
-            sudo cat "$conf" > "$work/before.json"
-          else
-            echo '{}' > "$work/before.json"
-          fi
-          # Merge, never overwrite: the runner image keeps its own settings in
-          # this file (its cgroup parent, for one).
-          if ! jq --arg m "$mirror" '.["registry-mirrors"] = ([$m] + ((.["registry-mirrors"] // []) - [$m]))' "$work/before.json" > "$work/after.json" 2>/dev/null \
-            || ! jq -e 'type == "object"' "$work/after.json" >/dev/null 2>&1; then
-            echo "::warning title=Registry mirror::$conf is not a JSON object this step can merge into; left as it is, so Docker Hub images are pulled directly"
-            exit 0
-          fi
-          sudo mkdir -p "$(dirname "$conf")"
-          sudo cp "$work/after.json" "$conf"
-          # docker.service has TimeoutStartSec=0, so a restart that hangs would
-          # hold the step for the job's whole timeout: each one is bounded.
-          if ! sudo timeout 120 systemctl restart docker; then
-            if [ "$had_conf" = true ]; then sudo cp "$work/before.json" "$conf"; else sudo rm -f "$conf"; fi
-            # A unit that failed to start is rate-limited from restarting again.
-            sudo systemctl reset-failed docker || true
-            sudo timeout 120 systemctl restart docker || true
-            if ! docker info >/dev/null 2>&1; then
-              echo "::error title=Docker daemon::the Docker daemon did not come back after its configuration was restored; nothing in this job can build or scan the image"
-              exit 1
-            fi
-            echo "::warning title=Registry mirror::the Docker daemon would not restart with $mirror as a registry mirror; restored its configuration, so Docker Hub images are pulled directly"
-            exit 0
-          fi
-          # The runner image keeps a Docker Hub credential in the CLI's config. The
-          # daemon forwards it to the mirror, which refuses it ("authentication
-          # failed"), and the pull falls back to Docker Hub. Without that one entry
-          # the mirror pulls are anonymous, which the mirror serves; a fallback pull
-          # is then anonymous too, as the build's base-image pulls already were.
-          cli_conf="$HOME/.docker/config.json"
-          if [ -f "$cli_conf" ]; then
-            if jq 'if (.auths? | type) == "object" then .auths |= with_entries(select(.key | test("(^|//)(index[.])?docker[.]io(/|$)") | not)) else . end' "$cli_conf" > "$work/cli.json" 2>/dev/null; then
-              cp "$work/cli.json" "$cli_conf"
-              echo "dropped the Docker Hub entry from $cli_conf, so pulls through the mirror are anonymous"
-            else
-              echo "::warning title=Registry mirror::$cli_conf is not JSON this step can edit; the mirror refuses the Docker Hub credential it holds, so Docker Hub images are pulled directly"
-            fi
-          fi
-          mirrors="$(docker info --format '{{json .RegistryConfig.Mirrors}}' 2>/dev/null || true)"
-          echo "docker daemon registry mirrors: ${mirrors:-none}"
-          case "$mirrors" in
-            *"$mirror"*) ;;
-            *) echo "::warning title=Registry mirror::the Docker daemon does not list $mirror after the restart, so Docker Hub images are pulled directly" ;;
-          esac
-          driver="$(docker buildx inspect 2>/dev/null | sed -n 's/^Driver: *//p' | head -n 1)"
-          echo "docker build builder: ${driver:-the classic builder}"
-          if [ -n "$driver" ] && [ "$driver" != docker ]; then
-            echo "::warning title=Registry mirror::docker build uses the $driver buildx driver, which does not read the daemon's registry mirrors, so base images are pulled directly"
-          fi
+          bash "$RUNNER_TEMP/registry-mirror.sh"
 
       - name: docker build (isolated; no deploy token present)
         if: needs.policy.outputs.function_shaped != 'true'
@@ -1273,9 +1249,13 @@ jobs:
         with:
           node-version: 22
 
+      # FUNCTION_SHAPED: a function app's devDependencies are not dated (its
+      # build installs with --omit=dev, so they never ship); a container
+      # app's are, since its Dockerfile may install them to build.
       - name: Dependency release-age cooldown
         env:
           MIN_RELEASE_AGE_DAYS: ${{ needs.policy.outputs.min_release_age_days }}
+          FUNCTION_SHAPED: ${{ needs.policy.outputs.function_shaped }}
         run: node inno-platform-ci/ci/check-dep-age.mjs app-repo/app
 
   # Skip deploying an app that is still the untouched template scaffold. A
@@ -1785,11 +1765,12 @@ jobs:
       # image push can outlast the TTL: an expired token there left the app
       # deployed but never finalized (no domain attach, not live).
       # actions/github-script wraps the
-      # ACTIONS_ID_TOKEN_REQUEST_URL/ACTIONS_ID_TOKEN_REQUEST_TOKEN dance
-      # that `core.getIDToken(audience)` performs internally; the equivalent
-      # raw call is:
-      #   curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-      #     "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=inno-platform-deploy"
+      # ACTIONS_ID_TOKEN_REQUEST_URL/ACTIONS_ID_TOKEN_REQUEST_TOKEN request
+      # that `core.getIDToken(audience)` makes internally. The platform's own
+      # workflows make the same request with the platform repository's
+      # ci/oidc-token.sh, inside shell loops where a github-script step cannot
+      # run; this workflow mints once per step, and keeps the action rather
+      # than add a mirror checkout to the policy job, which has none.
       - name: Get OIDC token (audience=inno-platform-deploy)
         id: oidc
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
@@ -1806,73 +1787,25 @@ jobs:
           APP: ${{ needs.policy.outputs.app }}
         run: |
           set -e
-          # NOT `curl -f`: -f discards the response body on a non-2xx, which
-          # would swallow the broker's deliberately actionable messages (e.g.
-          # 409 app_stopped: "start it from the platform panel (or with the
-          # start_app tool), then push again"). Capture the status via -w and
-          # surface the body verbatim on failure instead. The token stays in a
-          # shell var (never written to disk).
-          #
-          # --max-time 30 and NO --retry, unlike the policy fetch above: this
-          # request is not a read. Each call inserts a deployment row, flips
-          # the app to "deploying" and, for a container app, mints a 15-minute
-          # push-only Cloudflare token, so a curl retry on a 5xx or a 429 would
-          # start a second deployment (and mint a second token) and strand the
-          # first row. 30s is twice the policy fetch's bound because this call
-          # does that work before it answers.
-          #
-          # The one exception is the loop below: a 409 whose error is app_busy
-          # (another change to this app, or to an app linked to it, holds the
-          # app's lease) is retried, four attempts in all, 5s, 15s, then 30s
-          # apart, so 50s of waiting covers a holder doing one slow
-          # identity-provider read.
-          # The broker answers it before it inserts the row or flips the
-          # status (both run under the lease) and revokes any token it minted
-          # for the refused call, so a retry strands nothing. Every other
-          # answer, a 409 for a stopped app or a link refusal included, still
-          # fails at once.
-          #
-          # The request names the app and nothing else. Built once, so every
-          # attempt below sends the same body.
-          body="$(jq -cn --arg app "$APP" '{app: $app}')"
-          for attempt in 1 2 3 4; do
-            resp="$(curl -sS --max-time 30 -X POST "$BROKER_URL/deploy-token" \
-              -H "Authorization: Bearer $OIDC_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$body" \
-              -w '\n%{http_code}')"
-            http_code="$(printf '%s\n' "$resp" | tail -n1)"
-            resp="$(printf '%s\n' "$resp" | sed '$d')"
-            refusal="$(printf '%s\n' "$resp" | jq -r '.error // empty' 2>/dev/null || true)"
-            if [ "$http_code" = "409" ] && [ "$refusal" = "app_busy" ] && [ "$attempt" -lt 4 ]; then
-              wait_s=$(( attempt == 1 ? 5 : attempt == 2 ? 15 : 30 ))
-              echo "deploy-token: the broker answered 409 app_busy (another change to this app is in flight); retrying in ${wait_s}s (attempt $attempt of 4)" >&2
-              sleep "$wait_s"
-              continue
-            fi
-            break
-          done
-          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "deploy-token request failed (HTTP $http_code):" >&2
-            # stdout to stderr BEFORE jq's own stderr goes to /dev/null: the
-            # other order pointed stdout at /dev/null too, so a JSON refusal
-            # printed nothing and its message (the fix) never reached the log.
-            printf '%s\n' "$resp" | jq -r '.message // .error // .' >&2 2>/dev/null || printf '%s\n' "$resp" >&2
-            exit 1
-          fi
-
-          # The answer's fields a later step reads, each handed on as a step
-          # output (an absent optional one as empty, never jq's literal
-          # "null"). The answer carries more (expires_on, shape, perimeter);
-          # no step reads them, so none is handed on.
-          # The push-only Cloudflare token, for a container app's image push.
-          # A function app's answer carries none: the platform uploads its
-          # Worker, so its CI holds no Cloudflare credential at all.
-          token="$(echo "$resp" | jq -r '.token // empty')"
-          deployment_id="$(echo "$resp" | jq -r .deployment_id)"
-          # The scanned image's id for THIS run, if the container job recorded
-          # one (R11). Empty for a function-shaped app.
-          image_id="$(echo "$resp" | jq -r '.image_id // empty')"
+          # ci/deploy-token.mjs posts {app} to /deploy-token and prints the
+          # three fields of the answer the later steps read, as one JSON
+          # object: the push-only Cloudflare token for a container app's image
+          # push (a function app's answer carries none: the platform uploads
+          # its Worker, so its CI holds no Cloudflare credential at all), the
+          # deployment id, and the scanned image's id the container job
+          # recorded (R11; empty for a function app). The request is not
+          # idempotent (each call inserts a deployment row, flips the app to
+          # "deploying" and, for a container app, mints a 15-minute token), so
+          # the script retries nothing but a 409 app_busy, which the broker
+          # answers before it writes anything, on ci/broker-post.mjs's one
+          # schedule, bounds each attempt at 30 s, and on any other refusal
+          # prints the broker's own message (the fix, e.g. 409 app_stopped:
+          # "start it first, then release again ...") and fails the step. The
+          # answer stays in a shell variable, never on disk or in the log.
+          answer="$(node inno-platform-ci/ci/deploy-token.mjs "$BROKER_URL" "$APP" "$OIDC_TOKEN")"
+          token="$(printf '%s' "$answer" | jq -r .token)"
+          deployment_id="$(printf '%s' "$answer" | jq -r .deployment_id)"
+          image_id="$(printf '%s' "$answer" | jq -r .image_id)"
 
           # Masked only when there is one: a function app's answer has none.
           if [ -n "$token" ]; then echo "::add-mask::$token"; fi

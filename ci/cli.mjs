@@ -95,32 +95,20 @@ export function parseIntegerArg(label, raw) {
 export const logSafe = (s, n = 200) => String(s).replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, n);
 
 // --- The instance's names ---------------------------------------------------
-// Tenant CI's copy of the names the instance builds everything from:
-// ci/instance.json, which scripts/instance.mjs generates from the instance
-// manifest and the publish mirror ships beside these scripts. The
-// accessibility scanner reads it, and spells no name of its own.
+// Tenant CI's copy of the one instance value it reads: ci/instance.json,
+// which scripts/instance.mjs generates from the instance manifest and the
+// publish mirror ships beside these scripts. The accessibility scanner builds
+// its synthetic member's group header from the group prefix, and spells no
+// name of its own.
 
-// The rules, restated from src/instance.ts (itself restated from
+// The rule, restated from src/instance.ts (itself restated from
 // scripts/lib/manifest.mjs): ci/ ships standalone and imports nothing from
-// either. They matter beyond tidiness: every value lands in a deployed
-// config's JSON string and in a String.replace replacement, so these rules
-// are also what keeps a quote, a backslash or a `$` out of both.
-// test/instance-formula-parity.node.test.ts holds the prefix rule to the
-// Worker's, verdict for verdict.
-const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+// either. It matters beyond tidiness: the value lands in a request header the
+// scanner sends, so the rule is also what keeps a control byte or a quote out
+// of it. test/instance-formula-parity.node.test.ts holds it to the Worker's,
+// verdict for verdict.
 const INSTANCE_RULES = {
-  // Only the host prefix may be empty (apps at <app>.<domain>); a missing key
-  // is still refused, since "" is a string and undefined is not.
-  hostPrefix: /^(?:[a-z0-9][a-z0-9-]*-)?$/,
-  resourcePrefix: /^[a-z0-9][a-z0-9-]*-$/,
   groupPrefix: /^[a-z0-9][a-z0-9-]*-$/,
-  platformName: new RegExp(`^${LABEL}$`),
-  platformHost: new RegExp(`^${LABEL}$`),
-  adminGroup: /^[a-z0-9][a-z0-9-]*[a-z0-9]$/,
-  diagBucket: /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/,
-  // The email sender's host label, or "" when it has none (an unprefixed
-  // instance reserves it as an app name; see reservedAppNames).
-  emailHostLabel: new RegExp(`^(?:${LABEL})?$`),
 };
 
 /**
@@ -128,9 +116,8 @@ const INSTANCE_RULES = {
  */
 
 /**
- * Check instance data and return its eight values, frozen, without any other
- * key. Throws naming the source and the first key that is missing or
- * breaks its rule.
+ * Check instance data and return its value, frozen, without any other key.
+ * Throws naming the source and the key when it is missing or breaks its rule.
  *
  * @param {unknown} data
  * @param {string} [source] - where the data came from, for the message
@@ -149,16 +136,11 @@ export function checkInstanceData(data, source = "the instance data") {
     }
     out[key] = v;
   }
-  // The admin group is one of this instance's groups (the manifest's own
-  // cross-check, which the Worker repeats).
-  if (!out.adminGroup.startsWith(out.groupPrefix) || out.adminGroup.length === out.groupPrefix.length) {
-    throw new Error(`${source}: adminGroup ${JSON.stringify(out.adminGroup)} must start with groupPrefix ${JSON.stringify(out.groupPrefix)} and name more than it`);
-  }
   return Object.freeze(/** @type {InstanceData} */ (out));
 }
 
 /**
- * Read the instance's names, from the first of: `path` (a script's
+ * Read the instance data, from the first of: `path` (a script's
  * --instance flag), the env var INNO_INSTANCE_JSON (the data itself, as
  * JSON; empty counts as unset), and the ci/instance.json beside this file.
  * The last is resolved from this module's own location, not the working

@@ -16,9 +16,15 @@
 //     refuses an empty body, and a body that is the literal JSON `null`, each
 //     with its own message, rather than let a report pass that the broker may
 //     never have read.
-//   - scripts/cf-api.mjs's apiReq, the operator scripts' Cloudflare API call.
+//   - scripts/cf-api.mjs's apiReq, the Cloudflare API call of the one
+//     operator script built on it, scripts/check-okta-server.mjs.
 //   - ci/export-app.mjs's R2 list. Its object GET stays raw: it streams the
 //     body to disk.
+//
+// withBusyRetry, last below, is the one retry of the broker's lease refusal
+// (409 app_busy) on the one schedule, BUSY_RETRY_DELAYS_MS: tenant CI's
+// token request (ci/deploy-token.mjs) and finalize (ci/deploy-finalize.mjs)
+// both run through it.
 //
 // Every request is bounded: no answer, or no end to it, within the caller's
 // timeoutMs (BROKER_TIMEOUT_MS when absent) throws
@@ -26,9 +32,11 @@
 // connection and never answers cannot hold a job until its own timeout. The
 // default is the short reports' (an SBOM, a sweep's or the dependency gate's
 // results, an export's end, an R2 list, an operator script's Cloudflare
-// call), whose answers are quick. The finalize waits longer on a bound of its
-// own (ci/deploy-finalize.mjs FINALIZE_TIMEOUT_MS): a container app's answers
-// only after the platform has rolled the image out and uploaded the host.
+// call), whose answers are quick. The token request and the finalize each
+// wait on a bound of their own (ci/deploy-token.mjs DEPLOY_TOKEN_TIMEOUT_MS,
+// ci/deploy-finalize.mjs FINALIZE_TIMEOUT_MS): the first is shorter, the
+// second longer, since a container app's finalize answers only after the
+// platform has rolled the image out and uploaded the host.
 //
 // One import on purpose, ./cli.mjs, for logSafe, the ci/ log sanitiser: it
 // ships beside this file in the mirror manifest and imports only Node's own
@@ -148,4 +156,59 @@ export async function brokerPost({ base, path, label, token, body, timeoutMs }, 
   );
   if (answer === null) throw new Error(`${label} failed: ${text === "" ? "empty" : "JSON null"} response body`);
   return answer;
+}
+
+// The broker answers 409 app_busy while another change to the app holds its
+// lease: a grant, a link, an open or close of the app or of an app linked to
+// it (src/routes/deploy.ts takes the lease before it reads or writes
+// anything, and /deploy-token revokes any token it minted for the refused
+// call). Failing there would fail a deploy over a change that ends in
+// seconds, so that one answer is retried: the broker wrote nothing, and the
+// same request is safe to send again. Four attempts, 5s, 15s, then 30s
+// apart: 50s of waiting covers a holder doing one slow identity-provider read
+// under the lease (a grant to a consumer, or a close that includes this app),
+// and stays well inside a fresh OIDC token's life. Every other answer, a 409
+// for a stopped app or a stale deployment included, fails at once.
+// The platform's own host wave waits out a held lease on the same schedule
+// (src/hosts.ts HOST_WAVE_BUSY_DELAYS_MS, a copy, since ci/ ships standalone
+// and imports nothing from src/, which test/doc-parity.node.test.ts holds to
+// this one).
+export const BUSY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
+
+/** True for the broker's lease refusal: HTTP 409 with the JSON error app_busy. */
+export function isBusyRefusal(err) {
+  if (err?.status !== 409 || typeof err.body !== "string") return false;
+  try {
+    return JSON.parse(err.body)?.error === "app_busy";
+  } catch {
+    return false;
+  }
+}
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Run `send` (one broker request) and retry it on the lease refusal alone,
+ * BUSY_RETRY_DELAYS_MS apart, logging each retry to stderr: never stdout,
+ * which the workflow parses (`jq`) for the two callers' answers. Any other
+ * failure, and the last busy answer, is thrown as it came.
+ *
+ * @template T
+ * @param {string} label - the request's label, e.g. "deploy-token"
+ * @param {() => Promise<T>} send
+ * @param {(ms: number) => Promise<void>} [wait] - the pause between attempts; injectable for testing
+ * @returns {Promise<T>}
+ */
+export async function withBusyRetry(label, send, wait = pause) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await send();
+    } catch (err) {
+      if (!isBusyRefusal(err) || attempt >= BUSY_RETRY_DELAYS_MS.length) throw err;
+      const ms = BUSY_RETRY_DELAYS_MS[attempt];
+      console.error(`${label}: the broker answered 409 app_busy (another change to this app is in flight); ` +
+        `retrying in ${ms / 1000}s (attempt ${attempt + 1} of ${BUSY_RETRY_DELAYS_MS.length + 1})`);
+      await wait(ms);
+    }
+  }
 }

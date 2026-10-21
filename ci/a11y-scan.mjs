@@ -930,6 +930,26 @@ export function parseArgs(argv) {
   return out;
 }
 
+/**
+ * The options main() hands scan() from its arguments and the instance's
+ * group prefix: the one place --identity becomes `anonymous` (only
+ * "anonymous" reads as anonymous, parseIdentity), so a test can see what an
+ * anonymous app is scanned as without a browser (OPEN 90).
+ *
+ * @param {Record<string, string>} args - parseArgs' answer
+ * @param {string | null} groupPrefix - the instance's group prefix
+ * @returns {{ base: string, app: string, groupPrefix: string | null, anonymous: boolean, chrome: string }}
+ */
+export function scanOptions(args, groupPrefix) {
+  return {
+    base: args.base,
+    app: args.app,
+    groupPrefix,
+    anonymous: parseIdentity(args.identity) === "anonymous",
+    chrome: args.chrome,
+  };
+}
+
 export async function main(argv = process.argv.slice(2)) {
   let args;
   try {
@@ -979,8 +999,7 @@ export async function main(argv = process.argv.slice(2)) {
     // the scan environment's problem, reported but never blocking.
     result = { pages: [], infra: true, error: "the app did not answer /healthz 200 for the scan" };
   }
-  const anonymous = parseIdentity(args.identity) === "anonymous";
-  if (!result) result = await scan({ base: args.base, routes, axeSource, app: args.app, groupPrefix, anonymous, chrome: args.chrome });
+  if (!result) result = await scan({ ...scanOptions(args, groupPrefix), routes, axeSource });
   const outcome = evaluate(result, mode, ignores);
   const first = result.pages.find((p) => p.headers && p.status === "scanned") ?? result.pages.find((p) => p.headers);
   const headers = first ? headerFindings(first.headers) : [];

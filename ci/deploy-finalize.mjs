@@ -23,7 +23,7 @@
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { brokerPost } from "./broker-post.mjs";
+import { brokerPost, withBusyRetry } from "./broker-post.mjs";
 import { isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // A FAILURE-SHAPE guard, not a security bound. The platform already refuses an
@@ -90,7 +90,7 @@ export function readDeclarationFile(root = ".") {
  * silently replaced by the global one and the "test" started making real
  * network calls. Named fields make that a TypeError instead of a quiet
  * escape. `fetcher` stays the last parameter, outside the object, like every
- * sibling helper's (uploadSbom, postResults, postDepsResults, brokerPost).
+ * sibling helper's (uploadSbom, postFindings, brokerPost).
  *
  * @param {object} req
  * @param {string} req.base - broker base URL, e.g. "https://inno-platform.example.workers.dev"
@@ -107,7 +107,7 @@ export function readDeclarationFile(root = ".") {
  * @param {(ms: number) => Promise<void>} [wait] - the pause between busy retries; injectable for testing
  * @returns {Promise<any>} the parsed JSON response body (e.g. { url })
  */
-export async function finalize({ base, token, app, deploymentId, imageId, image, bundle, variables }, fetcher = fetch, wait = pause) {
+export async function finalize({ base, token, app, deploymentId, imageId, image, bundle, variables }, fetcher = fetch, wait) {
   const body = {
     app, deployment_id: deploymentId,
     ...(imageId ? { image_id: imageId } : {}),
@@ -115,21 +115,14 @@ export async function finalize({ base, token, app, deploymentId, imageId, image,
     ...(bundle ? { bundle } : {}),
     ...(variables !== undefined ? { variables } : {}),
   };
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await brokerPost(
-        { base, path: "/deploy-complete", label: "deploy-complete", token, body, timeoutMs: FINALIZE_TIMEOUT_MS },
-        fetcher,
-      );
-    } catch (err) {
-      if (!isBusyRefusal(err) || attempt >= BUSY_RETRY_DELAYS_MS.length) throw err;
-      const ms = BUSY_RETRY_DELAYS_MS[attempt];
-      // stderr, never stdout: the workflow pipes stdout into `jq -r .url`.
-      console.error(`deploy-complete: the broker answered 409 app_busy (another change to this app is in flight); ` +
-        `retrying in ${ms / 1000}s (attempt ${attempt + 1} of ${BUSY_RETRY_DELAYS_MS.length + 1})`);
-      await wait(ms);
-    }
-  }
+  // A 409 app_busy (another change holds the app's lease) is retried on
+  // ci/broker-post.mjs's one schedule: failing there would fail a deploy CI
+  // has already handed over, leaving the app `deploying` until the job is
+  // re-run.
+  return withBusyRetry("deploy-complete", () => brokerPost(
+    { base, path: "/deploy-complete", label: "deploy-complete", token, body, timeoutMs: FINALIZE_TIMEOUT_MS },
+    fetcher,
+  ), wait);
 }
 
 // How long the finalize waits for /deploy-complete's answer: a bound of its
@@ -145,31 +138,6 @@ export async function finalize({ base, token, app, deploymentId, imageId, image,
 // derived, because ci/ ships standalone in the public mirror and imports
 // nothing from src/ on purpose.
 export const FINALIZE_TIMEOUT_MS = 600_000;
-
-// /deploy-complete answers 409 app_busy while another change to the app holds
-// its lease: a grant, a link, an open or close of the app or of an app linked
-// to it (src/routes/deploy.ts takes the lease before it reads or writes
-// anything). Failing there would fail a deploy CI has already handed over,
-// leaving the app `deploying` until the job is re-run, so that one answer is
-// retried: the broker wrote nothing, and the same request is safe to send
-// again. Four attempts, 5s, 15s, then 30s apart: 50s of waiting covers a
-// holder doing one slow identity-provider read under the lease (a grant to a
-// consumer, or a close that includes this app), and stays well inside the
-// fresh OIDC token's life. Every other answer, a 409 for a stopped app or a
-// stale deployment included, fails at once as before.
-export const BUSY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
-
-/** True for the broker's lease refusal: HTTP 409 with the JSON error app_busy. */
-export function isBusyRefusal(err) {
-  if (err?.status !== 409 || typeof err.body !== "string") return false;
-  try {
-    return JSON.parse(err.body)?.error === "app_busy";
-  } catch {
-    return false;
-  }
-}
-
-const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 if (isMainModule(import.meta.url)) {
   try {

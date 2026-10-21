@@ -11,12 +11,16 @@
 //   env MIN_RELEASE_AGE_DAYS  threshold in days (0 or unset => gate disabled)
 // Exits 0 if compliant or disabled, 1 (with violations printed) otherwise.
 //
-// Scans exact pins only — app/requirements.txt (`name==version`) via PyPI and
-// app/package-lock.json (resolved versions) via the npm registry. Ranges and
-// un-pinned deps are skipped (nothing to date). A registry lookup that fails or
-// returns no date is skipped with a warning rather than failing the deploy: a
-// registry hiccup must not block a release, and the known-vulnerable gate still
-// runs regardless. Zero npm dependencies: node builtins + local cli.mjs only.
+//   env FUNCTION_SHAPED       "true" for a function app (the policy job's
+//                             function_shaped): its devDependencies are not dated
+//
+// Scans exact pins only: app/requirements.txt (`name==version`) via PyPI and
+// app/package-lock.json (resolved versions; a function app's devDependencies
+// left out) via the npm registry. Ranges and un-pinned deps are skipped
+// (nothing to date). A registry lookup that fails or returns no date is
+// skipped with a warning rather than failing the deploy: a registry hiccup
+// must not block a release, and the known-vulnerable gate still runs
+// regardless. Zero npm dependencies: node builtins + local cli.mjs only.
 
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -48,11 +52,21 @@ export function parseRequirements(text) {
 // registry to date local code that was never published (a guaranteed miss, and
 // a spurious "age unknown" warning on every run). Its installed counterpart
 // under node_modules/ is a link entry with no version, so nothing is lost.
-export function parseNpmLock(json) {
+// For a function app (`skipDev`), a fourth is skipped too: an entry the lock
+// marks `dev`, a devDependency (or one only a devDependency pulls in). Its
+// dependencies reach its Worker only through app-build's `npm ci
+// --omit=dev`, so such a package never ships, and the cooldown dates only
+// what ships (R7-5); `devOptional` entries stay, as --omit=dev installs them.
+// A container app's devDependencies ARE dated: its Dockerfile is the
+// author's, may install them to build, and so a young one can shape the
+// image. The default is the container rule, so a caller that does not know
+// the shape dates everything.
+export function parseNpmLock(json, { skipDev = false } = {}) {
   const out = [];
   const pkgs = json && json.packages ? json.packages : {};
   for (const [path, info] of Object.entries(pkgs)) {
     if (!path || !info || typeof info.version !== "string") continue;
+    if (skipDev && info.dev === true) continue;
     if (!path.includes("node_modules/")) continue;
     const name = path.split("node_modules/").pop();
     if (name) out.push({ ecosystem: "npm", name, version: info.version });
@@ -146,7 +160,9 @@ async function resolvePublishTimes(entries, fetchImpl) {
 
 // --- Orchestration ----------------------------------------------------------
 
-export async function checkDepAge({ appDir, thresholdDays, fetchImpl = fetch, nowMs = Date.now(), readManifest }) {
+// `functionShaped`: the app is a function app, whose devDependencies are
+// not dated (parseNpmLock's skipDev). Absent, every lock entry is dated.
+export async function checkDepAge({ appDir, thresholdDays, functionShaped = false, fetchImpl = fetch, nowMs = Date.now(), readManifest }) {
   const read = readManifest ?? ((p) => (existsSync(p) ? readFileSync(p, "utf8") : null));
   const entries = [];
 
@@ -156,7 +172,7 @@ export async function checkDepAge({ appDir, thresholdDays, fetchImpl = fetch, no
   const lock = read(join(appDir, "package-lock.json"));
   let lockUsable = false;
   if (lock) {
-    try { entries.push(...parseNpmLock(JSON.parse(lock))); lockUsable = true; } catch { /* malformed: handled below */ }
+    try { entries.push(...parseNpmLock(JSON.parse(lock), { skipDev: functionShaped })); lockUsable = true; } catch { /* malformed: handled below */ }
   }
 
   // package.json with NO usable lockfile, absent OR malformed, the operator's
@@ -181,15 +197,18 @@ export async function checkDepAge({ appDir, thresholdDays, fetchImpl = fetch, no
 // --- CLI --------------------------------------------------------------------
 
 // Exported so the gate's exit code is testable; the CLI block below is the
-// only production caller. `appDir`/`thresholdDays` fall back to argv/env.
-export async function main({ appDir, thresholdDays } = {}) {
+// only production caller. `appDir`/`thresholdDays`/`functionShaped` fall back
+// to argv/env; only FUNCTION_SHAPED "true" reads as a function app, so a
+// missing value (a policy outage) dates every entry.
+export async function main({ appDir, thresholdDays, functionShaped } = {}) {
   appDir ??= process.argv[2] || "app";
   thresholdDays ??= Number(process.env.MIN_RELEASE_AGE_DAYS || 0);
+  functionShaped ??= process.env.FUNCTION_SHAPED === "true";
   if (!Number.isFinite(thresholdDays) || thresholdDays <= 0) {
     console.log("dep-age: min_release_age_days is 0, so the cooldown gate is disabled; nothing to check.");
     return 0;
   }
-  const { violations, checked, skipped, unpinnedNpm } = await checkDepAge({ appDir, thresholdDays });
+  const { violations, checked, skipped, unpinnedNpm } = await checkDepAge({ appDir, thresholdDays, functionShaped });
   // logSafe on the name and the version, not on `ecosystem` (a literal this
   // script chose). Both come from the app's own package-lock.json or
   // requirements.txt, parsed here before npm or pip has validated anything: a
