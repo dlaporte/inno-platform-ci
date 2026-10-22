@@ -884,8 +884,9 @@ jobs:
       # Uploaded DIRECTLY to the broker from this job (no workflow artifact:
       # app-owned jobs in the caller share the run's artifact namespace) and
       # staged server-side under this run's VERIFIED run_id claim;
-      # /deploy-complete promotes it to the live pointer. Best-effort: a failed
-      # upload warns and the build proceeds (the sweep keeps the previous SBOM).
+      # /deploy-complete promotes it to the live pointer. On a release tag the
+      # upload also records the scanned image's id, which the deploy needs, so
+      # a failed upload fails this job (the upload step below).
       - name: Generate SBOM (CycloneDX)
         if: needs.policy.outputs.function_shaped != 'true'
         env:
@@ -919,11 +920,9 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         # Captured into a variable first: `echo "id=$(...)"` returns echo's own
         # 0 when the substitution fails, which would stage the SBOM with an
-        # empty id and surface one job later as "the container job did not
-        # record an image id with the broker; re-run the release after a green
-        # safety preflight", which is a wrong diagnosis delivered after a
-        # deploy token has already been minted. Failing here names the step
-        # that actually went wrong.
+        # empty id, and the broker would then refuse the deploy job's token
+        # request (image_not_recorded) with no word of this step. Failing here
+        # names the step that actually went wrong.
         run: |
           set -e
           id="$(docker image inspect --format '{{.Id}}' app-under-test)"
@@ -946,9 +945,12 @@ jobs:
 
       # The broker stages an SBOM only from a release-tag run and answers any
       # other ref 403 deploy_denied:ref, so on a push to main this pair would
-      # mint a token for nothing and warn "SBOM upload failed" on every push
-      # (OPEN 53, v0.15.7). A warning that fires every time teaches an owner
-      # to ignore the one that matters.
+      # mint a token for nothing and fail every push (OPEN 53, v0.15.7). On a
+      # release tag a failed upload fails the job (R7-1, v0.17.4): the upload
+      # records the scanned image's id, and the broker refuses the deploy job's
+      # token request for a run that recorded none, so the release cannot
+      # deploy without it. ci/sbom-upload.mjs prints the broker's refusal as
+      # an ::error and exits 1, on this step, where the fix is.
       - name: Get OIDC token (audience=inno-platform-sbom)
         id: oidc_sbom
         if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
@@ -959,15 +961,14 @@ jobs:
             core.setSecret(token);
             core.setOutput('token', token);
 
-      - name: Upload SBOM to broker (best-effort)
+      - name: Upload SBOM and image id to broker
         if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
         env:
           OIDC_TOKEN: ${{ steps.oidc_sbom.outputs.token }}
           APP: ${{ needs.policy.outputs.app }}
           IMAGE_ID: ${{ steps.image.outputs.id }}
         run: |
-          node inno-platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$OIDC_TOKEN" "$IMAGE_ID" \
-            || echo "::warning::SBOM upload failed: the safety sweep will keep using the previous deployment's SBOM"
+          node inno-platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$OIDC_TOKEN" "$IMAGE_ID"
 
       # Contract 22 (R8, §3; docs/APP-ACCESSIBILITY.md): an automated
       # accessibility scan plus an advisory response-header check of the SAME
@@ -1853,11 +1854,14 @@ jobs:
         # pipefail for the same reason as the save step: without it the
         # `gunzip -c | docker load` pipe below reports docker load's status
         # alone, and a truncated archive surfaced only as "Image mismatch".
+        # The empty-id branch is defensive: the broker refuses the token
+        # request of a run that recorded no scanned image (image_not_recorded)
+        # before it mints anything, so no normal run reaches it.
         run: |
           set -e
           set -o pipefail
           if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
-            echo "::error title=No scanned image recorded::the container job did not record an image id with the broker; re-run the release after a green safety preflight"
+            echo "::error title=No scanned image recorded::the broker answered no scanned image id for this run; re-run the release's workflow"
             exit 1
           fi
           gunzip -c "$RUNNER_TEMP/scanned-image/image.tar.gz" | docker load

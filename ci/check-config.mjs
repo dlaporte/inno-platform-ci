@@ -16,7 +16,7 @@
 
 import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { join, sep } from "node:path";
-import { isMainModule } from "./cli.mjs";
+import { isMainModule, logSafe } from "./cli.mjs";
 
 // Headers every app's CLAUDE.md must carry, regardless of deployment type.
 const REQUIRED_CLAUDE_MD_HEADERS = [
@@ -448,6 +448,17 @@ export function checkConfig(appDir) {
   return { ok: violations.length === 0, violations };
 }
 
+/**
+ * The CLI's lines, one per violation. A violation can carry a file name the
+ * author wrote, so each passes through logSafe: no newline or control byte
+ * reaches the runner's log, where `::error::` at a line start is a command.
+ * @param {string[]} violations
+ * @returns {string[]}
+ */
+export function violationLines(violations) {
+  return violations.map((violation) => `  - ${logSafe(violation, 1000)}`);
+}
+
 // --- CLI wrapper ---
 if (isMainModule(import.meta.url)) {
   const [appDir] = process.argv.slice(2);
@@ -459,7 +470,7 @@ if (isMainModule(import.meta.url)) {
   const { ok, violations } = checkConfig(appDir);
   if (!ok) {
     console.error("config-integrity check FAILED:");
-    for (const violation of violations) console.error(`  - ${violation}`);
+    for (const line of violationLines(violations)) console.error(line);
     process.exit(1);
   }
   console.log("config-integrity check passed.");
