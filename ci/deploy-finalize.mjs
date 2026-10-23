@@ -20,11 +20,18 @@
 // the app declared one, and sends it as `variables` so the broker can update
 // the app's declared platform variables at the same time it marks the
 // deployment live.
+//
+// A failure prints two lines on stderr (R7-5, v0.17.6): the message, plain,
+// then one annotation titled "Deploy not finalized" (ci/cli.mjs annotate),
+// whose fix is the broker's sentence when the refusal carries one (a
+// script_rejected's carries Cloudflare's reason) and a re-run of the
+// release's workflow otherwise. The release's workflow then runs
+// ci/deploy-abandon.mjs, which releases the app from `deploying`.
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { brokerPost, withBusyRetry } from "./broker-post.mjs";
-import { isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
+import { brokerPost, refusalParts, withBusyRetry } from "./broker-post.mjs";
+import { annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // A FAILURE-SHAPE guard, not a security bound. The platform already refuses an
 // oversized body at 64 KiB (readAppBody's DEFAULT_MAX_BODY_BYTES), but it does
@@ -132,12 +139,17 @@ export async function finalize({ base, token, app, deploymentId, imageId, image,
 // uploaded the host (Cloudflare's upload timeout, 60 s), checked the app's
 // host in DNS (two reads) and attached it (each of those three calls 30 s at
 // most), and committed the deployment; a shorter bound fails a slow but
-// healthy deploy that the platform goes on to finish. No answer within it
-// throws `deploy-complete failed: no answer within 600 s`, which is not
-// retried. test/doc-parity.node.test.ts pins it above that sum; it is NOT
-// derived, because ci/ ships standalone in the public mirror and imports
-// nothing from src/ on purpose.
-export const FINALIZE_TIMEOUT_MS = 600_000;
+// healthy deploy that the platform goes on to finish. It also stays a
+// minute inside the app lease the finalize runs under (src/registry.ts
+// LEASE_TTL_MS, 10 minutes): when CI gives up, the job's last step asks
+// /deploy-abandon to release the app under that same lease, and must meet it
+// still held (app_busy, the app left to the recovery sweep) rather than take
+// it over from a rollout that already landed. No answer within it throws
+// `deploy-complete failed: no answer within 540 s`, which is not retried.
+// test/doc-parity.node.test.ts pins it above that sum and below the lease;
+// it is NOT derived, because ci/ ships standalone in the public mirror and
+// imports nothing from src/ on purpose.
+export const FINALIZE_TIMEOUT_MS = 540_000;
 
 if (isMainModule(import.meta.url)) {
   try {
@@ -152,20 +164,16 @@ if (isMainModule(import.meta.url)) {
     const declared = readDeclarationFile(".");
     if (!declared.ok) {
       // A workflow annotation, not a failure: the platform keeps its previous
-      // declarations and the deploy is unaffected. MUST stay console.error
-      // (stderr), not console.log: the workflow captures this script's
-      // stdout into `$result` and pipes it straight into `jq -r .url`
-      // (platform-ci.yml's "Finalize deployment" step) under `set -e`. A
-      // non-JSON line on stdout makes that jq call fail, which turns this
-      // exact "warn, don't fail" case into a failed deploy - the opposite of
-      // the intent. Other ci/ scripts (e.g. check-dep-age.mjs) use
-      // console.log for their own `::warning::` lines, but none of them has
-      // a caller that parses their stdout as JSON; that precedent does not
-      // apply here.
-      // logSafe, not the raw error: JSON.parse's message embeds a snippet of
+      // declarations and the deploy is unaffected. MUST stay on stderr, as
+      // annotate writes it: the workflow captures this script's stdout into
+      // `$result` and pipes it straight into `jq -r .url` (platform-ci.yml's
+      // "Finalize deployment" step) under `set -e`. A non-JSON line on
+      // stdout makes that jq call fail, which turns this exact "warn, don't
+      // fail" case into a failed deploy, the opposite of the intent.
+      // annotate flattens the error: JSON.parse's message embeds a snippet of
       // the raw file, so an author-chosen newline would otherwise forge a
       // second, well-formed workflow-command line in this step's log.
-      console.error(`::warning title=Declared variables::${logSafe(declared.error)}`);
+      annotate({ level: "warning", title: "Declared variables", file: "app/inno-variables.json", what: declared.error });
     }
     const result = await finalize({
       base, token, app,
@@ -177,11 +185,34 @@ if (isMainModule(import.meta.url)) {
     });
     // Human-readable line to stderr; the raw JSON result to stdout, so the
     // workflow can capture stdout and pipe it straight into `jq -r .url`
-    // instead of re-parsing this log line with sed.
-    console.error(`deploy-complete: ${JSON.stringify(result)}`);
+    // instead of re-parsing this log line with sed. The log line is
+    // flattened: the answer echoes an author's declared key back in
+    // variables_refused, which must not carry the runner's ##[ marker into
+    // the log. stdout stays raw, as jq reads it into a variable and nothing
+    // prints it.
+    console.error(`deploy-complete: ${logSafe(JSON.stringify(result), Infinity)}`);
     console.log(JSON.stringify(result));
   } catch (err) {
-    console.error(String(err?.message ?? err));
+    const raw = String(err?.message ?? err);
+    if (raw.startsWith("Usage:")) {
+      console.error(raw);
+    } else {
+      // A failure below brokerPost's (no connection at all) carries no label
+      // of its own, so the line says whose it is.
+      const said = /^(deploy-complete failed|invalid deploymentId)/.test(raw) ? raw : `deploy-complete failed: ${raw}`;
+      // Flattened, not cut: brokerPost already bounds a refusal's sentence
+      // (REFUSAL_MESSAGE_MAX_CHARS), and the step log keeps it whole.
+      console.error(logSafe(said, Infinity));
+      // The broker's sentence names the fix, so it is the annotation's fix,
+      // and the what is the refusal without it.
+      const { error, message } = refusalParts(err?.body);
+      const sentence = error !== null && message !== null;
+      annotate({
+        title: "Deploy not finalized",
+        what: sentence ? `deploy-complete failed (${err.status}): ${error}` : said,
+        fix: sentence ? message : "re-run the release's workflow",
+      });
+    }
     process.exitCode = 1;
   }
 }

@@ -63,7 +63,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isMainModule, loadInstanceData, logSafe } from "./cli.mjs";
+import { annotationLine, isMainModule, loadInstanceData, logSafe } from "./cli.mjs";
 
 export const AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 export const BLOCKING_IMPACTS = ["critical", "serious"];
@@ -426,10 +426,12 @@ export function renderSummary({ app, mode, result, outcome, headers, routesWarni
  * priority order: the verdict-level lines, then the response-header
  * advisories and the unscanned pages (each folded into one line when there
  * is more than one, so they always fit), then the findings, most severe
- * first, while their kind has room; a ::notice counts the findings that did
- * not fit. Every interpolated value passes through logSafe: rule ids and help
- * text come from axe, but routes and selectors come from the app and its DOM,
- * and a newline would end the command and forge a second one.
+ * first, while their kind has room; a notice counts the findings that did
+ * not fit. Every line is ci/cli.mjs's annotationLine (R7-5), which flattens
+ * and bounds every value, escapes the title as a property and the message's
+ * "%": rule ids and help text come from axe, but routes and selectors come
+ * from the app and its DOM, and a newline would end the command and forge a
+ * second one. The pieces keep their own tighter bounds as well.
  *
  * @returns {string[]}
  */
@@ -437,42 +439,43 @@ export function annotations({ mode, result, outcome, ignores, routesWarning,
   headers = /** @type {Array<{header: string, ok: boolean, note: string}>} */ ([]) }) {
   const out = [];
   const room = { error: ANNOTATIONS_PER_KIND, warning: ANNOTATIONS_PER_KIND };
-  const emit = (kind, rest) => {
-    if (kind in room) {
-      if (room[kind] === 0) return false;
-      room[kind]--;
+  const emit = (level, fields) => {
+    if (level in room) {
+      if (room[level] === 0) return false;
+      room[level]--;
     }
-    out.push(`::${kind} ${rest}`);
+    out.push(annotationLine({ level, ...fields }));
     return true;
   };
   if (outcome.verdict === "did-not-run") {
-    const kind = outcome.exitCode === 1 ? "error" : "warning";
+    const level = outcome.exitCode === 1 ? "error" : "warning";
     const why = outcome.exitCode === 3 ? " (platform-side; not blocking)" : "";
-    emit(kind, `title=Accessibility scan did not run::${logSafe(result.error ?? "no route could be scanned", 300)}; this is not a clean result${why}`);
+    emit(level, { title: "Accessibility scan did not run", what: logSafe(result.error ?? "no route could be scanned", 300),
+      fix: `this is not a clean result${why}` });
   }
   if (outcome.landingFault && outcome.verdict !== "did-not-run") {
-    const kind = outcome.exitCode === 1 ? "error" : "warning";
-    emit(kind, `title=Accessibility: landing page not scanned::/ could not be scanned (${logSafe(outcome.landingFault, 120)}); ` +
-      "the landing page is always checked, so other clean routes do not make up for it");
+    const level = outcome.exitCode === 1 ? "error" : "warning";
+    emit(level, { title: "Accessibility: landing page not scanned", what: `/ could not be scanned (${logSafe(outcome.landingFault, 120)})`,
+      fix: "the landing page is always checked, so other clean routes do not make up for it" });
   }
   if (outcome.verdict === "not-applicable") {
-    emit("notice", "title=Accessibility scan not applicable::no route answered HTML (an API-only app); nothing to check");
+    emit("notice", { title: "Accessibility scan not applicable", what: "no route answered HTML (an API-only app); nothing to check" });
   }
-  if (routesWarning) emit("warning", `title=Accessibility routes::${logSafe(routesWarning, 300)}`);
+  if (routesWarning) emit("warning", { title: "Accessibility routes", what: logSafe(routesWarning, 300) });
   const bad = headers.filter((f) => !f.ok);
   if (bad.length === 1) {
-    emit("warning", `title=Response header (advisory): ${logSafe(bad[0].header, 60)}::${logSafe(bad[0].note, 160)}`);
+    emit("warning", { title: `Response header (advisory): ${logSafe(bad[0].header, 60)}`, what: logSafe(bad[0].note, 160) });
   } else if (bad.length > 1) {
-    emit("warning", `title=Response headers (advisory)::${bad.length} to review: ` +
-      bad.map((f) => `${logSafe(f.header, 60)}: ${logSafe(f.note, 100)}`).join("; "));
+    emit("warning", { title: "Response headers (advisory)",
+      what: `${bad.length} to review: ${bad.map((f) => `${logSafe(f.header, 60)}: ${logSafe(f.note, 100)}`).join("; ")}` });
   }
   const unscanned = result.pages.filter((p) => p.status !== "scanned");
   if (unscanned.length === 1) {
     const [p] = unscanned;
-    emit("warning", `title=Accessibility: page not scanned::${logSafe(p.route, 80)}: ${logSafe(p.reason ?? p.status, 160)}`);
+    emit("warning", { title: "Accessibility: page not scanned", what: `${logSafe(p.route, 80)}: ${logSafe(p.reason ?? p.status, 160)}` });
   } else if (unscanned.length > 1) {
-    emit("warning", `title=Accessibility: ${unscanned.length} pages not scanned::` +
-      unscanned.map((p) => `${logSafe(p.route, 80)} (${logSafe(p.reason ?? p.status, 100)})`).join("; "));
+    emit("warning", { title: `Accessibility: ${unscanned.length} pages not scanned`,
+      what: unscanned.map((p) => `${logSafe(p.route, 80)} (${logSafe(p.reason ?? p.status, 100)})`).join("; ") });
   }
   const rows = [];
   for (const p of result.pages) {
@@ -487,18 +490,13 @@ export function annotations({ mode, result, outcome, ignores, routesWarning,
   let dropped = 0;
   for (const { p, v } of rows) {
     const blocking = BLOCKING_IMPACTS.includes(v.impact ?? "");
-    const kind = mode === "enforce" && blocking ? "error" : "warning";
+    const level = mode === "enforce" && blocking ? "error" : "warning";
     const where = v.targets && v.targets.length ? ` e.g. ${logSafe(v.targets[0], 80)}` : "";
-    if (!emit(kind, `title=Accessibility (${logSafe(v.impact ?? "unknown", 10)}): ${logSafe(v.id, 40)}::` +
-      `${logSafe(p.route, 80)}: ${logSafe(v.help, 140)}; ${Number(v.nodes) || 0} element(s)${where}. ${logSafe(v.helpUrl ?? "", 120)}`)) dropped++;
+    if (!emit(level, { title: `Accessibility (${logSafe(v.impact ?? "unknown", 10)}): ${logSafe(v.id, 40)}`,
+      what: `${logSafe(p.route, 80)}: ${logSafe(v.help, 140)}; ${Number(v.nodes) || 0} element(s)${where}. ${logSafe(v.helpUrl ?? "", 120)}` })) dropped++;
   }
-  if (dropped > 0) emit("notice", `title=Accessibility::${dropped} more finding(s) in the step summary`);
-  // The runner decodes %25, %0D and %0A in a command's message, so a literal
-  // "%0A" in a route or selector would display as a line break: escape "%".
-  return out.map((line) => {
-    const at = line.indexOf("::", 2);
-    return at === -1 ? line : line.slice(0, at + 2) + line.slice(at + 2).replace(/%/g, "%25");
-  });
+  if (dropped > 0) emit("notice", { title: "Accessibility", what: `${dropped} more finding(s) in the step summary` });
+  return out;
 }
 
 /**
@@ -1023,7 +1021,8 @@ if (isMainModule(import.meta.url)) {
   // workflow also requires result.json to confirm exitCode 1 before it
   // blocks, which covers crashes before this module even loads.)
   const crashed = (e) => {
-    console.log(`::warning title=Accessibility scan crashed::${logSafe(e && e.message ? e.message : e, 200)} (platform-side; not blocking)`);
+    console.log(annotationLine({ level: "warning", title: "Accessibility scan crashed",
+      what: `${logSafe(e && e.message ? e.message : e, 200)} (platform-side; not blocking)` }));
     process.exit(3);
   };
   process.on("uncaughtException", crashed);

@@ -16,7 +16,7 @@
 
 import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { join, sep } from "node:path";
-import { isMainModule, logSafe } from "./cli.mjs";
+import { annotateAll, isMainModule, logSafe } from "./cli.mjs";
 
 // Headers every app's CLAUDE.md must carry, regardless of deployment type.
 const REQUIRED_CLAUDE_MD_HEADERS = [
@@ -115,26 +115,32 @@ function* walkTree(root, rel = "") {
  * 1b's scan of the app root, with 6b as its nested-.npmrc companion. The
  * survivors keep their original numbers so existing references don't shift.)
  *
+ * Each violation is its sentence and the repo-relative path it is about
+ * (`file`, null when it names none), which the CLI's annotation carries as
+ * its file= property.
+ *
  * @param {string} appDir
- * @returns {{ok: boolean, violations: string[]}}
+ * @returns {{ok: boolean, violations: Array<{ message: string, file: string | null }>}}
  */
 export function checkConfig(appDir) {
+  /** @type {Array<{ message: string, file: string | null }>} */
   const violations = [];
+  const violation = (file, message) => { violations.push({ message, file }); };
 
   // --- Check 1: CLAUDE.md has the shared headers + one of each variant pair ---
   const claudeMdPath = join(appDir, "CLAUDE.md");
   if (!existsSync(claudeMdPath)) {
-    violations.push("CLAUDE.md is missing");
+    violation("CLAUDE.md", "CLAUDE.md is missing");
   } else {
     const claudeMd = readFileSync(claudeMdPath, "utf8");
     for (const header of REQUIRED_CLAUDE_MD_HEADERS) {
       if (!claudeMd.includes(header)) {
-        violations.push(`CLAUDE.md is missing required header: "${header}"`);
+        violation("CLAUDE.md", `CLAUDE.md is missing required header: "${header}"`);
       }
     }
     for (const pair of CLAUDE_MD_HEADER_VARIANTS) {
       if (!pair.some((h) => claudeMd.includes(h))) {
-        violations.push(`CLAUDE.md is missing a required header (any variant): ${pair.map((h) => `"${h}"`).join(" or ")}`);
+        violation("CLAUDE.md", `CLAUDE.md is missing a required header (any variant): ${pair.map((h) => `"${h}"`).join(" or ")}`);
       }
     }
   }
@@ -155,21 +161,21 @@ export function checkConfig(appDir) {
     for (const entry of readdirSync(appDir, { withFileTypes: true })) {
       const name = entry.name;
       if (name === ".wrangler" && (entry.isDirectory() || entry.isSymbolicLink())) {
-        violations.push(
+        violation(name,
           `.wrangler/ must not be committed: it is a wrangler-generated cache/redirect directory ` +
             `(.wrangler/deploy/config.json can redirect the deploy to an unvetted config)`,
         );
         continue;
       }
       if (name === "wrangler.jsonc") {
-        violations.push(
+        violation(name,
           "delete wrangler.jsonc: the platform supplies the app's Worker config itself " +
             "(see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)",
         );
         continue;
       }
       if (COMPETING_WRANGLER_RE.test(name)) {
-        violations.push(
+        violation(name,
           `${name} is a wrangler config file: apps may not carry ANY wrangler config; the platform injects it ` +
             `(wrangler's config discovery could silently prefer it over the gate-vetted file)`,
         );
@@ -209,14 +215,14 @@ export function checkConfig(appDir) {
       // container app, whose job env pins CLOUDFLARE_API_BASE_URL. Reject
       // like .npmrc: an unpinned build input. (2026-07-22 review find.)
       if (/^\.env(\..+)?$/.test(name)) {
-        violations.push(
+        violation(name,
           `${name} must not be committed: wrangler loads .env files when it runs at the repository root (an app-set ` +
             `CLOUDFLARE_API_BASE_URL would redirect the build's own calls); remove it`,
         );
         continue;
       }
       if (ROOT_PACKAGE_MANAGER_CONFIG_RE.test(name)) {
-        violations.push(
+        violation(name,
           `${name} must not be committed: package manager config is an unpinned deploy-build input; remove it`,
         );
       }
@@ -319,7 +325,7 @@ export function checkConfig(appDir) {
           targetIsDir = null;
         }
         if (targetIsDir !== false) {          // a directory link, or dangling
-          violations.push(
+          violation(rel,
             `${rel} is a symlink to ${targetIsDir === null ? "an unresolvable path" : "a directory"} ` +
               `(-> ${target}); directory symlinks must not be committed, because the config gate ` +
               `inspects the tree without following them and content behind one is never checked`,
@@ -328,7 +334,7 @@ export function checkConfig(appDir) {
           // a file link: legal only if its target resolves inside the app tree
           const real = (() => { try { return realpathSync(abs); } catch { return null; } })();
           if (real === null || !(real === appRoot || real.startsWith(appRoot + sep))) {
-            violations.push(
+            violation(rel,
               `${rel} is a symlink whose target resolves outside your app (-> ${target}); ` +
                 `a committed file symlink must point inside your app, because the build reads the ` +
                 `target's bytes and a link out of the tree can bake files the gate never saw into your app`,
@@ -338,14 +344,14 @@ export function checkConfig(appDir) {
       }
       // check 6b: a nested .npmrc (the root one is check 6's, above)
       if (name === ".npmrc" && rel.includes("/")) {
-        violations.push(
+        violation(rel,
           `${rel} must not be committed: npm reads the .npmrc of whichever directory it runs in ` +
             `and expands \${VAR} from the environment into it (an unpinned deploy-build input); remove it`,
         );
       }
     }
   } catch (err) {
-    violations.push(
+    violation(null,
       `config-integrity check could not fully inspect the app tree (${err.path ?? appDir}: ` +
         `${err.code ?? err}); a directory the gate cannot read fails closed`,
     );
@@ -379,7 +385,7 @@ export function checkConfig(appDir) {
         // there", and skip the entries-based violation below (it would
         // otherwise report an empty list for a directory we never saw into).
         srcUnreadable = true;
-        violations.push(
+        violation("src",
           `delete src/: the platform owns src/ and it could not be read (${err.code ?? err}); ` +
             `a src/ the gate cannot inspect fails closed`,
         );
@@ -387,7 +393,7 @@ export function checkConfig(appDir) {
     }
     if (!srcUnreadable && (!srcStat.isDirectory() || entries.length > 0)) {
       const what = srcStat.isDirectory() ? entries.map((n) => `src/${n}`).join(", ") : "src is not a directory";
-      violations.push(
+      violation("src",
         `delete src/: the platform owns src/ (the gate refuses author files there; keep your code under app/): ${what} ` +
           `(see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)`,
       );
@@ -411,7 +417,7 @@ export function checkConfig(appDir) {
   let scaffoldPresent = false;
   try { lstatSync(join(appDir, "scaffold")); scaffoldPresent = true; } catch {}
   if (scaffoldPresent && !existsSync(join(appDir, "app", ".needs-build"))) {
-    violations.push(
+    violation("scaffold",
       "delete scaffold/: the deployment-type scaffold directory is template-only; registration prunes it out of app repos",
     );
   }
@@ -439,7 +445,7 @@ export function checkConfig(appDir) {
       // ENOENT: nothing at this path — compliant.
     }
     if (present) {
-      violations.push(
+      violation(relPath,
         `delete ${relPath}: the platform supplies the build inputs at the repository root itself (see APP-CONTRACT R7: get_app_contract, or docs/APP-CONTRACT.md)`,
       );
     }
@@ -449,17 +455,21 @@ export function checkConfig(appDir) {
 }
 
 /**
- * The CLI's lines, one per violation. A violation can carry a file name the
- * author wrote, so each passes through logSafe: no newline or control byte
- * reaches the runner's log, where `::error::` at a line start is a command.
- * @param {string[]} violations
+ * The CLI's lines, one per violation's message. A violation can carry a file
+ * name the author wrote, so each passes through logSafe: no newline or
+ * control byte reaches the runner's log, where a line that starts with a
+ * workflow command is one.
+ * @param {Array<{ message: string, file: string | null }>} violations
  * @returns {string[]}
  */
 export function violationLines(violations) {
-  return violations.map((violation) => `  - ${logSafe(violation, 1000)}`);
+  return violations.map((v) => `  - ${logSafe(v.message, 1000)}`);
 }
 
 // --- CLI wrapper ---
+// The plain lines list every violation in the step log; then one annotation
+// each (ci/cli.mjs annotateAll, R7-5), pointing at the file it names, bounded
+// to the ten a step can show, so the run page says what to fix.
 if (isMainModule(import.meta.url)) {
   const [appDir] = process.argv.slice(2);
   if (!appDir) {
@@ -471,7 +481,13 @@ if (isMainModule(import.meta.url)) {
   if (!ok) {
     console.error("config-integrity check FAILED:");
     for (const line of violationLines(violations)) console.error(line);
-    process.exit(1);
+    annotateAll({
+      title: "Config integrity",
+      fix: "fix it as get_app_contract R7 says, then push again",
+      items: violations.map((v) => ({ what: v.message, ...(v.file ? { file: v.file } : {}) })),
+    });
+    process.exitCode = 1;
+  } else {
+    console.log("config-integrity check passed.");
   }
-  console.log("config-integrity check passed.");
 }

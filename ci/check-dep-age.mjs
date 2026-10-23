@@ -24,7 +24,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { isMainModule, logSafe } from "./cli.mjs";
+import { annotate, annotateAll, isMainModule, logSafe } from "./cli.mjs";
 
 const DAY_MS = 86_400_000;
 
@@ -196,6 +196,10 @@ export async function checkDepAge({ appDir, thresholdDays, functionShaped = fals
 
 // --- CLI --------------------------------------------------------------------
 
+// The repo-relative manifest an entry of each ecosystem is pinned in, the
+// file its annotation points at.
+const manifestOf = (ecosystem) => (ecosystem === "pypi" ? "app/requirements.txt" : "app/package-lock.json");
+
 // Exported so the gate's exit code is testable; the CLI block below is the
 // only production caller. `appDir`/`thresholdDays`/`functionShaped` fall back
 // to argv/env; only FUNCTION_SHAPED "true" reads as a function app, so a
@@ -212,15 +216,22 @@ export async function main({ appDir, thresholdDays, functionShaped } = {}) {
   // logSafe on the name and the version, not on `ecosystem` (a literal this
   // script chose). Both come from the app's own package-lock.json or
   // requirements.txt, parsed here before npm or pip has validated anything: a
-  // JSON key may contain a newline, and a newline inside a workflow command
-  // ends it and forges a clean second command line in the run's log. Same
-  // class ci/deploy-finalize.mjs documents for the declaration file.
-  //
-  // console.log is correct HERE and must stay: nothing parses this script's
-  // stdout. Do not harmonise it with deploy-finalize.mjs, whose stdout IS
-  // piped into `jq` under `set -e` and whose warnings must be on stderr.
-  for (const s of skipped) {
-    console.log(`::warning title=Dependency age unknown::${s.ecosystem}:${logSafe(s.name)}@${logSafe(s.version)}: no publish date from the registry; skipped`);
+  // JSON key may contain a newline, and a newline inside a log line ends it
+  // and forges a clean second command line in the run's log. Same class
+  // ci/deploy-finalize.mjs documents for the declaration file. The
+  // annotations (ci/cli.mjs annotate and annotateAll, R7-5) flatten their
+  // values the same way, and print on stderr beside these lines.
+  if (skipped.length > 0) {
+    console.error(`dep-age: ${skipped.length} dependency version(s) have no publish date from the registry, so the cooldown skipped them:`);
+    for (const s of skipped) console.error(`  - ${s.ecosystem}:${logSafe(s.name)}@${logSafe(s.version)}`);
+    annotateAll({
+      level: "warning",
+      title: "Dependency age unknown",
+      items: skipped.map((s) => ({
+        file: manifestOf(s.ecosystem),
+        what: `${s.ecosystem}:${logSafe(s.name)}@${logSafe(s.version)}: no publish date from the registry; skipped`,
+      })),
+    });
   }
   // Reaching here means an admin explicitly set safety.min_release_age_days:
   // they asked for a cooldown. Without a committed lockfile there are no exact
@@ -233,13 +244,15 @@ export async function main({ appDir, thresholdDays, functionShaped } = {}) {
   // being ON is the opt-in; a committed app lockfile is not otherwise required
   // by the app contract.
   if (unpinnedNpm) {
-    console.error(
-      "::error title=Dependency cooldown cannot be applied::app/package.json has no committed, " +
-      "parseable app/package-lock.json, so there are no exact npm versions to date (and the app-build " +
-      `job refuses a function-shaped app without one anyway, R11). This app cannot satisfy the ${thresholdDays}-day cooldown its ` +
-      "safety.min_release_age_days setting requires. Commit app/package-lock.json, or ask a platform " +
-      "admin to set safety.min_release_age_days to 0 for this app.",
-    );
+    annotate({
+      title: "Dependency cooldown",
+      file: "app/package-lock.json",
+      what: "app/package.json has no committed, " +
+        "parseable app/package-lock.json, so there are no exact npm versions to date (and the app-build " +
+        `job refuses a function-shaped app without one anyway, R11). This app cannot satisfy the ${thresholdDays}-day cooldown its ` +
+        "safety.min_release_age_days setting requires",
+      fix: "commit app/package-lock.json, or ask a platform admin to set safety.min_release_age_days to 0 for this app",
+    });
   }
   // Violations print even when unpinnedNpm already failed the run: a Python
   // app with cooldown violations AND an unpinned package.json should learn
@@ -247,12 +260,19 @@ export async function main({ appDir, thresholdDays, functionShaped } = {}) {
   if (violations.length > 0) {
     console.error(`dep-age: ${violations.length} dependency version(s) younger than the ${thresholdDays}-day cooldown:`);
     for (const v of violations) {
-      // logSafe for the same reason as the skipped-warning above: Actions
+      // logSafe for the same reason as the skipped lines above: Actions
       // reads workflow commands off stderr too, so an author-chosen newline
       // in a package name forges one from this line just as well.
       console.error(`  - ${v.ecosystem}:${logSafe(v.name)}@${logSafe(v.version)} published ${v.ageDays} day(s) ago`);
     }
-    console.error("Pin an older, vetted version, or ask a platform admin to lower safety.min_release_age_days for this app.");
+    // The file the young versions are pinned in, when they share one.
+    const files = new Set(violations.map((v) => manifestOf(v.ecosystem)));
+    annotate({
+      title: "Dependency cooldown",
+      file: files.size === 1 ? [...files][0] : undefined,
+      what: `${violations.length} dependency version(s) younger than the ${thresholdDays}-day cooldown`,
+      fix: "pin an older, vetted version, or ask a platform admin to lower safety.min_release_age_days for this app",
+    });
   }
   if (unpinnedNpm || violations.length > 0) return 1;
   console.log(`dep-age: ${checked} pinned dependency version(s) checked; all at least ${thresholdDays} day(s) old.`);
@@ -260,5 +280,14 @@ export async function main({ appDir, thresholdDays, functionShaped } = {}) {
 }
 
 if (isMainModule(import.meta.url)) {
-  main().then((code) => process.exit(code)).catch((e) => { console.error(e); process.exit(1); });
+  // A crash is the gate's failure too, said the way its verdicts are (an
+  // unreadable manifest's error can quote what it read, so it is flattened).
+  main().then((code) => process.exit(code)).catch((e) => {
+    annotate({
+      title: "Dependency cooldown",
+      what: logSafe(String(e?.message ?? e)),
+      fix: "re-run the workflow; if it repeats, ask a platform admin",
+    });
+    process.exit(1);
+  });
 }

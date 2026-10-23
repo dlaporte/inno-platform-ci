@@ -23,8 +23,10 @@
 //
 // withBusyRetry, last below, is the one retry of the broker's lease refusal
 // (409 app_busy) on the one schedule, BUSY_RETRY_DELAYS_MS: tenant CI's
-// token request (ci/deploy-token.mjs) and finalize (ci/deploy-finalize.mjs)
-// both run through it.
+// token request (ci/deploy-token.mjs), finalize (ci/deploy-finalize.mjs) and
+// release of a failed deploy's app (ci/deploy-abandon.mjs) all run through
+// it. refusalParts reads a refusal's code and sentence apart, for the CLIs
+// that annotate one.
 //
 // Every request is bounded: no answer, or no end to it, within the caller's
 // timeoutMs (BROKER_TIMEOUT_MS when absent) throws
@@ -32,11 +34,12 @@
 // connection and never answers cannot hold a job until its own timeout. The
 // default is the short reports' (an SBOM, a sweep's or the dependency gate's
 // results, an export's end, an R2 list, an operator script's Cloudflare
-// call), whose answers are quick. The token request and the finalize each
-// wait on a bound of their own (ci/deploy-token.mjs DEPLOY_TOKEN_TIMEOUT_MS,
-// ci/deploy-finalize.mjs FINALIZE_TIMEOUT_MS): the first is shorter, the
-// second longer, since a container app's finalize answers only after the
-// platform has rolled the image out and uploaded the host.
+// call), whose answers are quick. The token request, the finalize and the
+// release each wait on a bound of their own (ci/deploy-token.mjs
+// DEPLOY_TOKEN_TIMEOUT_MS, ci/deploy-finalize.mjs FINALIZE_TIMEOUT_MS,
+// ci/deploy-abandon.mjs ABANDON_TIMEOUT_MS): the first and the last are
+// shorter, the finalize longer, since a container app's finalize answers only
+// after the platform has rolled the image out and uploaded the host.
 //
 // One import on purpose, ./cli.mjs, for logSafe, the ci/ log sanitiser: it
 // ships beside this file in the mirror manifest and imports only Node's own
@@ -54,24 +57,42 @@ export const REFUSAL_MESSAGE_MAX_CHARS = 4000;
 // How long a request waits for its answer when its caller names no bound.
 export const BROKER_TIMEOUT_MS = 180_000;
 
+/**
+ * The two parts of a broker refusal, read from an answer's body: `error`, the
+ * code, and `message`, the platform's sentence, which names the fix. Each is
+ * its string flattened by logSafe (parsing turns the JSON's escapes back into
+ * the characters they stand for, a newline among them, which would start a
+ * forged workflow command in the run's log), the code bounded at 200
+ * characters and the sentence at REFUSAL_MESSAGE_MAX_CHARS; a part the body
+ * does not carry as a string, and both for a body that is not a JSON object,
+ * is null. The CLIs that annotate a refusal (ci/deploy-token.mjs,
+ * ci/deploy-finalize.mjs, ci/deploy-abandon.mjs) read it from the error's
+ * `body`.
+ *
+ * @param {string} text
+ * @returns {{ error: string | null, message: string | null }}
+ */
+export function refusalParts(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return { error: null, message: null }; }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return { error: null, message: null };
+  return {
+    error: typeof j.error === "string" ? logSafe(j.error) : null,
+    message: typeof j.message === "string" ? logSafe(j.message, REFUSAL_MESSAGE_MAX_CHARS) : null,
+  };
+}
+
 // What the thrown error says of a non-2xx answer. A JSON refusal with a string
 // `error` and `message`, the shape every broker refusal takes, reads as
-// `<error>: <message>`, so the log shows the platform's sentence (and, for a
-// script_rejected, Cloudflare's reason for refusing the Worker upload) rather than
-// its first 200 characters cut inside the JSON framing. Parsing turns the
-// JSON's escapes back into the characters they stand for, a newline among
-// them, which would start a forged workflow command in the run's log, so
-// both fields pass through logSafe. Any other answer, an HTML error page or
-// a refusal without both fields (`{"error":"app_busy"}`), is its first 200
+// `<error>: <message>` (refusalParts, flattened and bounded), so the log
+// shows the platform's sentence (and, for a script_rejected, Cloudflare's
+// reason for refusing the Worker upload) rather than its first 200 characters
+// cut inside the JSON framing. Any other answer, an HTML error page or a
+// refusal without both fields (`{"error":"app_busy"}`), is its first 200
 // characters, as it always was.
 function refusalText(text) {
-  try {
-    const j = JSON.parse(text);
-    if (j && typeof j.error === "string" && typeof j.message === "string") {
-      return `${logSafe(j.error)}: ${logSafe(j.message, REFUSAL_MESSAGE_MAX_CHARS)}`;
-    }
-  } catch { /* not JSON: the raw text below */ }
-  return text.slice(0, 200);
+  const { error, message } = refusalParts(text);
+  return error !== null && message !== null ? `${error}: ${message}` : text.slice(0, 200);
 }
 
 /**

@@ -23,11 +23,18 @@
 // log it cannot read, or an unresolved package that is already a production
 // dependency, which means the bundle failed for some other reason.
 //
+// The annotations follow the one rule (ci/cli.mjs annotateAll, R7-5): one
+// call per title, the two sharing the step's ten lines, on stderr. The
+// bundle step tees wrangler's log above them, which names every unresolved
+// import, so a last line counting the rest points at a log that holds them.
+//
 // Imports nothing from src/. ci/*.mjs is a separate, zero-dependency build
 // published to the public inno-platform-ci mirror and run on third-party
-// runners, where only `node:` modules are available.
+// runners, where only `node:` modules are available; ci/cli.mjs, its one
+// local import, ships beside it.
 
 import { readFileSync } from "node:fs";
+import { ANNOTATIONS_PER_STEP, annotateAll } from "./cli.mjs";
 
 // wrangler surfaces esbuild's wording verbatim, in double quotes
 // (`✘ [ERROR] Could not resolve "vitest"`), sometimes followed by a resolved
@@ -97,6 +104,8 @@ const dev = manifest.devDependencies ?? {};
 // package once per import site, and three copies of one explanation is noise
 // the author has to read past to find the second problem.
 const seen = new Set();
+const devImports = [];
+const undeclared = [];
 for (const m of log.matchAll(UNRESOLVED)) {
   const pkg = packageOf(m[1]);
   if (pkg === null || seen.has(pkg)) continue;
@@ -111,19 +120,35 @@ for (const m of log.matchAll(UNRESOLVED)) {
     // re-resolves it and rewrites an exact pin as a range. The subshell leaves
     // the author's shell at the repo root, where the commit runs. pkg is safe
     // inside single quotes: NPM_NAME admits no quote.
-    console.log(
-      `::error title=devDependency imported at runtime::"${pkg}" is declared under devDependencies in `
-      + "app/package.json but your production code imports it. Since platform v0.14.21 CI installs "
-      + "production dependencies only (npm ci --omit=dev), so it is not present at bundle time. Move it: "
-      + `(cd app && p='${pkg}' && spec="$(npm pkg get "devDependencies[$p]" | tr -d '"')" && test "$spec" != "{}" `
-      + `&& npm pkg set "dependencies[$p]=$spec" && npm pkg delete "devDependencies[$p]" && npm install `
-      + "--package-lock-only), commit app/package.json and app/package-lock.json, then push again. The dependency "
-      + "gate will audit it from then on.",
-    );
+    devImports.push({
+      what: `"${pkg}" is declared under devDependencies in `
+        + "app/package.json but your production code imports it. Since platform v0.14.21 CI installs "
+        + "production dependencies only (npm ci --omit=dev), so it is not present at bundle time. Move it: "
+        + `(cd app && p='${pkg}' && spec="$(npm pkg get "devDependencies[$p]" | tr -d '"')" && test "$spec" != "{}" `
+        + `&& npm pkg set "dependencies[$p]=$spec" && npm pkg delete "devDependencies[$p]" && npm install `
+        + "--package-lock-only)",
+    });
   } else {
-    console.log(
-      `::error title=Undeclared import::"${pkg}" is imported by your production code but not declared in `
-      + `app/package.json. Declare it: cd app && npm install ${pkg}, commit both manifest files, then push again.`,
-    );
+    undeclared.push({
+      what: `"${pkg}" is imported by your production code but not declared in `
+        + `app/package.json. Declare it: cd app && npm install ${pkg}`,
+    });
   }
 }
+// The two titles share the step's ANNOTATIONS_PER_STEP lines. Each list
+// shows whole while both fit; past that, the first keeps at least half,
+// and as much more as the second leaves free, and the second takes the rest.
+const devLimit = undeclared.length === 0 ? ANNOTATIONS_PER_STEP
+  : Math.max(ANNOTATIONS_PER_STEP - undeclared.length, ANNOTATIONS_PER_STEP / 2);
+annotateAll({
+  title: "devDependency imported at runtime",
+  fix: "commit app/package.json and app/package-lock.json, then push again. The dependency gate will audit it from then on.",
+  items: devImports,
+  limit: devLimit,
+});
+annotateAll({
+  title: "Undeclared import",
+  fix: "commit both manifest files, then push again.",
+  items: undeclared,
+  limit: ANNOTATIONS_PER_STEP - Math.min(devImports.length, devLimit),
+});

@@ -33,8 +33,13 @@ name: Platform CI
 #     `if:`-skipped, because a skipped needed job skips `deploy` unless
 #     deploy's `if:` drops its implicit success() check, and weakening that
 #     check would turn any future expression bug into a silent gate bypass.
-#     Policy-fetch failure falls back to the SECURE default (all gates on,
-#     no ignores) without failing the build.
+#     The policy fetch tells a refusal from an outage. A refusal (the
+#     broker answers a 4xx other than 401 and 429 with its JSON error: an
+#     app this repository is not registered as, an unlinked repository)
+#     fails the policy job with the broker's reason, since /deploy-token
+#     would refuse the same app. An outage (no answer, a 5xx, a 401, a 429,
+#     or a body that is not the broker's) falls back to the SECURE default
+#     (all gates on, no ignores) without failing the build.
 #   - REPORT steps are not gates, and say so in their names: the
 #     accessibility + response-header report and the Dockerfile
 #     misconfiguration report (contract 22, R8) run inside the container job.
@@ -158,7 +163,7 @@ jobs:
               ;;
           esac
           if [ "$valid" -ne 1 ] || [ "${#APP}" -gt 29 ]; then
-            echo "::error title=Invalid app name::the app name must match ^[a-z][a-z0-9-]{2,28}\$: fix the \`with: app:\` value in your deploy.yml"
+            echo '::error title=Invalid app name,file=.github/workflows/deploy.yml::the app name must match ^[a-z][a-z0-9-]{2,28}$; fix the `with: app:` value in .github/workflows/deploy.yml' >&2
             exit 1
           fi
           # Heredoc-delimited even though the grammar above already forbids a
@@ -179,14 +184,25 @@ jobs:
             core.setSecret(token);
             core.setOutput('token', token);
 
-      - name: Fetch gate policy (any failure => ALL gates on, NO ignores)
+      - name: Fetch gate policy (a refusal fails; an outage runs every gate)
         id: fetch
         env:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
           APP: ${{ steps.app.outputs.app }}
         run: |
-          # This step must NEVER fail the job: a broker outage must not block
-          # deploys, and the fallback is the SECURE direction (everything on).
+          # A refusal fails this job; an outage never does (R7-4). A refusal
+          # is an answer whose status is a 4xx other than 401 and 429 and
+          # whose body is the broker's JSON with a string `error`
+          # (app_mismatch, repo_unlinked, a provenance pin): /deploy-token
+          # refuses the same app, so running the gates on a guessed policy
+          # would only move the failure somewhere it says less (a function
+          # app's doomed docker build). Anything else, no answer, a 5xx, a 401
+          # (the platform could not verify this run's token, which a fault of
+          # its own, a JWKS or issuer read, answers too; a release still fails
+          # closed at /deploy-token's same 401), a 429 (a brake is an outage,
+          # not a verdict on the app), any other status or a body that is not
+          # the broker's, must not block a deploy, and falls back to the
+          # SECURE direction (everything on) (build decision 16).
           emit_defaults() {
             echo "::warning title=Gate policy unavailable::running all gates with no ignores (secure default)"
             for g in semgrep trivy gitleaks deps; do echo "gates_$g=true" >> "$GITHUB_OUTPUT"; done
@@ -212,10 +228,47 @@ jobs:
             # headers every app was scanned with before identity existed.
             echo "identity=identity-aware" >> "$GITHUB_OUTPUT"
           }
-          resp="$(curl -sS --max-time 15 --retry 2 -X POST "$BROKER_URL/ci/policy" \
+          # The refusal's annotation, built here because this job has no
+          # mirror checkout to run ci/annotate.mjs from: ci/cli.mjs
+          # annotationLine's rule as a jq program, which
+          # test/annotate-parity.node.test.ts holds to it over hostile bodies
+          # (logSafe's control-character flattening, its "##[" break and its
+          # UTF-16 cut, then the message's "%" escape). It prints nothing for
+          # a body that is not one JSON object with a string `error`, and jq
+          # fails on one that is not JSON at all; both read as an outage.
+          refusal="$(cat <<'JQ'
+          def cut($n): reduce explode[] as $c ({u: 0, o: []};
+            if .u >= $n then .
+            elif $c > 65535 then (if .u + 2 <= $n then .o += [$c] | .u += 2 else .o += [65533] | .u += 1 end)
+            else .o += [$c] | .u += 1 end) | .o | implode;
+          def safe($n): tostring | gsub("[\\x00-\\x1f\\x7f]+"; " ") | gsub("##\\["; "## [") | cut($n);
+          if length == 1 and (.[0] | type) == "object" and (.[0].error | type) == "string" then .[0]
+          | ("the platform refused this repository's CI for app \"\($app)\" (\(.error))" | safe(600)) as $what
+          | (if (.message | type) == "string" then .message else "the platform gave no reason; a platform admin can find it in the platform's audit log (its deploy_denied rows) or its Worker log" end | safe(600)) as $fix
+          | "::error title=Platform refused this app::" + (if $fix != "" then "\($what); \($fix)" else $what end | gsub("%"; "%25"))
+          else empty end
+          JQ
+          )"
+          # The body goes to a file and the status to stdout, so the two are
+          # judged apart; the file is emptied first, so a body curl never
+          # wrote reads as none.
+          : > "$RUNNER_TEMP/policy.json"
+          code="$(curl -sS -o "$RUNNER_TEMP/policy.json" -w '%{http_code}' --max-time 15 --retry 2 -X POST "$BROKER_URL/ci/policy" \
             -H "Authorization: Bearer $OIDC_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"app\":\"$APP\"}")" || { emit_defaults; exit 0; }
+          case "$code" in
+            200) ;;
+            401|429) emit_defaults; exit 0 ;;
+            4??)
+              if line="$(jq -rs --arg app "$APP" "$refusal" "$RUNNER_TEMP/policy.json" 2>/dev/null)" && [ -n "$line" ]; then
+                printf '%s\n' "$line" >&2
+                exit 1
+              fi
+              emit_defaults; exit 0 ;;
+            *) emit_defaults; exit 0 ;;
+          esac
+          resp="$(cat "$RUNNER_TEMP/policy.json")"
           if ! printf '%s' "$resp" | jq -e '.gates | type == "object"' >/dev/null 2>&1; then
             emit_defaults
             exit 0
@@ -302,32 +355,117 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.enabled == 'true'
         with:
+          # Every branch and every tag with its whole history, which is what
+          # the scan below reads.
           fetch-depth: 0
           # Same rule as every other app checkout here, and safe for the
-          # scan: at the SHA pinned below, gitleaks-action executes only the
-          # `gitleaks` binary (detect --redact -v --exit-code=2, with
-          # --log-opts) over the history this checkout has ALREADY fetched,
-          # and reaches the GitHub API with its own token. It runs no git
-          # fetch, pull, push, clone or ls-remote, so there is nothing in this
-          # job that would use a credential left in .git/config.
+          # scan: the gitleaks binary reads the history this checkout has
+          # ALREADY fetched (`git log`, and `git ls-remote --get-url`, which
+          # prints the configured remote's URL without contacting it). It runs
+          # no git fetch, pull, push or clone, so there is nothing in this job
+          # that would use a credential left in .git/config.
           persist-credentials: false
 
-      - name: gitleaks
+      # The secret scan (v0.17.6, OPEN 109) runs the gitleaks binary itself,
+      # not gitleaks/gitleaks-action, which, at the SHA it was pinned to,
+      # exited 0 with "No commits to scan" on a push whose commits list is
+      # empty, as every v* tag push is, so every release deployed unscanned,
+      # and on a push scanned only that push's own commits. With no
+      # third-party action there is no license rule either (the action wanted
+      # a paid GITLEAKS_LICENSE on an organization's repositories; the binary
+      # is MIT-licensed and wants none), and no step after the checkout holds
+      # a token.
+      - name: Install gitleaks 8.24.3 (checksum verified)
         if: steps.gate.outputs.enabled == 'true'
-        # Exact-pinned by commit SHA (= v3.0.0) like the Trivy image below: a
-        # floating major tag lets the gate's behavior drift with no repo diff.
-        # v3.0.0 is v2.3.9 moved from Node 20 to Node 24 and nothing else: its
-        # src/ is byte for byte v2.3.9's, so the scan flags, the default
-        # gitleaks binary (8.24.3) and the license rule (an organization
-        # account needs GITLEAKS_LICENSE, a personal one does not) are as before.
-        # No central per-finding ignores for gitleaks (its fingerprints are
-        # commit-bound and rebase-fragile); the app's own .gitleaksignore is
-        # the supported suppression surface.
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        # The release tarball is pinned by its sha256 (from the release's
+        # gitleaks_8.24.3_checksums.txt) and checked before anything is
+        # extracted; only the gitleaks binary comes out of it. The download
+        # is bounded, as the axe-core one is, so a stalled one fails the step
+        # rather than holding the job to its timeout.
+        run: |
+          curl -fsSL --max-time 120 --retry 2 -o "$RUNNER_TEMP/gitleaks.tgz" https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" version
+
+      - name: Write the platform's gitleaks configuration
+        if: steps.gate.outputs.enabled == 'true'
+        # gitleaks' default configuration and nothing of the app's: its
+        # default rules, and with them its default allowlist, which skips,
+        # among others, dependency directories (node_modules/, Go's and
+        # Ruby's vendor/ trees, Python virtual environments), lockfiles,
+        # images, fonts, archives and binary documents, any path containing
+        # gitleaks.toml, and placeholder values (APP-CONTRACT R8's gitleaks
+        # row names the paths). The scan passes this file with --config,
+        # which gitleaks reads before anything else, so a .gitleaks.toml the
+        # app commits (which could allowlist every path) is never read.
+        run: |
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+
+      - name: gitleaks (every commit the checkout holds)
+        if: steps.gate.outputs.enabled == 'true'
+        # One scan on every event. gitleaks runs `git log -p -U0` with the
+        # --log-opts given: --full-history --all (its own default) reads every
+        # commit on every branch and tag the checkout fetched, so a push, a v*
+        # tag release and a platform rebuild or respin scan the same history,
+        # and --diff-merges=remerge adds each two-parent merge's own
+        # resolution, for which plain `git log -p` prints no diff (git skips
+        # remerge for an octopus merge, so that one's own content is not
+        # read; APP-CONTRACT R8 says so), and --no-renames reads a renamed
+        # file whole at its new path, so a secret committed under a path the
+        # defaults skip (node_modules/, say) and then moved is read where it
+        # lands (build decision 22). The platform's --config above means a
+        # committed .gitleaks.toml is not read, and
+        # --ignore-gitleaks-allow means a `gitleaks:allow` comment on a line
+        # does nothing (as --disable-nosem does for semgrep below). The app's
+        # one waiver is a .gitleaksignore at its repository root: one
+        # fingerprint per line, as the step log prints it with each finding
+        # (commit:file:rule:line for that commit, or file:rule:line for every
+        # commit; a file a merge resolved a conflict in is named b/<file> in
+        # that merge's findings). No central per-finding ignores for gitleaks
+        # (its fingerprints are commit- or path-bound). --redact keeps each
+        # secret out of the log.
+        #
+        # The annotation (R7-5) tells the failures apart by exit code:
+        # gitleaks exits 2 (its --exit-code) for a finding, which is the
+        # author's to fix, and 1 when it could not scan, usually the
+        # platform's, so that line says to re-run and then ask a platform
+        # admin (build decisions 18 and 20). Either non-zero exit fails the
+        # gate: do not add continue-on-error here.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # gitleaks-action exits non-zero on any finding by default, and that
-          # failure is the gate. Do not add continue-on-error here.
+          # git's empty tree as the attribute source (build decision 20):
+          # `git log -p` otherwise reads the working tree's .gitattributes,
+          # where a committed `* -diff` or `* binary` turns every file into
+          # "Binary files differ" and the scan reads nothing. git reads this
+          # variable from 2.41, and the step asks for 2.42 to be safe (remerge
+          # needs 2.36); an older git ignores it without a word, so the step
+          # refuses to scan with one, or with a version it cannot read. git's
+          # own binary detection stays: a change with a NUL byte near the
+          # start of either side prints "Binary files differ" and is not
+          # read. That gap is accepted (build decision 22): the scan guards
+          # against a secret committed by mistake, and --text would diff
+          # every binary blob on every run to stop only a crafted commit.
+          GIT_ATTR_SOURCE: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+        run: |
+          git_ok=false
+          if [[ "$(git version)" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            if [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 42 ]; }; then git_ok=true; fi
+          fi
+          if [ "$git_ok" != true ]; then
+            echo "::error title=Gitleaks::the scan needs git 2.42 or later and the runner's is older or its version could not be read, so nothing was scanned; ask a platform admin" >&2
+            exit 1
+          fi
+          status=0
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" detect --source . --config "$RUNNER_TEMP/gitleaks.toml" --log-opts="--full-history --all --diff-merges=remerge --no-renames" --ignore-gitleaks-allow --redact -v --exit-code=2 || status=$?
+          if [ "$status" -eq 2 ]; then
+            echo "::error title=Secret scan (gitleaks),file=.gitleaksignore::a secret is committed somewhere in the repository's history; the step log names each finding's commit, file and rule (the secret redacted): rotate the secret, then remove it from the history or add the finding's fingerprint to .gitleaksignore" >&2
+          elif [ "$status" -ne 0 ]; then
+            echo "::error title=Gitleaks::gitleaks exited $status without a verdict; re-run the workflow, and if it repeats ask a platform admin" >&2
+          fi
+          exit "$status"
 
   # No job container: Semgrep installs from PyPI (ci/semgrep.lock says why),
   # so the job runs on the runner itself and pulls nothing from Docker Hub.
@@ -429,13 +567,26 @@ jobs:
         # (test/, tests/, build/, dist/, vendor/, node_modules/ and similar),
         # unchanged by this step. A false positive is still ignored centrally,
         # through the admin-set --exclude-rule list below.
+        #
+        # The scan's annotation (R7-5) tells the two failures apart by exit
+        # code: with --error, semgrep exits 1 for a blocking finding, which is
+        # the author's to fix, and 2 or more when it could not run at all (a
+        # ruleset it could not fetch, a bad flag), which is the platform's and
+        # is titled like the other install faults (build decision 14).
         env:
           IGNORES: ${{ needs.policy.outputs.ignores_semgrep }}
         run: |
           find . -depth -name .semgrepignore -exec rm -rf {} \;
           set -- --config p/owasp-top-ten --error --disable-nosem
           for id in $IGNORES; do set -- "$@" --exclude-rule "$id"; done
-          semgrep "$@" --exclude=/src .
+          status=0
+          semgrep "$@" --exclude=/src . || status=$?
+          if [ "$status" -eq 1 ]; then
+            echo "::error title=SAST (semgrep)::the OWASP Top Ten ruleset found a blocking finding; the step log names each finding's file, line and rule: fix the code, or ask a platform admin for safety.ignore.semgrep.<rule id> if it is a false positive" >&2
+          elif [ "$status" -ne 0 ]; then
+            echo "::error title=Semgrep::semgrep exited $status without a verdict (platform-side); re-run the workflow" >&2
+          fi
+          exit "$status"
 
   deps:
     runs-on: ubuntu-26.04
@@ -506,15 +657,19 @@ jobs:
           IGNORES: ${{ needs.policy.outputs.ignores_deps }}
         run: |
           if [ -f app/requirements.txt ]; then
-            # Hash-pinned install set (R25): gitleaks is pinned by SHA, trivy by
-            # digest and semgrep by ci/semgrep.lock's hashes, and pip-audit was
-            # the lone scanner installed from PyPI unpinned, so its ruleset and
-            # engine could drift between two runs of the same commit with no
-            # repo diff.
+            # Hash-pinned install set (R25): gitleaks by a checksum-verified
+            # release download, trivy by digest and semgrep by ci/semgrep.lock's
+            # hashes, and pip-audit was the lone scanner installed from PyPI
+            # unpinned, so its ruleset and engine could drift between two runs
+            # of the same commit with no repo diff.
             python3 -m pip install --quiet --require-hashes -r inno-platform-ci/ci/pip-audit.lock
             set --
             for id in $IGNORES; do set -- "$@" --ignore-vuln "$id"; done
-            python3 -m pip_audit -r app/requirements.txt "$@"
+            # pip-audit's exit cannot tell a finding from a crash: one annotation for both.
+            python3 -m pip_audit -r app/requirements.txt "$@" || {
+              echo "::error title=Dependency gate,file=app/requirements.txt::pip-audit found a known vulnerability in app/requirements.txt; upgrade the packages the step log names to a fixed version, or ask a platform admin for safety.ignore.deps.<id> if one does not apply" >&2
+              exit 1
+            }
           else
             echo "no app/requirements.txt, skipping pip-audit"
           fi
@@ -590,9 +745,13 @@ jobs:
       # lock: the app checkout's root IS the `docker build` context below, so a
       # mirror checkout left inside it would be in the image's build context,
       # and one removed after the app checkout would take an author directory
-      # of the same name with it. A function-shaped app builds no image, so
-      # neither step runs for one. (The ci/ scripts the later steps run come
-      # from the second mirror checkout, after the build.)
+      # of the same name with it. The annotation helper (ci/annotate.mjs, with
+      # the ci/cli.mjs it imports) leaves with it, into $RUNNER_TEMP/annotate:
+      # the two contract steps after the build end a refusal with its
+      # annotation (R7-5), before the second mirror checkout. A function-shaped
+      # app builds no image, so neither step runs for one. (The ci/ scripts
+      # the later steps run come from the second mirror checkout, after the
+      # build.)
       - name: Checkout inno-platform-ci (the registry mirror script)
         if: needs.policy.outputs.function_shaped != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -605,10 +764,12 @@ jobs:
           # clean up the token file it would otherwise leave in RUNNER_TEMP.
           persist-credentials: false
 
-      - name: Copy the registry mirror script out of the mirror checkout
+      - name: Copy the registry mirror script and the annotation helper out of the mirror checkout
         if: needs.policy.outputs.function_shaped != 'true'
         run: |
           cp inno-platform-ci/ci/registry-mirror.sh "$RUNNER_TEMP/registry-mirror.sh"
+          mkdir -p "$RUNNER_TEMP/annotate"
+          cp inno-platform-ci/ci/annotate.mjs inno-platform-ci/ci/cli.mjs "$RUNNER_TEMP/annotate/"
           rm -rf inno-platform-ci
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -712,10 +873,18 @@ jobs:
           user="$(docker inspect --format='{{.Config.User}}' app-under-test | tr '\000' '\001')"
           # What the messages print: Config.User with anything outside
           # printable ASCII shown as "?", so a line break in it cannot write a
-          # workflow command into the log.
-          shown="$(printf '%s' "$user" | LC_ALL=C tr -c ' -~' '?')"
+          # workflow command into the log, and the runner's old command
+          # marker "##[" broken to "## [", as ci/cli.mjs logSafe breaks it,
+          # since the runner acts on it anywhere in a line. Each refusal's
+          # plain line is followed by its "Container contract" annotation
+          # (R7-5), from the helper the copy-out step put in
+          # $RUNNER_TEMP/annotate.
+          shown="$(printf '%s' "$user" | LC_ALL=C tr -c ' -~' '?' | sed 's/##\[/## [/g')"
           refuse() {
             echo "container-validate: User='$shown' $1" >&2
+            node "$RUNNER_TEMP/annotate/annotate.mjs" --title "Container contract" --file Dockerfile \
+              --what "container-validate: User='$shown' $1" \
+              --fix "run as a non-root user (a USER with a numeric UID other than 0 in the Dockerfile)"
             exit 1
           }
           # `0:0` and `root:root` are neither "", "root" nor "0", so the old
@@ -799,7 +968,14 @@ jobs:
 
           ports="$(docker inspect --format='{{json .Config.ExposedPorts}}' app-under-test)"
           if ! echo "$ports" | grep -q '"8080/tcp"'; then
-            echo "container-validate: image does not EXPOSE 8080 (ExposedPorts=$ports), refusing" >&2
+            # The image's config writes these keys, so the plain line shows
+            # them as it shows Config.User above; the helper's logSafe
+            # flattens its own copy.
+            shown_ports="$(printf '%s' "$ports" | LC_ALL=C tr -c ' -~' '?' | sed 's/##\[/## [/g')"
+            echo "container-validate: image does not EXPOSE 8080 (ExposedPorts=$shown_ports), refusing" >&2
+            node "$RUNNER_TEMP/annotate/annotate.mjs" --title "Container contract" --file Dockerfile \
+              --what "the image does not EXPOSE 8080 (ExposedPorts=$ports)" \
+              --fix "add EXPOSE 8080 and listen on port 8080"
             exit 1
           fi
           echo "container-validate: exposes 8080"
@@ -839,10 +1015,15 @@ jobs:
           done
           if [ -z "$ok" ]; then
             if [ -n "$exited" ]; then
-              echo "container-validate: the container exited before /healthz answered 200, last status: ${last:-none}; refusing" >&2
+              said="container-validate: the container exited before /healthz answered 200, last status: ${last:-none}; refusing"
             else
-              echo "container-validate: /healthz did not answer 200 within 18 tries (about 90s when the port refuses, about 162s when it accepts and hangs), last status: ${last:-none}; refusing" >&2
+              said="container-validate: /healthz did not answer 200 within 18 tries (about 90s when the port refuses, about 162s when it accepts and hangs), last status: ${last:-none}; refusing"
             fi
+            # The sentence, then its annotation (R7-5), then the container's
+            # own output, which is the evidence.
+            echo "$said" >&2
+            node "$RUNNER_TEMP/annotate/annotate.mjs" --title "Container contract" --what "$said" \
+              --fix "serve GET /healthz with a 200 on port 8080 within about 90 seconds of start; the step log ends with the container's own output"
             echo "--- container logs ---" >&2
             docker logs smoke >&2 || true
             docker rm -f smoke || true
@@ -867,6 +1048,7 @@ jobs:
           # NOTE: keep comments ABOVE `docker run`, never between its
           # backslash-continued lines; a `#` there silently truncates the command
           # (the image argument is dropped) and bash -n cannot see it.
+          # Trivy's exit cannot tell a finding from a crash: one annotation for both.
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
@@ -878,7 +1060,11 @@ jobs:
               --ignorefile /.trivyignore.platform \
               --exit-code 1 \
               --no-progress \
-              app-under-test
+              app-under-test \
+            || {
+              echo "::error title=Image scan (Trivy),file=Dockerfile::the image has a HIGH or CRITICAL vulnerability with a fix available; the step log's table names each package and its fixed version: move to a patched base image or upgrade the package, or ask a platform admin for safety.ignore.trivy.<CVE id> if it does not apply" >&2
+              exit 1
+            }
 
       # SBOM of the image that is about to deploy: the safety sweep's input.
       # Uploaded DIRECTLY to the broker from this job (no workflow artifact:
@@ -1266,6 +1452,10 @@ jobs:
   # email. The new-app / migrate-app skills delete the marker once real code is
   # in place. The safety gate jobs still run on a scaffold push; only the
   # app Worker's bundle (app-build's steps) and the deploy job are gated.
+  # A release tag on a scaffold fails here, red, with the reason (R7-6): a
+  # tag is a request to deploy, and a green run that deployed nothing reads
+  # as a release. GITHUB_REF is the caller's ref, the one the deploy job's
+  # own condition tests.
   scaffold-check:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -1277,11 +1467,18 @@ jobs:
           # Same rule as every other app checkout here; this job reads one
           # marker file and runs nothing else.
           persist-credentials: false
-      - id: check
+      - name: Check for the unbuilt scaffold's marker (app/.needs-build)
+        id: check
         run: |
           if [ -f app/.needs-build ]; then
             echo "built=false" >> "$GITHUB_OUTPUT"
-            echo "app/.needs-build present: unbuilt scaffold, deploy will be skipped"
+            case "$GITHUB_REF" in
+              refs/tags/v*)
+                echo "::error title=Nothing deployed,file=app/.needs-build::app/.needs-build is still in the repository, so this release tag deploys nothing; delete it once app/ holds your app, then release again" >&2
+                exit 1
+                ;;
+            esac
+            echo "app/.needs-build present: an unbuilt scaffold, so the deploy job is skipped"
           else
             echo "built=true" >> "$GITHUB_OUTPUT"
           fi
@@ -1503,27 +1700,50 @@ jobs:
       #
       # It runs immediately before the bundle and under its condition, so
       # nothing between the two can add a link.
+      #
+      # Each refused link is one annotation (R7-5) from the mirror checkout's
+      # ci/annotate.mjs, the link as its file, so a link's name, which the
+      # author (or a dependency's tarball) chose, reaches the log only
+      # through logSafe. GitHub keeps ten annotations of a kind a step, so
+      # links past the tenth are named in one plain line instead, each name
+      # through the same logSafe (build decision 14): none is dropped
+      # silently. A name can start with "-" (a link at the checkout root
+      # reaches each command bare), so realpath takes it after --, every
+      # helper argument is --opt=value, and the plain line's names follow --
+      # (build decision 16).
       - name: Reject a symlink that escapes the repository
         if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
         run: |
           set -euo pipefail
           root="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
           bad=0
+          more=()
+          refuse_link() {
+            bad=$((bad + 1))
+            if [ "$bad" -le 10 ]; then
+              node inno-platform-ci/ci/annotate.mjs --title="$1" --file="$2" --what="$3" --fix="$4"
+            else
+              more+=("$2")
+            fi
+          }
           while IFS= read -r -d '' link; do
             link="${link#./}"
             # `-e` follows the link, so a dangling one (its target, or a link
             # in its chain, missing) fails here on every runner: GNU realpath
             # prints a path for a missing final component where BSD's does not.
-            if [ -e "$link" ] && tgt="$(realpath "$link" 2>/dev/null)"; then
+            if [ -e "$link" ] && tgt="$(realpath -- "$link" 2>/dev/null)"; then
               case "$tgt/" in
                 "$root"/*) : ;;
-                *) echo "::error title=Symlink escapes the repository::$link resolves outside your repository (-> $tgt)" >&2; bad=1 ;;
+                *) refuse_link "Symlink escapes the repository" "$link" "$link resolves outside your repository (-> $tgt)" "replace it with the file it points to, or remove it" ;;
               esac
             else
-              echo "::error title=Dangling symlink::$link does not resolve; remove it" >&2
-              bad=1
+              refuse_link "Dangling symlink" "$link" "$link does not resolve" "remove it"
             fi
           done < <(find . \( -path ./.git -o -path ./inno-platform-ci \) -prune -o -type l -print0)
+          if [ "${#more[@]}" -gt 0 ]; then
+            # shellcheck disable=SC2016 # a JavaScript template, not a shell expansion
+            node --input-type=module -e 'import { logSafe } from "./inno-platform-ci/ci/cli.mjs"; const names = process.argv.slice(1); console.error(`and ${names.length} more symlinks: ${names.map((n) => logSafe(n, 300)).join(", ")}`);' -- "${more[@]}"
+          fi
           if [ "$bad" -ne 0 ]; then
             echo "A symlink in your repository points outside it; a link may name only a file inside your repository. Remove it, or point it inside." >&2
             exit 1
@@ -1867,7 +2087,9 @@ jobs:
           gunzip -c "$RUNNER_TEMP/scanned-image/image.tar.gz" | docker load
           got="$(docker image inspect --format '{{.Id}}' app-under-test)"
           if [ "$got" != "$EXPECTED" ]; then
-            echo "::error title=Image mismatch::the image in the workflow artifact is not the one the safety gates scanned ($got != $EXPECTED)" >&2
+            node inno-platform-ci/ci/annotate.mjs --title "Image mismatch" \
+              --what "the image in the workflow artifact is not the one the safety gates scanned ($got != $EXPECTED)" \
+              --fix "re-run the release's workflow; a mismatch that repeats means the artifact was altered"
             exit 1
           fi
           echo "image verified: $got"
@@ -1971,7 +2193,10 @@ jobs:
         # deploy is unaffected: the script sends no field and the platform
         # keeps its previous declarations. Content that parses is the
         # broker's to judge, and it refuses a bad set without failing the
-        # deploy.
+        # deploy. The script prints the platform's answer on stderr itself,
+        # through logSafe; the step does not echo it again (it can carry an
+        # author's declared variable names), and an answer with no URL ends
+        # in the step's own annotation (R7-5).
         env:
           OIDC_TOKEN: ${{ steps.oidc_finalize.outputs.token }}
           APP: ${{ needs.policy.outputs.app }}
@@ -1992,14 +2217,15 @@ jobs:
         run: |
           set -e
           result="$(node inno-platform-ci/ci/deploy-finalize.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN" "$IMAGE_ID" "$IMAGE" "$BUNDLE")"
-          echo "$result"
           # Guard the shape, not just the exit status: a well-formed JSON body
           # that isn't the broker's would otherwise write "Deployed: null" into
           # a GREEN summary. (The broker's success path always carries url;
           # this is the belt to that.)
           url="$(echo "$result" | jq -r '.url // empty')"
           if [ -z "$url" ]; then
-            echo "::error title=Finalize::broker returned no url: $result" >&2
+            node inno-platform-ci/ci/annotate.mjs --title Finalize \
+              --what "the platform's answer named no URL ($result)" \
+              --fix "re-run the release's workflow; if it repeats, ask a platform admin"
             exit 1
           fi
           echo "Deployed: $url"
@@ -2007,3 +2233,42 @@ jobs:
             echo "### Deployed"
             echo "$url"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # A deploy that fails after /deploy-token started a deployment releases
+      # its app at once (R7-3): the platform's /deploy-abandon marks this
+      # run's deployment abandoned and returns the app from `deploying` to
+      # active or created (an active app's host serves its last completed
+      # release, unless this deploy's finalize failed after its upload
+      # landed, when this deploy's own code may be what serves), instead of
+      # leaving it for the lifecycle pass's recovery sweep (two run
+      # intervals, at least 2 hours). These two steps are the job's last, and
+      # run only when both halves of their condition hold.
+      # `failure()`: an earlier step of this job failed. A success has
+      # nothing to release, and a run that was cancelled or timed out
+      # (where failure() is false), or whose runner died, is the sweep's to
+      # release. The output test: the token step writes deployment_id only
+      # once the broker answered one, so no output means this run holds no
+      # deployment to release (the broker wrote none, or its answer never
+      # reached the step, which the sweep then covers). A fresh OIDC token,
+      # as finalize mints one: the first may have expired by now.
+      # ci/deploy-abandon.mjs adds no failure: it ends in a notice or a
+      # warning whatever the platform answers, a 405 from a platform without
+      # the route included.
+      - name: Get OIDC token to release the app
+        id: oidc_abandon
+        if: failure() && steps.deploy_token.outputs.deployment_id != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const token = await core.getIDToken('inno-platform-deploy');
+            core.setSecret(token);
+            core.setOutput('token', token);
+
+      - name: Release the app after a failed deploy
+        if: failure() && steps.deploy_token.outputs.deployment_id != ''
+        env:
+          OIDC_TOKEN: ${{ steps.oidc_abandon.outputs.token }}
+          APP: ${{ needs.policy.outputs.app }}
+          DEPLOYMENT_ID: ${{ steps.deploy_token.outputs.deployment_id }}
+        run: |
+          node inno-platform-ci/ci/deploy-abandon.mjs "$BROKER_URL" "$APP" "$DEPLOYMENT_ID" "$OIDC_TOKEN"

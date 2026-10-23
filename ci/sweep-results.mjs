@@ -17,11 +17,18 @@
 //
 // Tenant CI's deps gate reads the same npm normalizer (`gate`), so
 // safety.ignore.deps.* applies to npm exactly as `pip-audit --ignore-vuln`
-// applies it, and the gate and the sweep judge one shape.
+// applies it, and the gate and the sweep judge one shape. The gate's verdict
+// follows the one annotation rule (ci/cli.mjs annotate, R7-5): a plain line
+// per surviving advisory, naming the version that fixes it, then one
+// annotation naming the lockfile, the first ten advisories and the remedy; a
+// report it cannot read is annotated with the re-run remedy. The sweep's
+// modes (post, no-deps) run in the platform's own workflow and print their
+// failures plainly.
 //
 // Usage:
 //   node ci/sweep-results.mjs gate <auditJson>     env IGNORES: space-separated advisory ids
-//     exit 1 if any HIGH/CRITICAL advisory survives the ignores
+//     exit 1 if any HIGH/CRITICAL advisory survives the ignores, with the
+//     annotation the header names
 //   node ci/sweep-results.mjs post <trivy|npm> <brokerUrl> <app> <deploymentId> <reportPath> <token>
 //     normalize the lane's report and POST it
 //   node ci/sweep-results.mjs no-deps <brokerUrl> <app> <deploymentId> <token>
@@ -40,7 +47,7 @@
 
 import { readFile } from "node:fs/promises";
 import { brokerPost } from "./broker-post.mjs";
-import { isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
+import { ANNOTATION_WHAT_MAX, annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 /** The most findings one POST carries. */
 export const MAX_FINDINGS = 200;
@@ -241,9 +248,53 @@ async function readReport(path) {
   }
 }
 
+// The most advisories the gate's annotation names; the step log lists them all.
+const GATE_NAMED = 10;
+
+// The gate's words for an advisory, `<id> (<package>)`. logSafe on every
+// field, here and in survivorLine: each is `npm audit` output, which reports
+// whatever the app's own dependency tree named, and a newline inside a log
+// line ends it and forges a clean second command line in the run's log. Same
+// class ci/deploy-finalize.mjs documents for the declaration file.
+const named = (f) => `${logSafe(f.id)}${f.pkg ? ` (${logSafe(f.pkg)})` : ""}`;
+
+/**
+ * The gate annotation's what: the count, then the advisories by name, at
+ * most GATE_NAMED of them and only as many as fit, with the count of the
+ * rest, in ANNOTATION_WHAT_MAX characters, so the cut annotationLine makes
+ * never falls on ", and <n> more". The step log's plain lines list them all.
+ *
+ * @param {ReturnType<typeof normalizeNpm>} survivors
+ * @returns {string}
+ */
+function gateWhat(survivors) {
+  const head = `${survivors.length} HIGH/CRITICAL advisories: `;
+  const tail = (shown) => (survivors.length > shown ? `, and ${survivors.length - shown} more` : "");
+  const names = [];
+  for (const f of survivors.slice(0, GATE_NAMED)) {
+    const next = [...names, named(f)];
+    if ((head + next.join(", ") + tail(next.length)).length > ANNOTATION_WHAT_MAX) break;
+    names.push(named(f));
+  }
+  return head + names.join(", ") + tail(names.length);
+}
+
+/**
+ * The gate's plain line for one surviving advisory: its id and package, its
+ * severity and title, and what fixes it, the version npm names (`fixed`), a
+ * fix npm can find within the ranges, or none yet.
+ *
+ * @param {ReturnType<typeof normalizeNpm>[number]} f
+ * @returns {string}
+ */
+function survivorLine(f) {
+  const remedy = f.fixed ? `upgrade to ${logSafe(f.fixed)}` : f.fix_available ? "a fixed version exists (npm audit fix finds it)" : "no fixed version yet";
+  return `  - ${named(f)}, ${logSafe(f.severity, 20)}${f.title ? `: ${logSafe(f.title)}` : ""}; ${remedy}`;
+}
+
 if (isMainModule(import.meta.url)) {
+  const [mode, ...args] = process.argv.slice(2);
   try {
-    const [mode, ...args] = process.argv.slice(2);
     if (mode === "gate") {
       const [auditPath] = args;
       if (!auditPath) throw new Error(USAGE.gate);
@@ -253,13 +304,15 @@ if (isMainModule(import.meta.url)) {
       const ignored = findings.filter((f) => ignores.includes(f.id)).map((f) => f.id);
       if (ignored.length) console.log(`ignores honored: ${ignored.join(", ")}`);
       if (survivors.length) {
-        // logSafe on the id and the package name: both are fields of `npm
-        // audit` output, which reports whatever the app's own dependency tree
-        // named, and a newline inside a workflow command ends it and forges a
-        // clean second command line in the run's log. Same class
-        // ci/deploy-finalize.mjs documents for the declaration file.
-        console.error(`::error title=Dependency gate::${survivors.length} HIGH/CRITICAL advisories: ` +
-          survivors.map((f) => `${logSafe(f.id)}${f.pkg ? ` (${logSafe(f.pkg)})` : ""}`).join(", "));
+        console.error(`dependency gate: ${survivors.length} HIGH/CRITICAL advisories survive the ignores:`);
+        for (const f of survivors) console.error(survivorLine(f));
+        annotate({
+          title: "Dependency gate",
+          file: "app/package-lock.json",
+          what: gateWhat(survivors),
+          fix: "upgrade each package past its advisory (the step log names the fixed versions), or ask a platform " +
+            "admin for safety.ignore.deps.<advisory id> if one does not apply",
+        });
         process.exitCode = 1;
       } else {
         console.log(`dependency gate clean (${findings.length} total advisories below floor or ignored)`);
@@ -271,18 +324,26 @@ if (isMainModule(import.meta.url)) {
       const deploymentIdNum = parseIntegerArg("deploymentId", deploymentId);
       const findings = NORMALIZERS[lane](await readReport(reportPath));
       const result = await postFindings({ base, token, lane, app, deploymentId: deploymentIdNum, findings });
-      console.log(`${LANES[lane].label}: ${JSON.stringify(result)}`);
+      console.log(`${LANES[lane].label}: ${logSafe(JSON.stringify(result), Infinity)}`);
     } else if (mode === "no-deps") {
       const [base, app, deploymentId, token] = args;
       if (!base || !app || !deploymentId || !token) throw new Error(USAGE["no-deps"]);
       const deploymentIdNum = parseIntegerArg("deploymentId", deploymentId);
       const result = await postFindings({ base, token, lane: "npm", app, deploymentId: deploymentIdNum, findings: [] });
-      console.log(`${LANES.npm.label}: ${JSON.stringify(result)}`);
+      console.log(`${LANES.npm.label}: ${logSafe(JSON.stringify(result), Infinity)}`);
     } else {
       throw new Error(`unknown mode ${JSON.stringify(logSafe(mode ?? "", 40))}: use "gate", "post" or "no-deps"`);
     }
   } catch (err) {
-    console.error(String(err?.message ?? err));
+    const message = String(err?.message ?? err);
+    // The tenant gate's failure is the author's to see on the run page; the
+    // sweep's, and any usage line, stay plain (flattened: a report's parse
+    // error quotes the raw file).
+    if (mode === "gate" && !message.startsWith("Usage:")) {
+      annotate({ title: "Dependency gate", what: message, fix: "re-run the workflow; if it repeats, ask a platform admin" });
+    } else {
+      console.error(logSafe(message, Infinity));
+    }
     process.exitCode = 1;
   }
 }

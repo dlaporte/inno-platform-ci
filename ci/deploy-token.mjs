@@ -23,9 +23,14 @@
 // with the broker's own sentence, which names the fix. Until v0.17.3 this was
 // a bash loop around curl in the step itself, with its own copy of the
 // schedule (R7-3).
+//
+// A failure prints two lines on stderr (R7-5, v0.17.6): the message, plain,
+// as the step log has always shown it, then one annotation titled "Deploy
+// refused" (ci/cli.mjs annotate), whose fix is the broker's sentence when the
+// refusal carries one and a re-run of the release's workflow otherwise.
 
-import { brokerPost, withBusyRetry } from "./broker-post.mjs";
-import { isMainModule } from "./cli.mjs";
+import { brokerPost, refusalParts, withBusyRetry } from "./broker-post.mjs";
+import { annotate, isMainModule, logSafe } from "./cli.mjs";
 
 // How long the request waits for its answer: 30 s, shorter than brokerPost's
 // default for the reports (BROKER_TIMEOUT_MS). The broker does a deployment's
@@ -65,15 +70,36 @@ export async function requestDeployToken({ base, app, token }, fetcher = fetch, 
   };
 }
 
+const USAGE = "Usage: node ci/deploy-token.mjs <brokerUrl> <app> <token>";
+
 if (isMainModule(import.meta.url)) {
-  try {
-    const [base, app, token] = process.argv.slice(2);
-    if (!base || !app || !token) throw new Error("Usage: node ci/deploy-token.mjs <brokerUrl> <app> <token>");
-    // stdout is the JSON alone: the step parses it with jq. Everything else,
-    // the retries' lines and a refusal, goes to stderr.
-    console.log(JSON.stringify(await requestDeployToken({ base, app, token })));
-  } catch (err) {
-    console.error(String(err?.message ?? err));
+  const [base, app, token] = process.argv.slice(2);
+  if (!base || !app || !token) {
+    console.error(USAGE);
     process.exitCode = 1;
+  } else {
+    try {
+      // stdout is the JSON alone: the step parses it with jq. Everything else,
+      // the retries' lines and a refusal, goes to stderr.
+      console.log(JSON.stringify(await requestDeployToken({ base, app, token })));
+    } catch (err) {
+      // A failure below brokerPost's (no connection at all) carries no label
+      // of its own, so the line says whose it is.
+      const raw = String(err?.message ?? err);
+      const said = raw.startsWith("deploy-token failed") ? raw : `deploy-token failed: ${raw}`;
+      // Flattened, not cut: brokerPost already bounds a refusal's sentence
+      // (REFUSAL_MESSAGE_MAX_CHARS), and the step log keeps it whole.
+      console.error(logSafe(said, Infinity));
+      // The broker's sentence names the fix, so it is the annotation's fix,
+      // and the what is the refusal without it.
+      const { error, message } = refusalParts(err?.body);
+      const sentence = error !== null && message !== null;
+      annotate({
+        title: "Deploy refused",
+        what: sentence ? `deploy-token failed (${err.status}): ${error}` : said,
+        fix: sentence ? message : "re-run the release's workflow",
+      });
+      process.exitCode = 1;
+    }
   }
 }

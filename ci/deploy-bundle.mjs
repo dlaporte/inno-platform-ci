@@ -35,7 +35,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
+import { annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // The largest form the platform takes, before compression: its own memory
 // bound (a finalize holds up to about four copies of the form in one isolate
@@ -271,14 +271,21 @@ if (isMainModule(import.meta.url)) {
       console.log(staged);
     }
   } catch (err) {
-    // An annotation, so the refusal shows on the run's summary: the author no
-    // longer sees wrangler's own output from a deploy, and this message is
-    // the platform's word on why the bundle was not taken. Every message is
-    // already flattened where it quotes anything from outside this script;
-    // logSafe again here is what keeps that true for a message added later.
+    // A plain line, then an annotation, so the refusal shows on the run's
+    // summary: the author no longer sees wrangler's own output from a
+    // deploy, and this message is the platform's word on why the bundle was
+    // not taken. The plain line keeps the whole message in the step log (the
+    // annotation keeps ANNOTATION_WHAT_MAX characters of it), as the token
+    // and finalize CLIs do. Every message is already flattened where it
+    // quotes anything from outside this script; logSafe and annotate flatten
+    // it again, which is what keeps that true for a message added later.
     const message = String(err?.message ?? err);
-    if (message.startsWith("Usage:")) console.error(message);
-    else console.error(`::error title=App Worker bundle::${logSafe(message, 1200)}`);
+    if (message.startsWith("Usage:")) {
+      console.error(message);
+    } else {
+      console.error(logSafe(message, Infinity));
+      annotate({ title: "App Worker bundle", what: message });
+    }
     process.exitCode = 1;
   }
 }

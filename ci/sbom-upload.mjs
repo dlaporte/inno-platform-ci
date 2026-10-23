@@ -13,9 +13,9 @@
 // Not best-effort (R7-1, v0.17.4): this upload is the one place a run records
 // the scanned image's id, and the broker refuses the deploy job's token
 // request for a run that recorded none. So the CLI fails its step on any
-// failure, with one ::error annotation that carries the broker's refusal
-// (flattened by logSafe, so a refusal's text cannot start a workflow command
-// of its own), and exits 1. A refusal that carries the broker's own sentence
+// failure, with one error annotation that carries the broker's refusal
+// (ci/cli.mjs annotate, which flattens it, so a refusal's text cannot start a
+// workflow command of its own), and exits 1. A refusal that carries the broker's own sentence
 // (sbom_too_large, app_stopped, repo_unlinked) says what to do, so the line
 // adds no remedy of its own: for an SBOM over the cap, re-running the release's
 // workflow would rebuild the same image and meet the same refusal. Any other
@@ -29,7 +29,7 @@
 
 import { readFile } from "node:fs/promises";
 import { brokerPost } from "./broker-post.mjs";
-import { isMainModule, logSafe } from "./cli.mjs";
+import { annotate, isMainModule, logSafe } from "./cli.mjs";
 
 /**
  * POST {app, sbom, image_id?} to `${base}/deploy-sbom`, authenticated with the
@@ -83,13 +83,17 @@ if (isMainModule(import.meta.url)) {
       throw new Error(`could not read/parse SBOM at ${sbomPath}: ${String(err?.message ?? err)}`);
     }
     const result = await uploadSbom(base, token, app, sbom, imageId);
-    console.log(`deploy-sbom: ${JSON.stringify(result)}`);
+    // The step prints this line to its log as it is, so the broker's answer
+    // is flattened (logSafe breaks the runner's ##[ marker too).
+    console.log(`deploy-sbom: ${logSafe(JSON.stringify(result), Infinity)}`);
   } catch (err) {
-    const message = logSafe(String(err?.message ?? err), 600);
-    console.error(carriesBrokerSentence(err)
-      ? `::error title=SBOM upload failed::${message}`
-      : `::error title=SBOM upload failed::${message}; this release cannot deploy without it: ` +
-        "fix what the message names, then re-run the release's workflow");
+    annotate({
+      title: "SBOM upload failed",
+      what: String(err?.message ?? err),
+      fix: carriesBrokerSentence(err)
+        ? ""
+        : "this release cannot deploy without it: fix what the message names, then re-run the release's workflow",
+    });
     process.exitCode = 1;
   }
 }
