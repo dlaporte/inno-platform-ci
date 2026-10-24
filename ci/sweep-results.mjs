@@ -9,6 +9,10 @@
 // ignores) and drives the vulnerable episode; this script only delivers data.
 // A {stale:true} answer is SUCCESS: the app was redeployed, stopped or
 // reconfigured after the manifest, and the scan is deliberately discarded.
+// A scan the job could not finish is posted as a failure (postFailure), which
+// the platform stamps the app for and records nothing else for, so a failing
+// scan waits out its interval rather than keeping the sweep due every hour
+// (R13-14, v0.17.7).
 // Each lane keeps the first MAX_FINDINGS findings by severity rank (not by
 // name: the jq block this replaces sorted alphabetically, which put LOW
 // before MEDIUM and was right only because trivy ran with HIGH,CRITICAL),
@@ -22,8 +26,8 @@
 // per surviving advisory, naming the version that fixes it, then one
 // annotation naming the lockfile, the first ten advisories and the remedy; a
 // report it cannot read is annotated with the re-run remedy. The sweep's
-// modes (post, no-deps) run in the platform's own workflow and print their
-// failures plainly.
+// modes (post, no-deps, post-failed) run in the platform's own workflow and
+// print their failures plainly.
 //
 // Usage:
 //   node ci/sweep-results.mjs gate <auditJson>     env IGNORES: space-separated advisory ids
@@ -34,6 +38,9 @@
 //   node ci/sweep-results.mjs no-deps <brokerUrl> <app> <deploymentId> <token>
 //     record a function app with no app/package.json at its release tag as
 //     swept clean, with no audit (OPEN 87): the deps lane's POST with no findings
+//   node ci/sweep-results.mjs post-failed <trivy|npm> <brokerUrl> <app> <reason> <token>
+//     post that the lane's scan of the app could not finish, and why (at most
+//     200 characters): the platform stamps the app and records no finding
 // `token` is the GitHub Actions OIDC token (audience inno-platform-sweep). A
 // report the scanner did not finish (npm audit's top-level `error`, or a file
 // that is not a trivy report), and one that parses but whose nested structure
@@ -53,6 +60,13 @@ import { ANNOTATION_WHAT_MAX, annotate, isMainModule, logSafe, parseIntegerArg }
 export const MAX_FINDINGS = 200;
 /** The most of an advisory's title a finding carries. */
 export const MAX_TITLE_CHARS = 120;
+/**
+ * The most of a failure's reason a post carries: the most the results routes
+ * take (src/routes/sweep.ts MAX_FAILURE_REASON_CHARS, held equal by
+ * test/constant-parity.node.test.ts), so a failure post is never refused for
+ * its length.
+ */
+export const MAX_FAILURE_REASON_CHARS = 200;
 
 // Severity rank, most severe first. trivy says MEDIUM where npm says
 // MODERATE; anything else (trivy's UNKNOWN) sorts last.
@@ -228,9 +242,33 @@ export function gateSurvivors(findings, ignores) {
  * @returns {Promise<any>} the parsed JSON response body (e.g. { recorded } or { stale })
  */
 export async function postFindings({ base, token, lane, app, deploymentId, findings }, fetcher = fetch) {
+  return brokerPost({ ...laneOf(lane), base, token, body: { app, deployment_id: deploymentId, findings } }, fetcher);
+}
+
+/**
+ * POST {app, failed: true, reason} to the lane's results endpoint, with the
+ * OIDC bearer: the lane's scan of the app could not finish. The platform
+ * stamps the app and records nothing else. The reason is flattened and cut
+ * to MAX_FAILURE_REASON_CHARS (logSafe), the most the routes take.
+ *
+ * @param {object} req
+ * @param {string} req.base - broker base URL
+ * @param {string} req.token - GitHub Actions OIDC token (sweep audience)
+ * @param {"trivy"|"npm"} req.lane
+ * @param {string} req.app
+ * @param {string} req.reason - what could not finish, in the workflow's words
+ * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} [fetcher]
+ * @returns {Promise<any>} the parsed JSON response body ({ stamped: true })
+ */
+export async function postFailure({ base, token, lane, app, reason }, fetcher = fetch) {
+  return brokerPost({ ...laneOf(lane), base, token, body: { app, failed: true, reason: logSafe(reason, MAX_FAILURE_REASON_CHARS) } }, fetcher);
+}
+
+// The lane's endpoint and label, or a refusal naming the two there are.
+function laneOf(lane) {
   const to = Object.hasOwn(LANES, lane) ? LANES[lane] : undefined;
   if (!to) throw new Error(`unknown lane ${JSON.stringify(logSafe(lane, 40))}: use "trivy" or "npm"`);
-  return brokerPost({ ...to, base, token, body: { app, deployment_id: deploymentId, findings } }, fetcher);
+  return to;
 }
 
 const NORMALIZERS = { trivy: normalizeTrivy, npm: normalizeNpm };
@@ -238,6 +276,7 @@ const USAGE = {
   gate: "Usage: node ci/sweep-results.mjs gate <auditJson>  (env IGNORES = space-separated ids)",
   post: "Usage: node ci/sweep-results.mjs post <trivy|npm> <brokerUrl> <app> <deploymentId> <reportPath> <token>",
   "no-deps": "Usage: node ci/sweep-results.mjs no-deps <brokerUrl> <app> <deploymentId> <token>",
+  "post-failed": "Usage: node ci/sweep-results.mjs post-failed <trivy|npm> <brokerUrl> <app> <reason> <token>",
 };
 
 async function readReport(path) {
@@ -331,8 +370,13 @@ if (isMainModule(import.meta.url)) {
       const deploymentIdNum = parseIntegerArg("deploymentId", deploymentId);
       const result = await postFindings({ base, token, lane: "npm", app, deploymentId: deploymentIdNum, findings: [] });
       console.log(`${LANES.npm.label}: ${logSafe(JSON.stringify(result), Infinity)}`);
+    } else if (mode === "post-failed") {
+      const [lane, base, app, reason, token] = args;
+      if (!lane || !base || !app || !reason || !token) throw new Error(USAGE["post-failed"]);
+      const result = await postFailure({ base, token, lane, app, reason });
+      console.log(`${LANES[lane].label}: ${logSafe(JSON.stringify(result), Infinity)}`);
     } else {
-      throw new Error(`unknown mode ${JSON.stringify(logSafe(mode ?? "", 40))}: use "gate", "post" or "no-deps"`);
+      throw new Error(`unknown mode ${JSON.stringify(logSafe(mode ?? "", 40))}: use "gate", "post", "no-deps" or "post-failed"`);
     }
   } catch (err) {
     const message = String(err?.message ?? err);
