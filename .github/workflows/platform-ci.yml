@@ -772,7 +772,10 @@ jobs:
           cp inno-platform-ci/ci/annotate.mjs inno-platform-ci/ci/cli.mjs "$RUNNER_TEMP/annotate/"
           rm -rf inno-platform-ci
 
+      # A function-shaped app builds no image, so this checkout and the Node
+      # setup below skip for one, as every image step does (R7-7).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.policy.outputs.function_shaped != 'true'
         with:
           # This checkout root IS the `docker build` context below, so anything
           # in it is reachable by an author-written Dockerfile's COPY and can
@@ -784,19 +787,24 @@ jobs:
           persist-credentials: false
 
       # No `cache: npm` here: this job never runs `npm ci`/`npm install` (the
-      # docker build below is a wholly separate build context, and the only
-      # runner-side use of node is running inno-platform-ci/ci/sbom-upload.mjs
-      # directly). A cache key would have to hash a root lockfile that, once
+      # docker build below is a wholly separate build context, and node runs
+      # two scripts directly: the annotation helper,
+      # $RUNNER_TEMP/annotate/annotate.mjs, with which a contract step ends a
+      # refusal on any run, and inno-platform-ci/ci/sbom-upload.mjs on a
+      # release tag). A cache key would have to hash a root lockfile that, once
       # app repos stop vendoring worker build inputs, won't exist here; this
       # job installs no build tools and injects nothing.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: needs.policy.outputs.function_shaped != 'true'
         with:
           node-version: 22
 
-      # Only the trivy SCAN is policy-toggleable. The build, the non-root/port
-      # asserts (container contract), and the SBOM generation are unconditional
-      # because the SBOM is inventory, and capturing it even for gate-disabled apps
-      # means flipping the gate back restores sweep coverage without a deploy.
+      # Only the trivy SCAN is policy-toggleable. The build and the
+      # non-root/port asserts (container contract) run whatever the policy
+      # says, and so does the SBOM generation on a release tag, the one run
+      # that uploads it (R7-7): the SBOM is inventory, and capturing it even
+      # for a gate-disabled app means flipping the gate back restores sweep
+      # coverage without a deploy.
       # The ignore file is written AFTER checkout (checkout cleans the tree)
       # and is the ONLY ignore file mounted into trivy: the app repo itself
       # stays unmounted, so an app-committed .trivyignore remains inert.
@@ -1070,11 +1078,14 @@ jobs:
       # Uploaded DIRECTLY to the broker from this job (no workflow artifact:
       # app-owned jobs in the caller share the run's artifact namespace) and
       # staged server-side under this run's VERIFIED run_id claim;
-      # /deploy-complete promotes it to the live pointer. On a release tag the
-      # upload also records the scanned image's id, which the deploy needs, so
-      # a failed upload fails this job (the upload step below).
+      # /deploy-complete promotes it to the live pointer. Only a release tag's
+      # run uploads it, so this step and the image id step below run on a
+      # release tag alone (R7-7): a push builds and gates the image and stages
+      # nothing.
+      # The upload also records the scanned image's id, which the deploy
+      # needs, so a failed upload fails this job (the upload step below).
       - name: Generate SBOM (CycloneDX)
-        if: needs.policy.outputs.function_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
         env:
           TRIVY_TOKEN: ${{ github.token }}
         run: |
@@ -1103,7 +1114,7 @@ jobs:
       # this recorded id is what the deploy job checks it against.
       - name: Record the scanned image id
         id: image
-        if: needs.policy.outputs.function_shaped != 'true'
+        if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
         # Captured into a variable first: `echo "id=$(...)"` returns echo's own
         # 0 when the substitution fails, which would stage the SBOM with an
         # empty id, and the broker would then refuse the deploy job's token
@@ -1316,8 +1327,10 @@ jobs:
       # continue-on-error, and every command that can fail under Actions'
       # `bash -e` carries its own `||` and exit 0 (the tests plant a failure
       # in each). With no step timeout-minutes, `timeout` bounds trivy itself
-      # at 190 s with the kill grace, the one slow command here (the image is
-      # already local from the gate; trivy may fetch its checks bundle). It
+      # at 190 s with the kill grace, the one slow command here (the trivy
+      # image is already local when the gate ran; on a push with the gate off
+      # by policy nothing has pulled it, so the pull falls inside this
+      # timeout, and a timeout only warns; trivy may fetch its checks bundle). It
       # names risky build patterns the non-root/EXPOSE asserts do not cover
       # (a root USER, ADD from a URL, apt without --no-install-recommends).
       # Only a copy of the Dockerfile is mounted, read-only, so an
@@ -1408,14 +1421,36 @@ jobs:
   # published fewer than min_release_age_days days ago (config store:
   # safety.min_release_age_days; 0 = off, the default). Complements the `deps`
   # audit gate: that catches KNOWN-vulnerable versions, this catches too-new,
-  # unvetted ones. Always runs (never `if:`-skipped) and early-exits when the
-  # threshold is 0, matching the other gates' "disabled still runs" discipline.
+  # unvetted ones. The job always runs (never `if:`-skipped), as every gate
+  # does, and its gate switch skips the work at 0: the checkouts, the Node
+  # setup and the check run only when the cooldown is on (R7-7).
   dep-age:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     needs: [policy]
     steps:
+      # ci/check-dep-age.mjs' own rule: the cooldown is on when
+      # Number(MIN_RELEASE_AGE_DAYS || 0) is finite and above 0, so 1.5 is on,
+      # as the script checks it. The policy job hands over a number jq printed
+      # (safety.min_release_age_days, a whole number of days, or 0 on an
+      # outage), so the rule here reads a plain decimal: on when it holds a
+      # digit other than 0 and no minus sign. Anything else (empty, negative,
+      # not a number) is off, as it is there, and prints the script's line.
+      - name: Gate switch
+        id: gate
+        env:
+          MIN_RELEASE_AGE_DAYS: ${{ needs.policy.outputs.min_release_age_days }}
+        run: |
+          decimal='^[[:space:]]*[+]?([0-9]+([.][0-9]*)?|[.][0-9]+)[[:space:]]*$'
+          if [[ "$MIN_RELEASE_AGE_DAYS" =~ $decimal ]] && [[ "${BASH_REMATCH[1]}" == *[1-9]* ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dep-age: min_release_age_days is 0, so the cooldown gate is disabled; nothing to check."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
         with:
           path: app-repo
           # Same defense in depth as the sast, deps and container checkouts:
@@ -1423,6 +1458,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout inno-platform-ci (ci/ scripts)
+        if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: dlaporte/inno-platform-ci
@@ -1433,6 +1469,7 @@ jobs:
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.gate.outputs.enabled == 'true'
         with:
           node-version: 22
 
@@ -1440,6 +1477,7 @@ jobs:
       # build installs with --omit=dev, so they never ship); a container
       # app's are, since its Dockerfile may install them to build.
       - name: Dependency release-age cooldown
+        if: steps.gate.outputs.enabled == 'true'
         env:
           MIN_RELEASE_AGE_DAYS: ${{ needs.policy.outputs.min_release_age_days }}
           FUNCTION_SHAPED: ${{ needs.policy.outputs.function_shaped }}
