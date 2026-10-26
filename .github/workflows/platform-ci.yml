@@ -699,7 +699,7 @@ jobs:
             cd app
             if [ ! -f package-lock.json ]; then
               if [ "$FUNCTION_SHAPED" = "true" ]; then
-                echo "::error title=Missing app/package-lock.json::commit app/package-lock.json; the platform deploys the versions the dependency gates audited, and will not resolve your ranges fresh at deploy time"
+                echo "::error title=Missing app/package-lock.json::commit app/package-lock.json; the platform deploys the versions the dependency gates audited, and will not resolve your ranges fresh at deploy time" >&2
                 exit 1
               fi
               # A container app's throwaway resolution. Do NOT swallow this: an
@@ -707,7 +707,7 @@ jobs:
               # audit, which must fail loudly rather than silently pass. (A gate
               # that only logs a warning is a broken gate.)
               npm install --package-lock-only --ignore-scripts || {
-                echo "::error title=Dependency gate::could not resolve app/package.json into a lockfile: fix the dependency ranges or commit a package-lock.json"
+                echo "::error title=Dependency gate::could not resolve app/package.json into a lockfile: fix the dependency ranges or commit a package-lock.json" >&2
                 exit 1
               }
             fi
@@ -852,9 +852,15 @@ jobs:
         run: |
           bash "$RUNNER_TEMP/registry-mirror.sh"
 
+      # A failed build is the author's to fix, so it ends with its own
+      # annotation (R7-deploy-ci-4), which points at docker's error above it.
       - name: docker build (isolated; no deploy token present)
         if: needs.policy.outputs.function_shaped != 'true'
-        run: docker build -t app-under-test .
+        run: |
+          docker build -t app-under-test . || {
+            echo "::error title=Docker build,file=Dockerfile::docker build failed, so there is no image to gate or deploy; docker's error ends the step log: fix the Dockerfile or the files it copies, then push again" >&2
+            exit 1
+          }
 
       - name: Assert non-root user + EXPOSE 8080
         if: needs.policy.outputs.function_shaped != 'true'
@@ -1056,7 +1062,17 @@ jobs:
           # NOTE: keep comments ABOVE `docker run`, never between its
           # backslash-continued lines; a `#` there silently truncates the command
           # (the image argument is dropped) and bash -n cannot see it.
-          # Trivy's exit cannot tell a finding from a crash: one annotation for both.
+          #
+          # The annotation (R7-deploy-ci-4) tells the failures apart by exit
+          # code, as the gitleaks step does: --exit-code 2 makes a finding exit
+          # 2, which is the author's to fix, and trivy exits 1 on its own fatal
+          # error (a vulnerability DB download that failed, say), usually the
+          # platform's, so that line says to re-run and then ask a platform
+          # admin. The split rests on trivy's --exit-code reference (its own
+          # fatal errors exit 1), read, not run, so the first real scanner
+          # failure after the release is where it is seen. Either non-zero exit
+          # fails the gate.
+          status=0
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
@@ -1066,13 +1082,16 @@ jobs:
               --severity HIGH,CRITICAL \
               --ignore-unfixed \
               --ignorefile /.trivyignore.platform \
-              --exit-code 1 \
+              --exit-code 2 \
               --no-progress \
               app-under-test \
-            || {
-              echo "::error title=Image scan (Trivy),file=Dockerfile::the image has a HIGH or CRITICAL vulnerability with a fix available; the step log's table names each package and its fixed version: move to a patched base image or upgrade the package, or ask a platform admin for safety.ignore.trivy.<CVE id> if it does not apply" >&2
-              exit 1
-            }
+            || status=$?
+          if [ "$status" -eq 2 ]; then
+            echo "::error title=Image scan (Trivy),file=Dockerfile::the image has a HIGH or CRITICAL vulnerability with a fix available; the step log's table names each package and its fixed version: move to a patched base image or upgrade the package, or ask a platform admin for safety.ignore.trivy.<CVE id> if it does not apply" >&2
+          elif [ "$status" -ne 0 ]; then
+            echo "::error title=Trivy::trivy exited $status without a verdict; re-run the workflow, and if it repeats ask a platform admin" >&2
+          fi
+          exit "$status"
 
       # SBOM of the image that is about to deploy: the safety sweep's input.
       # Uploaded DIRECTLY to the broker from this job (no workflow artifact:
@@ -1662,7 +1681,9 @@ jobs:
       # nothing no gate has seen. A committed node_modules at the checkout
       # root is removed first, in both cases: esbuild resolves a bare import
       # from app/index.ts there next, and it has no legitimate use, since a
-      # root package.json is refused (config-integrity check 8).
+      # root package.json is refused (config-integrity check 8). A failed
+      # install, most often an app/package-lock.json that does not match
+      # app/package.json, ends with its own annotation (R7-deploy-ci-4).
       - name: Install the app Worker's dependencies
         if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
         run: |
@@ -1674,10 +1695,13 @@ jobs:
             exit 0
           fi
           if [ ! -f app/package-lock.json ]; then
-            echo "::error title=Missing app/package-lock.json::commit app/package-lock.json; the platform deploys the versions the dependency gates audited, and will not resolve your ranges fresh at deploy time"
+            echo "::error title=Missing app/package-lock.json::commit app/package-lock.json; the platform deploys the versions the dependency gates audited, and will not resolve your ranges fresh at deploy time" >&2
             exit 1
           fi
-          (cd app && npm ci --ignore-scripts --omit=dev)
+          (cd app && npm ci --ignore-scripts --omit=dev) || {
+            echo "::error title=Dependency install,file=app/package-lock.json::the dependency install could not install app/package-lock.json; npm's reason ends the step log: when app/package.json and app/package-lock.json disagree, run npm install in app/ and commit both files" >&2
+            exit 1
+          }
 
       # The platform's build tools: the wrangler the mirror's ci/build/
       # lockfile pins, which follows the mirror's main (PLATFORM_REF) as the
