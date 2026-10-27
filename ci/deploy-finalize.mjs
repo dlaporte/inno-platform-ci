@@ -22,15 +22,15 @@
 // deployment live.
 //
 // A failure prints two lines on stderr (R7-5, v0.17.6): the message, plain,
-// then one annotation titled "Deploy not finalized" (ci/cli.mjs annotate),
-// whose fix is the broker's sentence when the refusal carries one (a
-// script_rejected's carries Cloudflare's reason) and a re-run of the
-// release's workflow otherwise. The release's workflow then runs
+// then one annotation titled "Deploy not finalized", whose fix is the
+// broker's sentence when the refusal carries one (a script_rejected's carries
+// Cloudflare's reason) and a re-run of the release's workflow otherwise
+// (ci/broker-post.mjs reportRefusal). The release's workflow then runs
 // ci/deploy-abandon.mjs, which releases the app from `deploying`.
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { brokerPost, refusalParts, withBusyRetry } from "./broker-post.mjs";
+import { brokerPost, reportRefusal, withBusyRetry } from "./broker-post.mjs";
 import { annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // A FAILURE-SHAPE guard, not a security bound. The platform already refuses an
@@ -96,8 +96,9 @@ export function readDeclarationFile(root = ".") {
  * properties, so the body stayed correct while the injected fetcher was
  * silently replaced by the global one and the "test" started making real
  * network calls. Named fields make that a TypeError instead of a quiet
- * escape. `fetcher` stays the last parameter, outside the object, like every
- * sibling helper's (uploadSbom, postFindings, brokerPost).
+ * escape. Every ci/ broker helper takes its fields this way, with the
+ * injectable `fetcher` after the object, outside it (brokerPost,
+ * requestDeployToken, uploadSbom, handOver, requestAbandon, postFindings).
  *
  * @param {object} req
  * @param {string} req.base - broker base URL, e.g. "https://inno-platform.example.workers.dev"
@@ -197,20 +198,9 @@ if (isMainModule(import.meta.url)) {
     if (raw.startsWith("Usage:")) {
       console.error(raw);
     } else {
-      // A failure below brokerPost's (no connection at all) carries no label
-      // of its own, so the line says whose it is.
-      const said = /^(deploy-complete failed|invalid deploymentId)/.test(raw) ? raw : `deploy-complete failed: ${raw}`;
-      // Flattened, not cut: brokerPost already bounds a refusal's sentence
-      // (REFUSAL_MESSAGE_MAX_CHARS), and the step log keeps it whole.
-      console.error(logSafe(said, Infinity));
-      // The broker's sentence names the fix, so it is the annotation's fix,
-      // and the what is the refusal without it.
-      const { error, message } = refusalParts(err?.body);
-      const sentence = error !== null && message !== null;
-      annotate({
-        title: "Deploy not finalized",
-        what: sentence ? `deploy-complete failed (${err.status}): ${error}` : said,
-        fix: sentence ? message : "re-run the release's workflow",
+      // A malformed deployment id is this CLI's own refusal, and reads as it is.
+      reportRefusal(err, {
+        label: "deploy-complete", title: "Deploy not finalized", fix: "re-run the release's workflow", asIs: ["invalid deploymentId"],
       });
     }
     process.exitCode = 1;

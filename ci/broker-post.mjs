@@ -26,8 +26,10 @@
 // (409 app_busy) on the one schedule, BUSY_RETRY_DELAYS_MS: tenant CI's
 // token request (ci/deploy-token.mjs), finalize (ci/deploy-finalize.mjs) and
 // release of a failed deploy's app (ci/deploy-abandon.mjs) all run through
-// it. refusalParts reads a refusal's code and sentence apart, for the CLIs
-// that annotate one.
+// it. refusalParts reads a refusal's code and sentence apart, and
+// reportRefusal is the one way the four CLIs that end on a broker refusal
+// (ci/deploy-token.mjs, ci/deploy-finalize.mjs, ci/sbom-upload.mjs,
+// ci/deploy-bundle.mjs) report it (R7-deploy-ci-7).
 //
 // Every request is bounded: no answer, or no end to it, within the caller's
 // timeoutMs (BROKER_TIMEOUT_MS when absent) throws
@@ -42,12 +44,13 @@
 // shorter, the finalize longer, since a container app's finalize answers only
 // after the platform has rolled the image out and uploaded the host.
 //
-// One import on purpose, ./cli.mjs, for logSafe, the ci/ log sanitiser: it
-// ships beside this file in the mirror manifest and imports only Node's own
-// modules, so the mirror ships no extra file for these helpers and nothing
-// that imports them takes on a dependency beyond Node. Both helpers use the
-// global fetch, injectable for tests.
-import { logSafe } from "./cli.mjs";
+// One import on purpose, ./cli.mjs, for logSafe, the ci/ log sanitiser, and
+// annotate, the one annotation rule: it ships beside this file in the mirror
+// manifest and imports only Node's own modules, so the mirror ships no extra
+// file for these helpers and nothing that imports them takes on a dependency
+// beyond Node. Both request helpers use the global fetch, injectable for
+// tests.
+import { annotate, logSafe } from "./cli.mjs";
 
 // The most of a refusal's message the thrown error carries: room for the
 // longest the platform writes, a finalize's script_rejected quoting up to
@@ -66,9 +69,9 @@ export const BROKER_TIMEOUT_MS = 180_000;
  * forged workflow command in the run's log), the code bounded at 200
  * characters and the sentence at REFUSAL_MESSAGE_MAX_CHARS; a part the body
  * does not carry as a string, and both for a body that is not a JSON object,
- * is null. The CLIs that annotate a refusal (ci/deploy-token.mjs,
- * ci/deploy-finalize.mjs, ci/deploy-abandon.mjs) read it from the error's
- * `body`.
+ * is null. reportRefusal, below, reads it from the error's `body` for the
+ * four CLIs that end on a refusal, and ci/deploy-abandon.mjs, whose
+ * annotations are its own, reads it the same way.
  *
  * @param {string} text
  * @returns {{ error: string | null, message: string | null }}
@@ -90,10 +93,46 @@ export function refusalParts(text) {
 // reason for refusing the Worker upload) rather than its first 200 characters
 // cut inside the JSON framing. Any other answer, an HTML error page or a
 // refusal without both fields (`{"error":"app_busy"}`), is its first 200
-// characters, as it always was.
-function refusalText(text) {
+// characters, as it always was. Exported for ci/deploy-bundle.mjs, whose
+// hand-over sends its bytes itself and reads a refusal through this, so it
+// says what jsonRequest says of the same answer.
+export function refusalText(text) {
   const { error, message } = refusalParts(text);
   return error !== null && message !== null ? `${error}: ${message}` : text.slice(0, 200);
+}
+
+/**
+ * Report the failure a CLI ends on, on stderr, one way for the four that end
+ * on a broker refusal (R7-deploy-ci-7): a plain line, the message whole and
+ * flattened (the step log keeps what the annotation's bound cuts), then one
+ * annotation. When the refusal carries the broker's sentence (refusalParts of
+ * the error's `body`), the annotation's what is `<label> failed (<status>):
+ * <code>` and its fix the sentence, which names the fix; otherwise its what
+ * is the plain line and its fix the CLI's own. A message that does not
+ * already start `<label> failed`, or with a prefix in `asIs` (the CLI's own
+ * words for a malformed argument), is a failure below the request, with no
+ * label of its own (no connection at all, an unreadable file), so the line
+ * says whose it is: `<label> failed: <message>`. The plain line keeps
+ * `<label> failed (<status>): <error>: <message>`, the form the app plugin's
+ * failure tables quote.
+ *
+ * @param {unknown} err - what the CLI's work threw
+ * @param {{ label: string, title: string, fix: string, asIs?: string[] }} o
+ *   - label: the request's label, e.g. "deploy-token"; title: the
+ *   annotation's; fix: the CLI's own remedy, for a failure with no sentence
+ *   of the broker's ("" for none); asIs: message prefixes printed as they are
+ */
+export function reportRefusal(err, { label, title, fix, asIs = [] }) {
+  const message = String(err?.message ?? err);
+  const said = [`${label} failed`, ...asIs].some((p) => message.startsWith(p)) ? message : `${label} failed: ${message}`;
+  console.error(logSafe(said, Infinity));
+  const { error, message: sentence } = refusalParts(err?.body);
+  const carried = error !== null && sentence !== null;
+  annotate({
+    title,
+    what: carried ? `${label} failed (${err.status}): ${error}` : said,
+    fix: carried ? sentence : fix,
+  });
 }
 
 /**

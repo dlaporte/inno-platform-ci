@@ -35,7 +35,8 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
+import { refusalText, reportRefusal } from "./broker-post.mjs";
+import { isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // The largest form the platform takes, before compression: its own memory
 // bound (a finalize holds up to about four copies of the form in one isolate
@@ -222,14 +223,11 @@ export async function handOver({ base, app, deploymentId, token, dir, expected, 
   if (!res.ok) {
     // The refusal's own message names the rule and the fix (a module type the
     // platform does not take, the size cap, a deployment that is not this
-    // app's latest), so it is what the log shows. It can quote an author's
-    // module name, so it is flattened before it reaches a workflow command.
-    let said = text;
-    try {
-      const j = JSON.parse(text);
-      if (j && typeof j === "object") said = [j.error, j.message].filter((s) => typeof s === "string" && s !== "").join(": ") || text;
-    } catch { /* not JSON: the raw text, bounded below */ }
-    throw Object.assign(new Error(`deploy-bundle failed (${res.status}): ${logSafe(said, 1000)}`), { status: res.status, body: text });
+    // app's latest), so it is what the log shows, read as jsonRequest reads
+    // every broker refusal (refusalText: `<error>: <message>`, flattened, as
+    // it can quote an author's module name), the status and the body beside
+    // it for the CLI's report.
+    throw Object.assign(new Error(`deploy-bundle failed (${res.status}): ${refusalText(text)}`), { status: res.status, body: text });
   }
   let answer;
   try { answer = JSON.parse(text); } catch { answer = undefined; }
@@ -274,17 +272,19 @@ if (isMainModule(import.meta.url)) {
     // A plain line, then an annotation, so the refusal shows on the run's
     // summary: the author no longer sees wrangler's own output from a
     // deploy, and this message is the platform's word on why the bundle was
-    // not taken. The plain line keeps the whole message in the step log (the
-    // annotation keeps ANNOTATION_WHAT_MAX characters of it), as the token
-    // and finalize CLIs do. Every message is already flattened where it
-    // quotes anything from outside this script; logSafe and annotate flatten
-    // it again, which is what keeps that true for a message added later.
+    // not taken. ci/broker-post.mjs reportRefusal, as the token, finalize and
+    // SBOM CLIs report one: the plain line keeps the whole message in the
+    // step log (the annotation keeps ANNOTATION_WHAT_MAX characters of it),
+    // and a broker refusal's code is the annotation's what and its sentence
+    // the fix. A local refusal has no fix of its own beyond what it says.
+    // Every message is already flattened where it quotes anything from
+    // outside this script; logSafe and annotate flatten it again, which is
+    // what keeps that true for a message added later.
     const message = String(err?.message ?? err);
     if (message.startsWith("Usage:")) {
       console.error(message);
     } else {
-      console.error(logSafe(message, Infinity));
-      annotate({ title: "App Worker bundle", what: message });
+      reportRefusal(err, { label: "deploy-bundle", title: "App Worker bundle", fix: "" });
     }
     process.exitCode = 1;
   }

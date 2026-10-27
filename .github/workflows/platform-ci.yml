@@ -204,7 +204,7 @@ jobs:
           # the broker's, must not block a deploy, and falls back to the
           # SECURE direction (everything on) (build decision 16).
           emit_defaults() {
-            echo "::warning title=Gate policy unavailable::running all gates with no ignores (secure default)"
+            echo "::warning title=Gate policy unavailable::running all gates with no ignores (secure default)" >&2
             for g in semgrep trivy gitleaks deps; do echo "gates_$g=true" >> "$GITHUB_OUTPUT"; done
             for t in semgrep trivy deps; do echo "ignores_$t=" >> "$GITHUB_OUTPUT"; done
             # Falls back to shape=container, perimeter=sso on a broker outage:
@@ -347,7 +347,7 @@ jobs:
           ENABLED: ${{ needs.policy.outputs.gates_gitleaks }}
         run: |
           if [ "$ENABLED" != "true" ]; then
-            echo "::warning title=SAFETY GATE DISABLED::gitleaks gate disabled by platform policy: no secret scan ran on this deploy"
+            echo "::warning title=SAFETY GATE DISABLED::gitleaks gate disabled by platform policy: no secret scan ran on this deploy" >&2
             echo "### :warning: gitleaks gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
@@ -480,7 +480,7 @@ jobs:
           ENABLED: ${{ needs.policy.outputs.gates_semgrep }}
         run: |
           if [ "$ENABLED" != "true" ]; then
-            echo "::warning title=SAFETY GATE DISABLED::semgrep gate disabled by platform policy: no SAST ran on this deploy"
+            echo "::warning title=SAFETY GATE DISABLED::semgrep gate disabled by platform policy: no SAST ran on this deploy" >&2
             echo "### :warning: semgrep gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
@@ -518,7 +518,7 @@ jobs:
           got="$("$RUNNER_TEMP/semgrep/bin/semgrep" --version)"
           echo "semgrep $got installed (ci/semgrep.lock pins ${want:-no version})"
           if [ -z "$want" ] || [ "$got" != "$want" ]; then
-            echo "::error title=Semgrep version::installed semgrep $got, but ci/semgrep.lock pins ${want:-no version}; refusing to scan with an engine the lock does not name"
+            echo "::error title=Semgrep version::installed semgrep $got, but ci/semgrep.lock pins ${want:-no version}; refusing to scan with an engine the lock does not name" >&2
             exit 1
           fi
           echo "$RUNNER_TEMP/semgrep/bin" >> "$GITHUB_PATH"
@@ -605,7 +605,7 @@ jobs:
           ENABLED: ${{ needs.policy.outputs.gates_deps }}
         run: |
           if [ "$ENABLED" != "true" ]; then
-            echo "::warning title=SAFETY GATE DISABLED::dependency audit gate disabled by platform policy: no dependency scan ran on this deploy"
+            echo "::warning title=SAFETY GATE DISABLED::dependency audit gate disabled by platform policy: no dependency scan ran on this deploy" >&2
             echo "### :warning: dependency audit gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
@@ -815,7 +815,7 @@ jobs:
           IGNORES: ${{ needs.policy.outputs.ignores_trivy }}
         run: |
           if [ "$ENABLED" != "true" ]; then
-            echo "::warning title=SAFETY GATE DISABLED::trivy image gate disabled by platform policy: no image CVE scan ran on this deploy (the app is also exempt from the safety sweep)"
+            echo "::warning title=SAFETY GATE DISABLED::trivy image gate disabled by platform policy: no image CVE scan ran on this deploy (the app is also exempt from the safety sweep)" >&2
             echo "### :warning: trivy gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
@@ -1143,7 +1143,7 @@ jobs:
           set -e
           id="$(docker image inspect --format '{{.Id}}' app-under-test)"
           if [ -z "$id" ]; then
-            echo "::error title=No image id::docker image inspect returned nothing for app-under-test; the scanned image is not on this runner"
+            echo "::error title=No image id::docker image inspect returned nothing for app-under-test; the scanned image is not on this runner" >&2
             exit 1
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
@@ -1230,7 +1230,7 @@ jobs:
           set -uo pipefail
           case "$A11Y_MODE" in off|report|enforce) ;; *) A11Y_MODE=report ;; esac
           if [ "$A11Y_MODE" = "off" ]; then
-            echo "::warning title=Accessibility check off::safety.a11y.mode is off for this app; no accessibility scan ran"
+            echo "::warning title=Accessibility check off::safety.a11y.mode is off for this app; no accessibility scan ran" >&2
             echo "### :warning: Accessibility check OFF by platform policy (safety.a11y.mode)" >> "$GITHUB_STEP_SUMMARY" || true
             exit 0
           fi
@@ -1243,7 +1243,7 @@ jobs:
           # Every failure before the scanner's own verdict is platform-side:
           # loud, never blocking, in either mode.
           not_run() {
-            echo "::warning title=Accessibility scan did not run::$1; this is not a clean result (platform-side; not blocking)"
+            echo "::warning title=Accessibility scan did not run::$1; this is not a clean result (platform-side; not blocking)" >&2
             echo "### :warning: Accessibility scan did not run: $1" >> "$GITHUB_STEP_SUMMARY" || true
             exit 0
           }
@@ -1263,13 +1263,13 @@ jobs:
           # The app's optional route list: a regular file (not a symlink) up to
           # 64 KB, copied in; the scanner validates its contents.
           if [ -L app/inno-a11y.json ]; then
-            echo "::warning title=Accessibility routes::app/inno-a11y.json is a symlink, which is never followed; scanned / only"
+            echo "::warning title=Accessibility routes::app/inno-a11y.json is a symlink, which is never followed; scanned / only" >&2
           elif [ -f app/inno-a11y.json ]; then
             size="$(wc -c < app/inno-a11y.json 2>/dev/null || echo 0)"
             if [ "$size" -le 65536 ]; then
               cp app/inno-a11y.json "$SCAN/in/routes.json" || true
             else
-              echo "::warning title=Accessibility routes::app/inno-a11y.json is over 64 KB; scanned / only"
+              echo "::warning title=Accessibility routes::app/inno-a11y.json is over 64 KB; scanned / only" >&2
             fi
           fi
           { chmod -R a+rX "$SCAN/in" && chmod a+rwx "$SCAN/out"; } || not_run "could not prepare the scan directory"
@@ -1317,7 +1317,7 @@ jobs:
           # one directory the scanner container can write, so a symlink there
           # is refused (never followed into the runner's filesystem).
           if [ -L "$SCAN/out/summary.md" ]; then
-            echo "::warning title=Accessibility report::the scanner's summary is a symlink and was not read (platform-side; not blocking)"
+            echo "::warning title=Accessibility report::the scanner's summary is a symlink and was not read (platform-side; not blocking)" >&2
           elif [ -f "$SCAN/out/summary.md" ]; then
             head -c 200000 "$SCAN/out/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           fi
@@ -1331,12 +1331,12 @@ jobs:
               # symlink all leave it unconfirmed: platform-side, not blocking.
               if [ "$A11Y_MODE" = "enforce" ] && [ -f "$RESULT" ] && [ ! -L "$RESULT" ] \
                 && jq -e '.outcome.exitCode == 1 and .mode == "enforce"' "$RESULT" >/dev/null 2>&1; then
-                echo "::error title=Accessibility check failed::safety.a11y.mode is enforce for this app; fix what the accessibility report above marks as blocking (critical/serious findings, or a landing page that could not be scanned), or ask a platform admin to waive a rule (safety.ignore.a11y.<rule>)"
+                echo "::error title=Accessibility check failed::safety.a11y.mode is enforce for this app; fix what the accessibility report above marks as blocking (critical/serious findings, or a landing page that could not be scanned), or ask a platform admin to waive a rule (safety.ignore.a11y.<rule>)" >&2
                 exit 1
               fi
-              echo "::warning title=Accessibility scanner error::the scanner exited 1 without a confirmed verdict (platform-side); not blocking" ;;
+              echo "::warning title=Accessibility scanner error::the scanner exited 1 without a confirmed verdict (platform-side); not blocking" >&2 ;;
             *)
-              echo "::warning title=Accessibility scanner error::the scanner exited $status (platform-side); not blocking" ;;
+              echo "::warning title=Accessibility scanner error::the scanner exited $status (platform-side); not blocking" >&2 ;;
           esac
           exit 0
 
@@ -1367,11 +1367,11 @@ jobs:
           # the digest-parity lint). NOTE: keep comments ABOVE `docker run`,
           # never between its backslash-continued lines.
           if [ ! -f Dockerfile ] || [ -L Dockerfile ]; then
-            echo "::warning title=Dockerfile report::no regular Dockerfile at the repo root; nothing to report"
+            echo "::warning title=Dockerfile report::no regular Dockerfile at the repo root; nothing to report" >&2
             exit 0
           fi
           D="$RUNNER_TEMP/dockerfile-report"
-          { mkdir -p "$D/src" && cp Dockerfile "$D/src/Dockerfile"; } || { echo "::warning title=Dockerfile report::could not stage the Dockerfile; not blocking"; exit 0; }
+          { mkdir -p "$D/src" && cp Dockerfile "$D/src/Dockerfile"; } || { echo "::warning title=Dockerfile report::could not stage the Dockerfile; not blocking" >&2; exit 0; }
           timeout -k 10 180 docker run --rm \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
             -v "$D/src:/src:ro" \
@@ -1382,7 +1382,7 @@ jobs:
               --quiet \
               --format json \
               /src > "$D/report.json" \
-            || { echo "::warning title=Dockerfile report::trivy config did not complete; report only, not blocking"; exit 0; }
+            || { echo "::warning title=Dockerfile report::trivy config did not complete; report only, not blocking" >&2; exit 0; }
           # Finding text quotes the app's Dockerfile, so it is app-controlled:
           # control characters are flattened (no forged workflow command),
           # table text is entity-encoded except letters, digits and inert
@@ -1406,8 +1406,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY" || true
           # 10 warnings is GitHub's cap per kind per step, and nothing else in
           # this step warns once trivy has run; the rest are counted in a
-          # notice, which no finding can crowd out.
-          jq -r "$JQDEFS"' findings | (.[:10][] | "::warning title=Dockerfile (\(.Severity // "?" | .[:20] | prop)) \(.ID // "?" | .[:40] | prop)::\(((.Title // "") + ": " + (.Message // "")) | .[:300] | flat | gsub("%"; "%25"))"), (length - 10 | select(. > 0) | "::notice title=Dockerfile report::\(.) more finding(s) (first 50 in the step summary)")' "$D/report.json" 2>/dev/null || true
+          # notice, which no finding can crowd out. On stderr, as every
+          # annotation is (OPEN 149): the >&2 comes before the 2>/dev/null
+          # that drops jq's own errors, or it would drop the lines too.
+          jq -r "$JQDEFS"' findings | (.[:10][] | "::warning title=Dockerfile (\(.Severity // "?" | .[:20] | prop)) \(.ID // "?" | .[:40] | prop)::\(((.Title // "") + ": " + (.Message // "")) | .[:300] | flat | gsub("%"; "%25"))"), (length - 10 | select(. > 0) | "::notice title=Dockerfile report::\(.) more finding(s) (first 50 in the step summary)")' "$D/report.json" >&2 2>/dev/null || true
           echo "dockerfile-report: $n HIGH/CRITICAL finding(s); report only"
 
       # Only a tag run deploys, so only a tag run needs the image handed over.
@@ -1416,8 +1418,8 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
         # The default run shell is `bash -e {0}`, which does NOT set pipefail,
         # so a failed `docker save` would exit with gzip's 0 and upload a
-        # truncated archive. The deploy job then loads it and reports "Image
-        # mismatch" after it has already minted a deploy token.
+        # truncated archive, which the deploy job finds only when it unpacks
+        # it, a job after the failure.
         run: |
           set -o pipefail
           docker save app-under-test | gzip -1 > image.tar.gz
@@ -2041,6 +2043,47 @@ jobs:
           set -e
           node inno-platform-ci/ci/deploy-bundle.mjs --verify "$RUNNER_TEMP/app-bundle" "$EXPECTED"
 
+      # Container-shaped only: the scanned image, downloaded and loaded before
+      # the OIDC and deploy-token steps for the reason the bundle's download
+      # and check run there: neither needs a token, so they spend none of the
+      # push token's 15 minutes, and a missing or corrupt archive ends the run
+      # before the broker records a deployment. Nothing trusts the loaded
+      # image yet: the verify step after the token compares its id with the
+      # one the container job recorded with the broker (R7-deploy-ci-6).
+      #
+      # download-artifact v7.0.0 and the upload-artifact v6.0.0 that wrote
+      # these are each action's first Node 24 release, on the same
+      # @actions/artifact 5, and neither changed an input default from the v4
+      # pair before them: a download by name extracts into the workspace root
+      # unless `path:` says otherwise, and a digest mismatch still only warns
+      # (error is v8's default). The id check below, not the action, is what
+      # authenticates the image, and the hand-over's sha256 check does the
+      # same for the bundle downloaded above.
+      #
+      # Each download lands in a directory of its own under the runner's temp,
+      # never the workspace: an app-owned job in the caller shares this run's
+      # artifact namespace and can upload its own archive under either name,
+      # and extracted at the workspace root it would replace the files the
+      # mirror checkout put there (the ci/ scripts this job runs, beside the
+      # OIDC grant and the push token) before any check ran. The unpack step,
+      # the bundle's check and the hand-over read from those directories.
+      - name: Load the scanned image
+        if: needs.policy.outputs.function_shaped != 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: inno-scanned-image
+          path: ${{ runner.temp }}/scanned-image
+
+      # pipefail for the same reason as the save step: without it the
+      # `gunzip -c | docker load` pipe reports docker load's status alone, and
+      # a truncated archive surfaced only as "Image mismatch".
+      - name: Unpack the scanned image
+        if: needs.policy.outputs.function_shaped != 'true'
+        run: |
+          set -e
+          set -o pipefail
+          gunzip -c "$RUNNER_TEMP/scanned-image/image.tar.gz" | docker load
+
       # Requests a GitHub OIDC token scoped to audience "inno-platform-deploy"
       # (id-token: write, granted above). This token is used ONLY for
       # /deploy-token; the bundle hand-over and the finalize step below each
@@ -2098,55 +2141,28 @@ jobs:
             echo "image_id=$image_id"
           } >> "$GITHUB_OUTPUT"
 
-      # download-artifact v7.0.0 and the upload-artifact v6.0.0 that wrote
-      # these are each action's first Node 24 release, on the same
-      # @actions/artifact 5, and neither changed an input default from the v4
-      # pair before them: a download by name extracts into the workspace root
-      # unless `path:` says otherwise, and a digest mismatch still only warns
-      # (error is v8's default). The id check below, not the action, is what
-      # authenticates the image, and the hand-over's sha256 check does the
-      # same for the bundle downloaded above.
-      #
-      # Each download lands in a directory of its own under the runner's temp,
-      # never the workspace: an app-owned job in the caller shares this run's
-      # artifact namespace and can upload its own archive under either name,
-      # and extracted at the workspace root it would replace the files the
-      # mirror checkout put there (the ci/ scripts this job runs, beside the
-      # OIDC grant and the push token) before any check ran. The verify step
-      # and the hand-over read from those directories.
-      - name: Load the scanned image
-        if: needs.policy.outputs.function_shaped != 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: inno-scanned-image
-          path: ${{ runner.temp }}/scanned-image
-
       # THE build-once check (R11). wrangler used to re-build the author's
       # Dockerfile here, with CLOUDFLARE_API_TOKEN in env, producing a SECOND
       # image that the gates never saw and whose contents could differ (the
       # template Dockerfile alone is non-hermetic: a floating base tag plus
-      # `apt-get -y upgrade`). Now the scanned image is carried over and
-      # verified against the id the container job recorded with the broker, so
-      # an artifact substituted by an app-owned job in the caller cannot pass.
+      # `apt-get -y upgrade`). Now the scanned image is carried over, loaded
+      # before the token, and verified here against the id the container job
+      # recorded with the broker, so an artifact substituted by an app-owned
+      # job in the caller cannot pass.
       - name: Verify the loaded image is the scanned one
         id: verify_image
         if: needs.policy.outputs.function_shaped != 'true'
         env:
           EXPECTED: ${{ steps.deploy_token.outputs.image_id }}
-        # pipefail for the same reason as the save step: without it the
-        # `gunzip -c | docker load` pipe below reports docker load's status
-        # alone, and a truncated archive surfaced only as "Image mismatch".
         # The empty-id branch is defensive: the broker refuses the token
         # request of a run that recorded no scanned image (image_not_recorded)
         # before it mints anything, so no normal run reaches it.
         run: |
           set -e
-          set -o pipefail
           if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
-            echo "::error title=No scanned image recorded::the broker answered no scanned image id for this run; re-run the release's workflow"
+            echo "::error title=No scanned image recorded::the broker answered no scanned image id for this run; re-run the release's workflow" >&2
             exit 1
           fi
-          gunzip -c "$RUNNER_TEMP/scanned-image/image.tar.gz" | docker load
           got="$(docker image inspect --format '{{.Id}}' app-under-test)"
           if [ "$got" != "$EXPECTED" ]; then
             node inno-platform-ci/ci/annotate.mjs --title "Image mismatch" \

@@ -13,61 +13,47 @@
 // Not best-effort (R7-1, v0.17.4): this upload is the one place a run records
 // the scanned image's id, and the broker refuses the deploy job's token
 // request for a run that recorded none. So the CLI fails its step on any
-// failure, with one error annotation that carries the broker's refusal
-// (ci/cli.mjs annotate, which flattens it, so a refusal's text cannot start a
-// workflow command of its own), and exits 1. A refusal that carries the broker's own sentence
-// (sbom_too_large, app_stopped, repo_unlinked) says what to do, so the line
-// adds no remedy of its own: for an SBOM over the cap, re-running the release's
-// workflow would rebuild the same image and meet the same refusal. Any other
-// failure (no answer, a 5xx, a refusal with no sentence, an unreadable SBOM
-// file) ends with the CLI's remedy, re-running the release's workflow. The
-// tenant workflow runs it on a release tag only (platform-ci.yml, "Upload
-// SBOM and image id to broker").
+// failure and exits 1, reporting it as the token, finalize and bundle CLIs
+// do (ci/broker-post.mjs reportRefusal, R7-deploy-ci-7): the message plainly
+// on stderr, then one error annotation titled "SBOM upload failed" (ci/cli.mjs
+// annotate, which flattens it, so a refusal's text cannot start a workflow
+// command of its own). A refusal that carries the broker's own sentence
+// (sbom_too_large, app_stopped, repo_unlinked) says what to do, so the
+// sentence is the annotation's fix and the CLI adds no remedy of its own: for
+// an SBOM over the cap, re-running the release's workflow would rebuild the
+// same image and meet the same refusal. Any other failure (no answer, a
+// refusal with no sentence, an unreadable SBOM file) ends with the CLI's
+// remedy, re-running the release's workflow. The tenant workflow runs it on a
+// release tag only (platform-ci.yml, "Upload SBOM and image id to broker").
 //
 // Usage: node ci/sbom-upload.mjs <brokerUrl> <app> <sbomPath> <token> [imageId]
 // `token` is the GitHub Actions OIDC token (verified server-side).
 
 import { readFile } from "node:fs/promises";
-import { brokerPost } from "./broker-post.mjs";
-import { annotate, isMainModule, logSafe } from "./cli.mjs";
+import { brokerPost, reportRefusal } from "./broker-post.mjs";
+import { isMainModule, logSafe } from "./cli.mjs";
 
 /**
  * POST {app, sbom, image_id?} to `${base}/deploy-sbom`, authenticated with the
- * GitHub Actions OIDC token.
+ * GitHub Actions OIDC token. The fields are one options object, as every ci/
+ * broker helper's are, so an injected fetcher can never land in an optional
+ * field's slot.
  *
- * @param {string} base - broker base URL
- * @param {string} token - GitHub Actions OIDC token
- * @param {string} app
- * @param {object} sbom - parsed CycloneDX document
- * @param {string} [imageId] - the scanned image's config digest (R11)
- * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} fetcher
+ * @param {object} req
+ * @param {string} req.base - broker base URL
+ * @param {string} req.token - GitHub Actions OIDC token
+ * @param {string} req.app
+ * @param {object} req.sbom - parsed CycloneDX document
+ * @param {string} [req.imageId] - the scanned image's config digest (R11); no field when empty
+ * @param {(url: string, init?: any) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>} [fetcher]
  *   - injectable for testing; defaults to global fetch
  * @returns {Promise<any>} the parsed JSON response body (e.g. { stored })
  */
-export async function uploadSbom(base, token, app, sbom, imageId, fetcher = fetch) {
+export async function uploadSbom({ base, token, app, sbom, imageId }, fetcher = fetch) {
   return brokerPost(
     { base, path: "/deploy-sbom", label: "deploy-sbom", token, body: { app, sbom, ...(imageId ? { image_id: imageId } : {}) } },
     fetcher,
   );
-}
-
-/**
- * True for a refusal that carries the broker's own sentence: a 4xx whose JSON
- * body has a string `error` and `message` (the shape broker-post.mjs prints as
- * `<error>: <message>`). A 5xx is never one: whatever it says, the remedy is
- * to run again.
- *
- * @param {any} err - what uploadSbom threw
- * @returns {boolean}
- */
-export function carriesBrokerSentence(err) {
-  if (typeof err?.status !== "number" || err.status >= 500 || typeof err.body !== "string") return false;
-  try {
-    const j = JSON.parse(err.body);
-    return !!j && typeof j.error === "string" && typeof j.message === "string";
-  } catch {
-    return false;
-  }
 }
 
 if (isMainModule(import.meta.url)) {
@@ -82,18 +68,21 @@ if (isMainModule(import.meta.url)) {
     } catch (err) {
       throw new Error(`could not read/parse SBOM at ${sbomPath}: ${String(err?.message ?? err)}`);
     }
-    const result = await uploadSbom(base, token, app, sbom, imageId);
+    const result = await uploadSbom({ base, token, app, sbom, imageId });
     // The step prints this line to its log as it is, so the broker's answer
     // is flattened (logSafe breaks the runner's ##[ marker too).
     console.log(`deploy-sbom: ${logSafe(JSON.stringify(result), Infinity)}`);
   } catch (err) {
-    annotate({
-      title: "SBOM upload failed",
-      what: String(err?.message ?? err),
-      fix: carriesBrokerSentence(err)
-        ? ""
-        : "this release cannot deploy without it: fix what the message names, then re-run the release's workflow",
-    });
+    const raw = String(err?.message ?? err);
+    if (raw.startsWith("Usage:")) {
+      console.error(raw);
+    } else {
+      reportRefusal(err, {
+        label: "deploy-sbom",
+        title: "SBOM upload failed",
+        fix: "this release cannot deploy without it: fix what the message names, then re-run the release's workflow",
+      });
+    }
     process.exitCode = 1;
   }
 }
