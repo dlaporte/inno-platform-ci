@@ -54,7 +54,7 @@ import { annotate, logSafe } from "./cli.mjs";
 
 // The most of a refusal's message the thrown error carries: room for the
 // longest the platform writes, a finalize's script_rejected quoting up to
-// 2000 characters of Cloudflare's answer (src/clients/cloudflare.ts
+// 2000 characters of Cloudflare's answer (src/clients/cf-scripts.ts
 // SCRIPT_UPLOAD_MAX_ERROR_BODY) after its own words.
 export const REFUSAL_MESSAGE_MAX_CHARS = 4000;
 
