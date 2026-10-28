@@ -621,6 +621,54 @@ function launchChrome(binary) {
   return { proc, profile };
 }
 
+// How long the scanner waits for the browser it killed to exit before it
+// removes the throwaway profile, and how that removal retries what a child
+// process still writing leaves behind (an ENOTEMPTY): up to
+// PROFILE_REMOVE_TRIES tries, pausing PROFILE_REMOVE_DELAY_MS times the try's
+// number after each failed one (2 s in all). The retry is the scanner's own:
+// rmSync's maxRetries and retryDelay do not pause as Node documents them on
+// the Node versions probed. A profile still left after that is one line,
+// never a crash: it sits under the scanner container's /tmp, which goes with
+// the container.
+export const BROWSER_EXIT_WAIT_MS = 5_000;
+export const PROFILE_REMOVE_TRIES = 5;
+export const PROFILE_REMOVE_DELAY_MS = 200;
+
+/**
+ * Kill the browser and remove its throwaway profile. Never throws: scan()
+ * calls it from its `finally`, where a throw would replace the scan's result.
+ * A browser that started and has not exited is sent SIGKILL and waited for
+ * until it exits or `waitMs` passes, whichever comes first; one that never
+ * started (a spawn error has no exit to wait for) or already exited is not
+ * waited for. The removal is tried up to PROFILE_REMOVE_TRIES times, with a
+ * longer pause after each failed try; only when every try failed is it one
+ * line on stderr.
+ */
+export async function closeBrowser(proc, profile, { remove = (dir) => rmSync(dir, { recursive: true, force: true }), waitMs = BROWSER_EXIT_WAIT_MS } = {}) {
+  if (proc.pid !== undefined && proc.exitCode === null && proc.signalCode === null) {
+    let timer;
+    const exited = new Promise((resolve) => {
+      timer = setTimeout(resolve, waitMs);
+      proc.once("exit", resolve);
+    });
+    proc.kill("SIGKILL");
+    await exited;
+    clearTimeout(timer);
+  }
+  for (let attempt = 1; ; attempt++) {
+    try {
+      remove(profile);
+      return;
+    } catch (e) {
+      if (attempt >= PROFILE_REMOVE_TRIES) {
+        console.error(`a11y-scan: the browser's throwaway profile was not removed (${logSafe(e && e.message ? e.message : e, 160)}); it goes with the scanner's container`);
+        return;
+      }
+    }
+    await sleep(PROFILE_REMOVE_DELAY_MS * attempt);
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Page statuses that are the APP's doing (a 4xx, a blank shell, a redirect
@@ -868,9 +916,12 @@ async function waitHealthz(base, seconds) {
 
 /**
  * Drive the browser over every route. Never throws: a failure to start is a
- * result with no scanned pages and an error string.
+ * result with no scanned pages and an error string. `removeProfile` is
+ * injected by the tests (the teardown's profile removal); unset, the
+ * teardown's own runs.
  */
-export async function scan({ base, routes, axeSource, app, groupPrefix, anonymous = false, chrome, budgetMs = SCAN_BUDGET_MS }) {
+export async function scan({ base, routes, axeSource, app, groupPrefix, anonymous = false, chrome, budgetMs = SCAN_BUDGET_MS,
+  removeProfile = /** @type {((dir: string) => void) | undefined} */ (undefined) }) {
   const deadline = Date.now() + budgetMs;
   const identity = identityHeaders({ base, app, groupPrefix, anonymous });
   const binary = chrome || findChrome();
@@ -894,8 +945,7 @@ export async function scan({ base, routes, axeSource, app, groupPrefix, anonymou
   } catch (e) {
     return { pages, axeVersion, infra: true, error: `browser failed: ${logSafe(e && e.message ? e.message : e, 160)}` };
   } finally {
-    proc.kill("SIGKILL");
-    rmSync(profile, { recursive: true, force: true });
+    await closeBrowser(proc, profile, { remove: removeProfile });
   }
 }
 

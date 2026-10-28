@@ -141,7 +141,7 @@ export async function finalize({ base, token, app, deploymentId, imageId, image,
 // host in DNS (two reads) and attached it (each of those three calls 30 s at
 // most), and committed the deployment; a shorter bound fails a slow but
 // healthy deploy that the platform goes on to finish. It also stays a
-// minute inside the app lease the finalize runs under (src/registry.ts
+// minute inside the app lease the finalize runs under (src/app-lease.ts
 // LEASE_TTL_MS, 10 minutes): when CI gives up, the job's last step asks
 // /deploy-abandon to release the app under that same lease, and must meet it
 // still held (app_busy, the app left to the recovery sweep) rather than take
