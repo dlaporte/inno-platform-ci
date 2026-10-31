@@ -1711,7 +1711,8 @@ jobs:
       # $RUNNER_TEMP outside the app checkout, so nothing of the author's sits
       # on its resolution path. wrangler runs exclusively as "$WRANGLER",
       # never via `npx` (which would fetch wrangler from the registry,
-      # unpinned).
+      # unpinned). The same lockfile pins the esbuild and Tailwind CLI that
+      # ci/build-ui.mjs runs from this copy for a browser interface.
       #
       # It also puts the mirror's bundling config and compiler settings at the
       # checkout root, over any author file of either name: app-worker.jsonc,
@@ -1762,8 +1763,9 @@ jobs:
       # credential, no token, no secret. A later change that puts anything
       # sensitive on this job's disk must not rely on this guard.
       #
-      # It runs immediately before the bundle and under its condition, so
-      # nothing between the two can add a link.
+      # It runs immediately before the interface build and the bundle, under
+      # their condition, and neither of those adds a link, so nothing between
+      # it and the bundle can.
       #
       # Each refused link is one annotation (R7-5) from the mirror checkout's
       # ci/annotate.mjs, the link as its file, so a link's name, which the
@@ -1812,6 +1814,26 @@ jobs:
             echo "A symlink in your repository points outside it; a link may name only a file inside your repository. Remove it, or point it inside." >&2
             exit 1
           fi
+
+      # A function app's browser interface (APP-CONTRACT §1.1, "Browser
+      # interface"), built before the bundle that carries it. With no app/ui/
+      # the script removes a committed app/.ui-build/ (its own output dir,
+      # with a warning) and builds nothing, so an app without an interface
+      # bundles as before. With one, it runs the build tools' pinned esbuild
+      # (and Tailwind CLI, when app/ui/styles.css imports tailwindcss) over
+      # app/ui/, resolving packages from app/node_modules, the tree the
+      # install above put there and the deps gate audits, and writes the
+      # result as one generated module, app/.ui-build/ui.ts, which the
+      # author's app/index.ts imports and the bundle below carries under the
+      # same 16 MiB cap. It reads author files after the symlink guard and
+      # writes only regular files under app/.ui-build, so it adds no link;
+      # like the bundle, it runs in a job that holds nothing worth reading
+      # (threat model DP11). A failed build ends with its annotations
+      # ("Browser interface build", "Tailwind build", "Browser interface
+      # entry missing").
+      - name: Build the app's browser interface
+        if: needs.policy.outputs.function_shaped == 'true' && needs.scaffold-check.outputs.built == 'true'
+        run: node inno-platform-ci/ci/build-ui.mjs --tools "$RUNNER_TEMP/build-tools"
 
       # Bundles the app Worker from the checkout with the bundling config
       # above. `--dry-run` needs no auth and makes no call to Cloudflare, and
