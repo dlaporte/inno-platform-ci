@@ -185,7 +185,7 @@ export function parseIdentity(raw) {
 /**
  * The headers the front door owns under R3, as the scan sends them: a
  * synthetic member of the app's users group (<groupPrefix><app>-users,
- * src/naming.ts oktaGroupName's formula) with a synthetic subject, and the
+ * src/naming.ts usersGroupName's formula) with a synthetic subject, and the
  * forwarded host and proto of --base. Those two are what is true on the runner (production
  * sends the app's hostname and https); APP-CONTRACT tells apps to build
  * links from them, and an https proto here would send an app's own
