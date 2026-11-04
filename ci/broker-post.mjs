@@ -17,8 +17,7 @@
 //     with its own message, rather than let a report pass that the broker may
 //     never have read.
 //   - scripts/cf-api.mjs's apiReq, the Cloudflare API call of the operator
-//     scripts built on it, scripts/check-okta-server.mjs and
-//     scripts/placeholders.mjs.
+//     script built on it, scripts/placeholders.mjs.
 //   - ci/export-app.mjs's R2 list. Its object GET stays raw: it streams the
 //     body to disk.
 //

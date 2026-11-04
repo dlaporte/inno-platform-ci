@@ -2,8 +2,8 @@
 
 The Innovation Platform's **public CI contract**: the reusable safety-gate +
 deploy workflow (`.github/workflows/platform-ci.yml`), the gate scripts it
-runs (`ci/`), and the pinned build tools the deploy job installs
-(`ci/build/`).
+runs (`ci/`), and the pinned build tools the app-build and deploy jobs
+install (`ci/build/`).
 
 **This repo is a generated mirror (do not open PRs here).** Source of truth,
 tests, and review happen in the private `inno-platform` repo; every commit

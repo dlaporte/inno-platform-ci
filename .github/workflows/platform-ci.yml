@@ -639,15 +639,19 @@ jobs:
         run: |
           # There is deliberately no root `npm audit` here: config-integrity
           # check 8 REJECTS a repo carrying a root package.json/package-lock.json
-          # /tsconfig.json. The deploy job installs the platform's build tools
-          # from the mirror's ci/build/ into its own directory outside the
-          # checkout, and puts only tsconfig.json at the checkout root, for the
-          # function shape, over any author copy. An author package.json or
-          # lockfile there would sit in esbuild's lookup from app/index.ts, and
-          # any of the three is always stale, so the gate keeps all three out.
-          # So any repo that reaches this job has no root manifest to audit.
-          # The build tools (wrangler, a dev tool bundled into no app) are
-          # reported by the platform's CI and watched by Dependabot.
+          # /tsconfig.json. The app-build job (a function app's bundle) and the
+          # deploy job (a container app's image push) install the platform's
+          # build tools from the mirror's ci/build/ into a directory of their
+          # own outside the checkout, and app-build puts only tsconfig.json at
+          # the checkout root, for the function shape, over any author copy. An
+          # author package.json or lockfile there would sit in esbuild's lookup
+          # from app/index.ts, and any of the three is always stale, so the gate
+          # keeps all three out. So any repo that reaches this job has no root
+          # manifest to audit. The build tools (wrangler, esbuild and the
+          # Tailwind CLI) are reported by the platform's CI and watched by
+          # Dependabot, not gated here: no tool is bundled into an app, though
+          # a browser interface's bundle and stylesheet, which esbuild and the
+          # Tailwind CLI build from app/ui/, reach the app's Worker.
           # The app's OWN dependencies are audited by the two steps below.
           echo "root manifest is forbidden by config-integrity; the platform's build tools come from the mirror's ci/build, reported by the platform's CI and watched by Dependabot"
 
