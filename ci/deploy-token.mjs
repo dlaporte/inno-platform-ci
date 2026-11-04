@@ -7,8 +7,8 @@
 // image's id the container job recorded; a function app's answer carries
 // neither (the platform uploads its Worker), and each is then "". The step
 // masks the token before anything else is logged and writes the three to its
-// outputs. The answer's other fields (expires_on, shape, perimeter) are read
-// by no step and are not printed.
+// outputs. The answer's other field (expires_on) is read by no step and is
+// not printed.
 //
 // Usage: node ci/deploy-token.mjs <brokerUrl> <app> <token>
 // `token` is the GitHub Actions OIDC token (audience inno-platform-deploy).

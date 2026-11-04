@@ -122,7 +122,6 @@ jobs:
       # scan sends an anonymous app the four identity headers empty, as the
       # front door serves it.
       identity: ${{ steps.fetch.outputs.identity }}
-      shape: ${{ steps.fetch.outputs.shape }}
       perimeter: ${{ steps.fetch.outputs.perimeter }}
       # The shape axis, collapsed to a boolean: 'true' when the app's code is
       # an app-owned Worker in the dispatch namespace (shape == 'function'), i.e. NOT a
@@ -207,11 +206,10 @@ jobs:
             echo "::warning title=Gate policy unavailable::running all gates with no ignores (secure default)" >&2
             for g in semgrep trivy gitleaks deps; do echo "gates_$g=true" >> "$GITHUB_OUTPUT"; done
             for t in semgrep trivy deps; do echo "ignores_$t=" >> "$GITHUB_OUTPUT"; done
-            # Falls back to shape=container, perimeter=sso on a broker outage:
-            # the safe, original build path (a function app that can't be
-            # identified just runs the container gates, which its repo won't
-            # satisfy, and fails safely).
-            echo "shape=container" >> "$GITHUB_OUTPUT"
+            # Falls back to function_shaped=false and perimeter=sso on a
+            # broker outage: the safe, original build path (a function app
+            # that can't be identified just runs the container gates, which
+            # its repo won't satisfy, and fails safely).
             echo "perimeter=sso" >> "$GITHUB_OUTPUT"
             echo "function_shaped=false" >> "$GITHUB_OUTPUT"
             # Cooldown has no "secure default" that could block a legit deploy on
@@ -294,10 +292,9 @@ jobs:
           # values fail safe to the container x sso path exactly as before.
           shape="$(printf '%s' "$resp" | jq -r 'if .shape == "function" then "function" else "container" end')"
           perimeter="$(printf '%s' "$resp" | jq -r 'if .perimeter == "oauth-rs" then "oauth-rs" else "sso" end')"
-          echo "shape=$shape" >> "$GITHUB_OUTPUT"
           echo "perimeter=$perimeter" >> "$GITHUB_OUTPUT"
-          # function_shaped survives as the gate-condition flag; it is now simply
-          # the shape axis.
+          # The shape axis reaches the gates as one flag, function_shaped,
+          # which every condition reads.
           if [ "$shape" = "function" ]; then
             echo "function_shaped=true" >> "$GITHUB_OUTPUT"
           else
