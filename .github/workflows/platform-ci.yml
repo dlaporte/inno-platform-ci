@@ -792,9 +792,9 @@ jobs:
       # two scripts directly: the annotation helper,
       # $RUNNER_TEMP/annotate/annotate.mjs, with which a contract step ends a
       # refusal on any run, and inno-platform-ci/ci/sbom-upload.mjs on a
-      # release tag). A cache key would have to hash a root lockfile that, once
-      # app repos stop vendoring worker build inputs, won't exist here; this
-      # job installs no build tools and injects nothing.
+      # release tag). A cache key would have to hash a root lockfile, which
+      # config-integrity check 8 refuses in an app repo (ci/check-config.mjs);
+      # this job installs no build tools and injects nothing.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: needs.policy.outputs.function_shaped != 'true'
         with:
@@ -1846,12 +1846,12 @@ jobs:
       # (the gate rejects a committed .env; this is the suspenders).
       #
       # --config app-worker.jsonc pins the exact file copied from the mirror.
-      # (config-integrity does not vet this file: it REJECTS any wrangler
-      # config committed to the app repo; the guarantee is provenance, not
-      # inspection.) wrangler discovers config as wrangler.json ??
-      # wrangler.jsonc ?? wrangler.toml (wrangler.json OUTRANKS .jsonc, and
-      # multiple files don't error), so without --config an attacker could add
-      # an unvetted wrangler.json and have wrangler silently use it.
+      # (config-integrity does not vet this file: it REJECTS any wrangler config
+      # at the app repository's root, where wrangler's discovery looks; the
+      # guarantee is provenance, not inspection.) wrangler discovers config as
+      # wrangler.json ?? wrangler.jsonc ?? wrangler.toml (wrangler.json OUTRANKS
+      # .jsonc, and multiple files don't error), so without --config an attacker
+      # could add an unvetted wrangler.json and have wrangler silently use it.
       #
       # `pipefail` is set explicitly rather than assumed: a `run:` block with
       # no `shell:` key executes as `bash -e {0}`, where a pipeline reports
@@ -2182,7 +2182,7 @@ jobs:
         # before it mints anything, so no normal run reaches it.
         run: |
           set -e
-          if [ -z "$EXPECTED" ] || [ "$EXPECTED" = "null" ]; then
+          if [ -z "$EXPECTED" ]; then
             echo "::error title=No scanned image recorded::the broker answered no scanned image id for this run; re-run the release's workflow" >&2
             exit 1
           fi
@@ -2353,8 +2353,7 @@ jobs:
       # reached the step, which the sweep then covers). A fresh OIDC token,
       # as finalize mints one: the first may have expired by now.
       # ci/deploy-abandon.mjs adds no failure: it ends in a notice or a
-      # warning whatever the platform answers, a 405 from a platform without
-      # the route included.
+      # warning whatever the platform answers.
       - name: Get OIDC token to release the app
         id: oidc_abandon
         if: failure() && steps.deploy_token.outputs.deployment_id != ''
