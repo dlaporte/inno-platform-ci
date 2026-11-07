@@ -282,12 +282,12 @@ export async function main({ appDir, thresholdDays, functionShaped } = {}) {
 if (isMainModule(import.meta.url)) {
   // A crash is the gate's failure too, said the way its verdicts are (an
   // unreadable manifest's error can quote what it read, so it is flattened).
-  main().then((code) => process.exit(code)).catch((e) => {
+  main().then((code) => { process.exitCode = code; }).catch((e) => {
     annotate({
       title: "Dependency cooldown",
       what: logSafe(String(e?.message ?? e)),
       fix: "re-run the workflow; if it repeats, ask a platform admin",
     });
-    process.exit(1);
+    process.exitCode = 1;
   });
 }

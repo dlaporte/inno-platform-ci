@@ -31,7 +31,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { brokerPost, reportRefusal, withBusyRetry } from "./broker-post.mjs";
-import { annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
+import { UsageError, annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // A FAILURE-SHAPE guard, not a security bound. The platform already refuses an
 // oversized body at 64 KiB (readAppBody's DEFAULT_MAX_BODY_BYTES), but it does
@@ -156,7 +156,7 @@ if (isMainModule(import.meta.url)) {
   try {
     const [base, app, deploymentId, token, imageIdArg, imageArg, bundleArg] = process.argv.slice(2);
     if (!base || !app || !deploymentId || !token) {
-      throw new Error("Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [imageId] [image] [bundle]");
+      throw new UsageError("Usage: node ci/deploy-finalize.mjs <brokerUrl> <app> <deploymentId> <token> [imageId] [image] [bundle]");
     }
     // The broker's /deploy-token response is where this came from (via
     // `jq -r .deployment_id`); parseIntegerArg says what a malformed one
@@ -194,15 +194,15 @@ if (isMainModule(import.meta.url)) {
     console.error(`deploy-complete: ${logSafe(JSON.stringify(result), Infinity)}`);
     console.log(JSON.stringify(result));
   } catch (err) {
-    const raw = String(err?.message ?? err);
-    if (raw.startsWith("Usage:")) {
-      console.error(raw);
+    if (err instanceof UsageError) {
+      console.error(err.message);
+      process.exitCode = 2;
     } else {
       // A malformed deployment id is this CLI's own refusal, and reads as it is.
       reportRefusal(err, {
         label: "deploy-complete", title: "Deploy not finalized", fix: "re-run the release's workflow", asIs: ["invalid deploymentId"],
       });
+      process.exitCode = 1;
     }
-    process.exitCode = 1;
   }
 }

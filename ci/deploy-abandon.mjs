@@ -33,7 +33,7 @@
 // arguments not parsing.
 
 import { brokerPost, refusalParts, withBusyRetry } from "./broker-post.mjs";
-import { annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
+import { UsageError, annotate, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 
 // How long each attempt waits for its answer: the platform's release is a
 // few writes under the app's lease, as quick as the token request it undoes
@@ -96,11 +96,11 @@ if (isMainModule(import.meta.url)) {
   let req;
   try {
     const [base, app, deploymentId, token = "", ...rest] = process.argv.slice(2);
-    if (!base || !app || !deploymentId || rest.length) throw new Error(USAGE);
+    if (!base || !app || !deploymentId || rest.length) throw new UsageError(USAGE);
     req = { base, app, deploymentId: parseIntegerArg("deploymentId", deploymentId), token };
   } catch (err) {
     console.error(logSafe(String(err?.message ?? err), 1000));
-    process.exitCode = 1;
+    process.exitCode = err instanceof UsageError ? 2 : 1;
   }
   if (req && !req.token) {
     annotate({

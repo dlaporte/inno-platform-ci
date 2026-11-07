@@ -35,7 +35,7 @@
 
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { annotate, annotateAll, isMainModule } from "./cli.mjs";
+import { UsageError, annotate, annotateAll, isMainModule } from "./cli.mjs";
 
 const USAGE = [
   "Usage: node ci/annotate.mjs [--level <error|warning|notice>] --title <t> --what <w> [--fix <f>] [--file <p>]",
@@ -66,10 +66,10 @@ export function parseAnnotateArgs(argv) {
       allowPositionals: false,
     }));
   } catch {
-    throw new Error(USAGE);
+    throw new UsageError(USAGE);
   }
   const { level, title, what, fix, file, each } = values;
-  if (!["error", "warning", "notice"].includes(level) || !title || (what === undefined) === !each) throw new Error(USAGE);
+  if (!["error", "warning", "notice"].includes(level) || !title || (what === undefined) === !each) throw new UsageError(USAGE);
   return { level: /** @type {"error"|"warning"|"notice"} */ (level), title, what, fix, file, each };
 }
 
@@ -78,8 +78,10 @@ if (isMainModule(import.meta.url)) {
   try {
     args = parseAnnotateArgs(process.argv.slice(2));
   } catch (err) {
+    // Every refusal parseAnnotateArgs throws is a usage error (ci/cli.mjs's
+    // exit-code rule).
     console.error(String(err?.message ?? err));
-    process.exitCode = 1;
+    process.exitCode = 2;
   }
   if (args) {
     const { level, title, what, fix, file, each } = args;

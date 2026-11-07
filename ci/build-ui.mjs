@@ -191,11 +191,12 @@ export async function buildUi({ tools, app = "app", log = (s) => console.log(s) 
 if (isMainModule(import.meta.url)) {
   let values;
   try {
-    ({ values } = parseArgs({ args: process.argv.slice(2), options: { tools: { type: "string" }, app: { type: "string", default: "app" } } }));
-    if (!values.tools) throw new Error("--tools is required");
+    const parsed = parseArgs({ args: process.argv.slice(2), options: { tools: { type: "string" }, app: { type: "string", default: "app" } } }).values;
+    if (!parsed.tools) throw new Error("--tools is required");
+    values = parsed;
   } catch (err) {
     console.error(`${logSafe(err.message)}\n${USAGE}`);
-    process.exit(2);
+    process.exitCode = 2;
   }
-  process.exit(await buildUi({ tools: values.tools, app: values.app }));
+  if (values) process.exitCode = await buildUi({ tools: values.tools, app: values.app });
 }

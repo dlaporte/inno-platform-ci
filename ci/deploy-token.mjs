@@ -78,7 +78,7 @@ if (isMainModule(import.meta.url)) {
   const [base, app, token] = process.argv.slice(2);
   if (!base || !app || !token) {
     console.error(USAGE);
-    process.exitCode = 1;
+    process.exitCode = 2;
   } else {
     try {
       // stdout is the JSON alone: the step parses it with jq. Everything else,

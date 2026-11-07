@@ -476,20 +476,20 @@ if (isMainModule(import.meta.url)) {
   const [appDir] = process.argv.slice(2);
   if (!appDir) {
     console.error("Usage: node ci/check-config.mjs <app-dir>");
-    process.exit(1);
-  }
-
-  const { ok, violations } = checkConfig(appDir);
-  if (!ok) {
-    console.error("config-integrity check FAILED:");
-    for (const line of violationLines(violations)) console.error(line);
-    annotateAll({
-      title: "Config integrity",
-      fix: "fix it as get_app_contract R7 says, then push again",
-      items: violations.map((v) => ({ what: v.message, ...(v.file ? { file: v.file } : {}) })),
-    });
-    process.exitCode = 1;
+    process.exitCode = 2;
   } else {
-    console.log("config-integrity check passed.");
+    const { ok, violations } = checkConfig(appDir);
+    if (!ok) {
+      console.error("config-integrity check FAILED:");
+      for (const line of violationLines(violations)) console.error(line);
+      annotateAll({
+        title: "Config integrity",
+        fix: "fix it as get_app_contract R7 says, then push again",
+        items: violations.map((v) => ({ what: v.message, ...(v.file ? { file: v.file } : {}) })),
+      });
+      process.exitCode = 1;
+    } else {
+      console.log("config-integrity check passed.");
+    }
   }
 }
