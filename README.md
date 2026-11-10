@@ -6,7 +6,7 @@ runs (`ci/`), and the pinned build tools the app-build and deploy jobs
 install (`ci/build/`).
 
 **This repo is a generated mirror (do not open PRs here).** Source of truth,
-tests, and review happen in the private `inno-platform` repo; every commit
+tests, and review happen in the `inno-platform` repo; every commit
 here is `publish: inno-platform@<sha>`, pushed automatically by its CI.
 
 App repos consume it with `.github/workflows/deploy.yml`:
