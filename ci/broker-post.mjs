@@ -231,8 +231,8 @@ export async function brokerPost({ base, path, label, token, body, timeoutMs }, 
 // for a stopped app or a stale deployment included, fails at once.
 // The platform's own host wave waits out a held lease on the same schedule
 // (src/hosts.ts HOST_WAVE_BUSY_DELAYS_MS, a copy, since ci/ ships standalone
-// and imports nothing from src/, which test/doc-parity.node.test.ts holds to
-// this one).
+// and imports nothing from src/, which
+// test/doc-parity/operations-7-13.node.test.ts holds to this one).
 export const BUSY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
 
 /** True for the broker's lease refusal: HTTP 409 with the JSON error app_busy. */

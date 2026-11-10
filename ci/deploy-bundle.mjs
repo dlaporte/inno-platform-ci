@@ -45,7 +45,7 @@ import { UsageError, isMainModule, logSafe, parseIntegerArg } from "./cli.mjs";
 // compression and enforces itself at upload. Checked here twice, so an author
 // learns it from the build on every push rather than from a refused release:
 // in app-build, as soon as the bundle exists, and again on the bytes this
-// script hands over. test/doc-parity.node.test.ts pins it to src/'s
+// script hands over. test/doc-parity/values.node.test.ts pins it to src/'s
 // MAX_BUNDLE_BYTES; it is NOT imported from there, because ci/ ships
 // standalone in the public mirror and imports nothing from src/ on purpose.
 export const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
