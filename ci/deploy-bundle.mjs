@@ -216,7 +216,7 @@ export async function handOver({ base, app, deploymentId, token, dir, expected, 
     text = await res.text();
   } catch (e) {
     if (e?.name === "TimeoutError") {
-      throw new Error(`deploy-bundle failed: the platform did not answer within ${timeoutMs / 1000} s; re-run the job`);
+      throw new Error(`deploy-bundle failed: the platform did not answer within ${timeoutMs / 1000} s; re-run the release's workflow`);
     }
     throw e;
   }

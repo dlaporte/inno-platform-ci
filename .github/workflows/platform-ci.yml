@@ -166,7 +166,8 @@ jobs:
 
       # `app` is caller-asserted; safe only because the broker binds the signed
       # repository_id claim to the app record and refuses mismatches
-      # (app_mismatch / deploy_denied:repo_id).
+      # (app_mismatch; from v0.18.31 a repository no app is bound to reads a
+      # bare deploy_denied).
       #
       # `inputs.app` comes from the app's OWN deploy.yml (`with: app:`) and
       # was never validated here. A multiline value injected extra
@@ -221,6 +222,7 @@ jobs:
     name: Config integrity
     runs-on: ubuntu-26.04
     timeout-minutes: 10
+    needs: [policy]
     steps:
       - name: Checkout app repo (the caller)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -633,11 +635,16 @@ jobs:
     # This job builds the user-controlled Dockerfile. It deliberately has NO
     # deploy token, no Cloudflare credential, and no platform secret in its
     # env: an app author fully controls this build's inputs (the Dockerfile
-    # + app/ sources), so nothing of value to the platform is reachable from
-    # it. The deploy job holds the token, and pushes only the image this job
-    # built, scanned and recorded (R11).
-    # (The OIDC token the SBOM upload mints is NOT a credential: it only
-    # proves provenance to the broker's /deploy-sbom endpoint.)
+    # + app/ sources), and the author's code runs here only inside docker:
+    # the build, the smoke run and the accessibility scan. The deploy job
+    # holds the token, and pushes only the image this job built, scanned and
+    # recorded (R11).
+    # (The job holds `id-token: write` for the SBOM upload, and GitHub scopes
+    # it to the job, not the step, so code on this runner outside docker
+    # could mint a token of any audience, the deploy audience included: the
+    # deploy job's own reusable workflow, which the brokers can pin, is a
+    # later release (L-7). Nothing here runs the author's code outside
+    # docker.)
     env:
       # The run's own GITHUB_TOKEN, read-only, for trivy's vulnerability DB
       # and checks bundle pulls from ghcr (anonymous pulls are rate-limited),
@@ -656,10 +663,11 @@ jobs:
       # take an author directory of the same name with it. They are the
       # registry mirror step's ci/registry-mirror.sh, the container contract
       # (ci/container-contract.sh: the non-root/EXPOSE assert and the /healthz
-      # smoke test, v0.18.16, CI-02), and the annotation helper the contract
-      # ends a refusal with (ci/annotate.mjs, with the ci/cli.mjs it imports;
-      # R7-5), which the contract script runs from beside itself. A
-      # function-shaped app builds no image, so none of them runs for one.
+      # smoke test, v0.18.16, CI-02), the symlink guard (ci/symlink-guard.sh,
+      # run after the Node setup; L-8, v0.18.31), and the annotation helper
+      # the contract and the guard end a refusal with (ci/annotate.mjs, with
+      # the ci/cli.mjs it imports; R7-5), which each runs from beside itself.
+      # A function-shaped app builds no image, so none of them runs for one.
       # (The ci/ scripts the later steps run come from the second mirror
       # checkout, after the build.)
       - name: Checkout inno-platform-ci (the registry mirror and container contract scripts)
@@ -678,7 +686,7 @@ jobs:
         if: needs.policy.outputs.function_shaped != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/ci"
-          cp inno-platform-ci/ci/registry-mirror.sh inno-platform-ci/ci/container-contract.sh inno-platform-ci/ci/annotate.mjs inno-platform-ci/ci/cli.mjs "$RUNNER_TEMP/ci/"
+          cp inno-platform-ci/ci/registry-mirror.sh inno-platform-ci/ci/container-contract.sh inno-platform-ci/ci/symlink-guard.sh inno-platform-ci/ci/annotate.mjs inno-platform-ci/ci/cli.mjs "$RUNNER_TEMP/ci/"
           rm -rf inno-platform-ci
 
       # A function-shaped app builds no image, so this checkout and the Node
@@ -699,9 +707,11 @@ jobs:
       # No `cache: npm` here: this job never runs `npm ci`/`npm install` (the
       # docker build below is a wholly separate build context, and node runs
       # two scripts directly: the annotation helper,
-      # $RUNNER_TEMP/ci/annotate.mjs, with which the container contract ends
-      # a refusal on any run, and inno-platform-ci/ci/sbom-upload.mjs on a
-      # release tag). A cache key would have to hash a root lockfile, which
+      # $RUNNER_TEMP/ci/annotate.mjs, with which the container contract and
+      # the symlink guard end a refusal on any run, and
+      # inno-platform-ci/ci/sbom-upload.mjs on a release tag; the guard also
+      # runs `node -e`, importing $RUNNER_TEMP/ci/cli.mjs, to name the links
+      # past its tenth). A cache key would have to hash a root lockfile, which
       # config-integrity check 8 refuses in an app repo (ci/check-config.mjs);
       # this job installs no build tools and injects nothing.
       - name: Set up Node 22
@@ -710,15 +720,35 @@ jobs:
         with:
           node-version: 22
 
+      # The symlink guard (L-8, v0.18.31), ci/symlink-guard.sh from the copy
+      # the job took out of its mirror checkout: it refuses any link in the
+      # checkout that resolves outside it, and any dangling one, before
+      # anything below reads the checkout or the build context. This job
+      # holds id-token: write, so its own gates must not rest on another
+      # job's differently rooted checkout (config-integrity, which this job
+      # does not wait for). Every file the job's steps write lands outside the
+      # checkout, its own under $RUNNER_TEMP, save the second mirror
+      # checkout's directory (below), so a committed link at one of those
+      # names redirects nothing. The walk prunes a directory at the mirror
+      # checkout's path, here the tenant's own directory of that name if any:
+      # no step writes under it, and the second mirror checkout replaces it.
+      # A link of that name, where that checkout writes, is walked and
+      # refused like any other (R15).
+      - name: Reject a symlink that escapes the repository
+        if: needs.policy.outputs.function_shaped != 'true'
+        run: |
+          "$RUNNER_TEMP/ci/symlink-guard.sh"
+
       # Only the trivy SCAN is policy-toggleable. The build and the
       # non-root/port asserts (container contract) run whatever the policy
       # says, and so does the SBOM generation on a release tag, the one run
       # that uploads it (R7-7): the SBOM is inventory, and capturing it even
       # for a gate-disabled app means flipping the gate back restores sweep
       # coverage without a deploy.
-      # The ignore file is written AFTER checkout (checkout cleans the tree)
-      # and is the ONLY ignore file mounted into trivy: the app repo itself
-      # stays unmounted, so an app-committed .trivyignore remains inert.
+      # The ignore file is the platform's own, written under $RUNNER_TEMP,
+      # outside the checkout, and it is the ONLY ignore file mounted into
+      # trivy: an app-committed `.trivyignore`, or a file or link named
+      # `.trivyignore.platform`, is neither read nor written (L-8, v0.18.31).
       - name: Gate switch + platform ignore file
         id: gate
         env:
@@ -730,11 +760,11 @@ jobs:
             echo "### :warning: trivy gate DISABLED by platform policy" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
-          : > .trivyignore.platform
-          for id in $IGNORES; do echo "$id" >> .trivyignore.platform; done
-          if [ -s .trivyignore.platform ]; then
+          : > "$RUNNER_TEMP/trivyignore.platform"
+          for id in $IGNORES; do echo "$id" >> "$RUNNER_TEMP/trivyignore.platform"; done
+          if [ -s "$RUNNER_TEMP/trivyignore.platform" ]; then
             echo "platform-managed trivy ignores in effect:"
-            cat .trivyignore.platform
+            cat "$RUNNER_TEMP/trivyignore.platform"
           fi
 
       # Function-shaped apps (the 'function' and 'mcp-function' presets) have no Dockerfile, so every image
@@ -822,7 +852,7 @@ jobs:
         run: |
           status=0
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$HOME/.cache/trivy:/root/.cache/trivy" \
-            -v "$PWD/.trivyignore.platform:/.trivyignore.platform:ro" -e GITHUB_TOKEN="$TRIVY_TOKEN" \
+            -v "$RUNNER_TEMP/trivyignore.platform:/.trivyignore.platform:ro" -e GITHUB_TOKEN="$TRIVY_TOKEN" \
             "$TRIVY_IMAGE" image --severity HIGH,CRITICAL --ignore-unfixed --ignorefile /.trivyignore.platform \
               --exit-code 2 --no-progress app-under-test \
             || status=$?
@@ -848,10 +878,11 @@ jobs:
         # NOTE: never put a comment between the docker run's backslash-continued
         # lines (the trivy gate's step says why).
         run: |
+          mkdir -p "$RUNNER_TEMP/sbom"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
-            -v "$PWD:/out" \
+            -v "$RUNNER_TEMP/sbom:/out" \
             -e GITHUB_TOKEN="$TRIVY_TOKEN" \
             "$TRIVY_IMAGE" image \
               --format cyclonedx \
@@ -861,10 +892,11 @@ jobs:
 
       # The identity of the image the gates actually scanned. Reported to the
       # broker with the SBOM below, under this run's VERIFIED OIDC run_id
-      # claim, from this TOKEN-LESS job. The image itself travels to the deploy
-      # job as a workflow artifact, and app-owned jobs in the caller share the
-      # run's artifact namespace, so the artifact alone proves nothing and
-      # this recorded id is what the deploy job checks it against.
+      # claim, from this job, which holds no deploy token. The image itself
+      # travels to the deploy job as a workflow artifact, and app-owned jobs in
+      # the caller share the run's artifact namespace, so the artifact alone
+      # proves nothing and this recorded id is what the deploy job checks it
+      # against.
       - name: Record the scanned image id
         id: image
         if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
@@ -908,7 +940,7 @@ jobs:
           IMAGE_ID: ${{ steps.image.outputs.id }}
         run: |
           token="$(inno-platform-ci/ci/oidc-token.sh inno-platform-sbom)"
-          node inno-platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" sbom.json "$token" "$IMAGE_ID"
+          node inno-platform-ci/ci/sbom-upload.mjs "$BROKER_URL" "$APP" "$RUNNER_TEMP/sbom/sbom.json" "$token" "$IMAGE_ID"
 
       # Contract 22 (R8, §3; docs/APP-ACCESSIBILITY.md): an automated
       # accessibility scan plus an advisory response-header check of the SAME
@@ -984,7 +1016,7 @@ jobs:
       # retention-days: 1, because this is a build intermediate, not a record.
       - name: Save the scanned image for the deploy job
         if: needs.policy.outputs.function_shaped != 'true' && startsWith(github.ref, 'refs/tags/v')
-        run: docker save app-under-test | gzip -1 > image.tar.gz
+        run: docker save app-under-test | gzip -1 > "$RUNNER_TEMP/image.tar.gz"
 
       # overwrite: true for the same reason the app-build job's upload needs it
       # (below): artifacts are scoped to the RUN, not the attempt, so with the
@@ -995,7 +1027,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: inno-scanned-image
-          path: image.tar.gz
+          path: ${{ runner.temp }}/image.tar.gz
           retention-days: 1
           if-no-files-found: error
           overwrite: true
@@ -1084,6 +1116,7 @@ jobs:
     name: Scaffold check
     runs-on: ubuntu-26.04
     timeout-minutes: 10
+    needs: [policy]
     outputs:
       built: ${{ steps.check.outputs.built }}
     steps:

@@ -38,8 +38,9 @@ import { isMainModule } from "./cli.mjs";
 // default for the reports (BROKER_TIMEOUT_MS). The broker does a deployment's
 // first writes (and, for a container app, mints the push token) before it
 // answers, which takes seconds; a broker that holds the connection longer is
-// failing, and the job is re-run. No answer within it throws
-// `deploy-token failed: no answer within 30 s`, which is not retried.
+// failing, and the remedy is to re-run the release's workflow. No answer
+// within it throws `deploy-token failed: no answer within 30 s`, which is
+// not retried.
 export const DEPLOY_TOKEN_TIMEOUT_MS = 30_000;
 
 /**

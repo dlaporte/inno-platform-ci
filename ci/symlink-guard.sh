@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# The app-build job's symlink guard for tenant CI (the step "Reject a symlink
-# that escapes the repository", which runs it from its mirror checkout): it
+# The symlink guard of tenant CI's app-build and container jobs (each job's
+# step "Reject a symlink that escapes the repository" runs it, app-build from
+# its mirror checkout and the container job from its $RUNNER_TEMP/ci copy): it
 # refuses any symlink in the checkout whose target resolves outside the
 # repository checkout ($GITHUB_WORKSPACE), and any dangling one, walking the
 # whole checkout from the step's working directory, node_modules included,
-# and pruning .git and the mirror checkout (public platform code). The
-# step's comment in platform-ci.yml says why, and what it does not contain.
+# and pruning .git and the mirror checkout (public platform code). Only a
+# directory at the mirror checkout's path is pruned: a link of that name is
+# walked and refused like any other (v0.18.31, ruling R15). The step's
+# comment in platform-ci.yml says why, and what it does not contain.
 #
 # Each refused link is one annotation from ci/annotate.mjs beside this
 # script, the link as its file, so a link's name, which the author (or a
@@ -45,7 +48,7 @@ while IFS= read -r -d '' link; do
   else
     refuse_link "Dangling symlink" "$link" "$link does not resolve" "remove it"
   fi
-done < <(find . \( -path ./.git -o -path ./inno-platform-ci \) -prune -o -type l -print0)
+done < <(find . \( -path ./.git -o -path ./inno-platform-ci -type d \) -prune -o -type l -print0)
 if [ "${#more[@]}" -gt 0 ]; then
   # shellcheck disable=SC2016 # a JavaScript template, not a shell expansion
   node --input-type=module -e 'const { logSafe } = await import(process.argv[1]); const names = process.argv.slice(2); console.error(`and ${names.length} more symlinks: ${names.map((n) => logSafe(n, 300)).join(", ")}`);' -- "$ci/cli.mjs" "${more[@]}"

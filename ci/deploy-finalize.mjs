@@ -126,8 +126,8 @@ export async function finalize({ base, token, app, deploymentId, imageId, image,
   };
   // A 409 app_busy (another change holds the app's lease) is retried on
   // ci/broker-post.mjs's one schedule: failing there would fail a deploy CI
-  // has already handed over, leaving the app `deploying` until the job is
-  // re-run.
+  // has already handed over, leaving the app `deploying` until someone does
+  // what its refusal says: re-run the release's workflow.
   return withBusyRetry("deploy-complete", () => brokerPost(
     { base, path: "/deploy-complete", label: "deploy-complete", token, body, timeoutMs: FINALIZE_TIMEOUT_MS },
     fetcher,
